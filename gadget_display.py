@@ -577,6 +577,202 @@ class GadgetDisplay:
         # In real implementation with real-time updates,
         # would restore from backup of previous screen
 
+    def draw_expanded_message(self, sender_name, message_text, right_edge=158):
+        """
+        Draw expanded message view - replaces the left column info panels
+        Shows incoming message text (no GIF - that's for reactions)
+
+        Args:
+            sender_name: Name of message sender (e.g., "Amy")
+            message_text: The message content
+            right_edge: Right edge of the panel (default 158)
+        """
+        box_right = right_edge - 5
+        frame_top = 4
+        frame_bottom = 318
+
+        # Clear and draw main frame
+        self.draw.rectangle([2, frame_top, right_edge, frame_bottom],
+                           fill=COLORS['bg'], outline=COLORS['lavender'], width=1)
+
+        # Header - "message from [name]"
+        header_y = frame_top
+        self.draw.rectangle([6, header_y - 5, right_edge - 6, header_y + 7], fill=COLORS['bg'])
+        header_text = f"message from {sender_name}"
+        self.draw.text((8, header_y - 4), header_text, font=self.font_header, fill=COLORS['lavender'])
+
+        # Inner message box (lavender border)
+        msg_box_top = 16
+        msg_box_height = 290  # Most of the frame
+        self.draw.rectangle([5, msg_box_top, box_right, msg_box_top + msg_box_height],
+                           outline=COLORS['lavender'], width=2)
+
+        # Message text area - use most of the box
+        text_y = msg_box_top + 20
+        text_x = 12
+        max_width = box_right - text_x - 5
+
+        # Word wrap the message text
+        words = message_text.split()
+        lines = []
+        current_line = ""
+        for word in words:
+            test_line = current_line + (" " if current_line else "") + word
+            try:
+                test_width = self.font_small.getlength(test_line)
+            except:
+                test_width = len(test_line) * 8
+            if test_width <= max_width:
+                current_line = test_line
+            else:
+                if current_line:
+                    lines.append(current_line)
+                current_line = word
+        if current_line:
+            lines.append(current_line)
+
+        # Draw message lines (more lines now since no GIF area)
+        for i, line in enumerate(lines[:12]):
+            self.draw.text((text_x, text_y + i * 18), line,
+                          font=self.font_small, fill=COLORS['white'])
+
+        # Reaction hints at bottom
+        hint_y = msg_box_top + msg_box_height - 35
+        hint_text = "double tap = love"
+        try:
+            hint_width = self.font_tiny.getlength(hint_text)
+        except:
+            hint_width = len(hint_text) * 7
+        hint_x = (box_right + 5) // 2 - hint_width // 2
+        self.draw.text((hint_x, hint_y), hint_text,
+                      font=self.font_tiny, fill=self._dim_color(COLORS['lavender']))
+
+        hint_text2 = "triple tap = fire"
+        try:
+            hint_width2 = self.font_tiny.getlength(hint_text2)
+        except:
+            hint_width2 = len(hint_text2) * 7
+        hint_x2 = (box_right + 5) // 2 - hint_width2 // 2
+        self.draw.text((hint_x2, hint_y + 14), hint_text2,
+                      font=self.font_tiny, fill=self._dim_color(COLORS['lavender']))
+
+    def draw_reaction_received(self, sender_name, gif_frame, right_edge=158):
+        """
+        Draw reaction received view - shows "Ben -" with large GIF
+        This is what the SENDER sees when someone reacts to their message
+
+        Args:
+            sender_name: Name of person who sent the reaction (e.g., "Ben")
+            gif_frame: PIL Image of current GIF frame (heart or fire)
+            right_edge: Right edge of the panel (default 158)
+        """
+        box_right = right_edge - 5
+        frame_top = 4
+        frame_bottom = 318
+
+        # Clear and draw main frame
+        self.draw.rectangle([2, frame_top, right_edge, frame_bottom],
+                           fill=COLORS['bg'], outline=COLORS['lavender'], width=1)
+
+        # Header - "reaction from [name]"
+        header_y = frame_top
+        self.draw.rectangle([6, header_y - 5, right_edge - 6, header_y + 7], fill=COLORS['bg'])
+        header_text = f"reaction from {sender_name}"
+        self.draw.text((8, header_y - 4), header_text, font=self.font_header, fill=COLORS['lavender'])
+
+        # Inner box (lavender border)
+        msg_box_top = 16
+        msg_box_height = 290
+        self.draw.rectangle([5, msg_box_top, box_right, msg_box_top + msg_box_height],
+                           outline=COLORS['lavender'], width=2)
+
+        # GIF takes up most of the box (no name text inside, it's in header)
+        gif_area_top = msg_box_top + 10
+        gif_area_bottom = msg_box_top + msg_box_height - 10
+        gif_area_height = gif_area_bottom - gif_area_top
+        gif_area_width = box_right - 10  # Almost full width
+
+        # Calculate GIF dimensions maintaining aspect ratio
+        if gif_frame:
+            orig_w, orig_h = gif_frame.size
+            aspect = orig_w / orig_h
+
+            # Fit within available space
+            if aspect > (gif_area_width / gif_area_height):
+                # Width constrained
+                new_width = gif_area_width
+                new_height = int(new_width / aspect)
+            else:
+                # Height constrained
+                new_height = gif_area_height
+                new_width = int(new_height * aspect)
+
+            # Center the GIF
+            gif_x = 5 + (gif_area_width - new_width) // 2
+            gif_y = gif_area_top + (gif_area_height - new_height) // 2
+
+            # Resize and paste
+            resized = gif_frame.copy()
+            resized = resized.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+            # Handle transparency/palette
+            if resized.mode == 'RGBA':
+                bg = Image.new('RGB', (new_width, new_height), COLORS['bg'])
+                bg.paste(resized, mask=resized.split()[3])
+                resized = bg
+            elif resized.mode == 'P':
+                resized = resized.convert('RGB')
+            elif resized.mode != 'RGB':
+                resized = resized.convert('RGB')
+
+            self.image.paste(resized, (gif_x, gif_y))
+
+    def render_message_view(self, sender_name, message_text, album_art_path=None):
+        """
+        Render the expanded message view (replaces normal display)
+        Shows incoming message - user has 30 seconds to react
+
+        Args:
+            sender_name: Name of message sender
+            message_text: The message content
+            album_art_path: Path to album artwork (still shown on right)
+        """
+        # Clear previous image
+        self.image = Image.new('RGB', (self.width, self.height), color=COLORS['bg'])
+        self.draw = ImageDraw.Draw(self.image)
+
+        # Draw album art on right side (same as normal view)
+        album_x = self.draw_album_art(album_art_path=album_art_path)
+
+        # Draw expanded message view on left
+        info_panel_right = album_x - 5
+        self.draw_expanded_message(sender_name, message_text, right_edge=info_panel_right)
+
+        return self.image
+
+    def render_reaction_view(self, sender_name, gif_frame, album_art_path=None):
+        """
+        Render the reaction received view
+        Shows "Ben -" with the reaction GIF (fire/heart)
+
+        Args:
+            sender_name: Name of person who reacted
+            gif_frame: PIL Image of current GIF frame
+            album_art_path: Path to album artwork (still shown on right)
+        """
+        # Clear previous image
+        self.image = Image.new('RGB', (self.width, self.height), color=COLORS['bg'])
+        self.draw = ImageDraw.Draw(self.image)
+
+        # Draw album art on right side
+        album_x = self.draw_album_art(album_art_path=album_art_path)
+
+        # Draw reaction view on left
+        info_panel_right = album_x - 5
+        self.draw_reaction_received(sender_name, gif_frame, right_edge=info_panel_right)
+
+        return self.image
+
     def show(self):
         """Display the image (preview mode shows in window, hardware mode pushes to display)"""
         if self.preview_mode:
