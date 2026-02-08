@@ -1,0 +1,4 @@
+Pillow>=10.0.0
+# For Raspberry Pi hardware (uncomment when deploying to Pi):
+# spidev>=3.5
+# RPi.GPIO>=0.7.1
