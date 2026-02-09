@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Gadget Display Renderer
-Renders the tiptop-style terminal UI for the Gadget music sharing device
+LEELOO Display Renderer
+Renders the tiptop-style terminal UI for the LEELOO music sharing device
 """
 
 from PIL import Image, ImageDraw, ImageFont
@@ -30,18 +30,18 @@ def get_moon_phase():
 
 # Color palette - matches React UI exactly
 COLORS = {
-    'bg': '#1A1D2E',            # gadget-navy (dark background)
-    'green': '#719253',          # gadget-green (album box)
-    'purple': '#9C93DD',         # gadget-purple (time box)
-    'rose': '#D6697F',           # gadget-rose (pushed by text)
-    'tan': '#C2995E',            # gadget-tan (weather box)
-    'lavender': '#A7AFD4',       # gadget-lavender (messages box)
+    'bg': '#1A1D2E',            # leeloo-navy (dark background)
+    'green': '#719253',          # leeloo-green (album box)
+    'purple': '#9C93DD',         # leeloo-purple (time box)
+    'rose': '#D6697F',           # leeloo-rose (pushed by text)
+    'tan': '#C2995E',            # leeloo-tan (weather box)
+    'lavender': '#A7AFD4',       # leeloo-lavender (messages box)
     'white': '#FFFFFF',
     'orange': '#FF8800',         # Spotify code / UV high
     'yellow': '#D4A84B',         # UV moderate (muted yellow)
 }
 
-class GadgetDisplay:
+class LeelooDisplay:
     def __init__(self, width=480, height=320, preview_mode=True):
         """
         Initialize the display
@@ -57,7 +57,7 @@ class GadgetDisplay:
         
         # Load fonts - increased sizes (except header and band/song)
         try:
-            self.font_header = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 9)  # For Gadget/tap to talk
+            self.font_header = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 9)  # For LEELOO/tap to talk
             self.font_tiny = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 12)   # main text
             self.font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 13)
             self.font_med = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 15)
@@ -109,7 +109,7 @@ class GadgetDisplay:
         b = int(hex_color[4:6], 16)
 
         # Dim by mixing with background (30% original, 70% background)
-        bg_r, bg_g, bg_b = 0x1A, 0x1D, 0x2E  # gadget-navy
+        bg_r, bg_g, bg_b = 0x1A, 0x1D, 0x2E  # leeloo-navy
         dim_r = int(r * 0.3 + bg_r * 0.7)
         dim_g = int(g * 0.3 + bg_g * 0.7)
         dim_b = int(b * 0.3 + bg_b * 0.7)
@@ -302,7 +302,7 @@ class GadgetDisplay:
         header_y = 4
         # Draw background behind header text to "break" the frame
         self.draw.rectangle([6, header_y - 5, 155, header_y + 7], fill=COLORS['bg'])
-        self.draw.text((8, header_y - 4), "Gadget v1.0", font=self.font_header, fill=COLORS['lavender'])
+        self.draw.text((8, header_y - 4), "LEELOO v1.0", font=self.font_header, fill=COLORS['lavender'])
         self.draw.text((90, header_y - 4), "tap to talk", font=self.font_header, fill=COLORS['lavender'])
 
         # ===== WEATHER BOX ===== (tan border)
@@ -777,12 +777,12 @@ class GadgetDisplay:
         """Display the image (preview mode shows in window, hardware mode pushes to display)"""
         if self.preview_mode:
             # Save and show preview
-            self.image.save('/tmp/gadget_preview.png')
-            print("💾 Preview saved to /tmp/gadget_preview.png")
+            self.image.save('/tmp/leeloo_preview.png')
+            print("Preview saved to /tmp/leeloo_preview.png")
             try:
                 self.image.show()
             except:
-                print("⚠️  Could not open image viewer. Check /tmp/gadget_preview.png")
+                print("Could not open image viewer. Check /tmp/leeloo_preview.png")
         else:
             # Push to hardware display
             if self.display_device:
@@ -791,6 +791,10 @@ class GadgetDisplay:
                 pass
             else:
                 print("⚠️  No hardware display available")
+
+
+# Backwards compatibility alias
+GadgetDisplay = LeelooDisplay
 
 
 def demo():
@@ -811,7 +815,7 @@ def demo():
             'rain_24h_inches': 0.5,
         }
 
-    display = GadgetDisplay(preview_mode=True)
+    display = LeelooDisplay(preview_mode=True)
 
     # Time data - use real time!
     now = datetime.now()

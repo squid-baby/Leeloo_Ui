@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Captive Portal - Web-based setup flow for Gadget
+Captive Portal - Web-based setup flow for LEELOO
 Serves a cyberpunk terminal-styled UI on phone
 """
 
@@ -19,7 +19,7 @@ from wifi_manager import (
 app = Flask(__name__)
 
 # Config path
-CONFIG_PATH = os.environ.get("GADGET_CONFIG_PATH", "/home/pi/gadget_config.json")
+CONFIG_PATH = os.environ.get("LEELOO_CONFIG_PATH", "/home/pi/leeloo_config.json")
 
 # State
 setup_state = {
@@ -267,7 +267,7 @@ def setup_wifi():
 
     content = f"""
     <div class="header header-line">
-        GADGET v1.0 ─── SETUP
+        LEELOO v1.0 ─── SETUP
     </div>
 
     <div class="terminal-box">
@@ -342,7 +342,7 @@ def setup_wifi():
         }});
     </script>
     """
-    return render_page("Gadget Setup - WiFi", content)
+    return render_page("LEELOO Setup - WiFi", content)
 
 
 @app.route('/setup/info')
@@ -350,7 +350,7 @@ def setup_info():
     """Step 2: User info (name, contacts, location)"""
     content = """
     <div class="header header-line">
-        GADGET v1.0 ─── SETUP
+        LEELOO v1.0 ─── SETUP
     </div>
 
     <div class="terminal-box">
@@ -362,7 +362,7 @@ def setup_info():
 
             <label>YOUR CREW:</label>
             <input type="text" name="contacts" placeholder="Amy, Ben, Sarah">
-            <div class="hint">Comma-separated names of friends with Gadgets</div>
+            <div class="hint">Comma-separated names of friends with LEELOOs</div>
 
             <label>ZIP CODE (for weather):</label>
             <input type="text" name="zip_code" placeholder="27601" pattern="[0-9]{5}" maxlength="5" required>
@@ -408,7 +408,7 @@ def setup_info():
         });
     </script>
     """
-    return render_page("Gadget Setup - Info", content)
+    return render_page("LEELOO Setup - Info", content)
 
 
 @app.route('/setup/guide')
@@ -416,7 +416,7 @@ def setup_guide():
     """Step 3: Quick start guide"""
     content = """
     <div class="header header-line">
-        GADGET v1.0 ─── QUICK GUIDE
+        LEELOO v1.0 ─── QUICK GUIDE
     </div>
 
     <div class="slides" id="slides">
@@ -424,7 +424,7 @@ def setup_guide():
         <div class="slide" data-slide="0">
             <div class="terminal-box">
                 <h2>You're all set!</h2>
-                <p>Quick guide to your new Gadget.</p>
+                <p>Quick guide to your new LEELOO.</p>
                 <p style="color: #6A6A8A; margin-top: 20px;">Swipe to learn →</p>
                 <div class="dots">
                     <div class="dot active"></div>
@@ -440,7 +440,7 @@ def setup_guide():
         <div class="slide" data-slide="1" style="display:none;">
             <div class="terminal-box">
                 <h2>Share Things</h2>
-                <p>Tap the TOP of your Gadget (not the screen) and talk to it.</p>
+                <p>Tap the TOP of your LEELOO (not the screen) and talk to it.</p>
                 <p style="margin-top: 10px;">Ask about weather, time, send messages, and music.</p>
                 <p style="background:#2A2D3E; padding:10px; margin:15px 0; font-size: 13px;">"send my homies Lets Dance by David Bowie"</p>
                 <p style="font-size: 12px; color: #6A6A8A;">Tap and ask "what can I ask?" for more help.</p>
@@ -549,7 +549,7 @@ def setup_guide():
         });
     </script>
     """
-    return render_page("Gadget - Quick Guide", content)
+    return render_page("LEELOO - Quick Guide", content)
 
 
 @app.route('/done')
@@ -559,11 +559,11 @@ def done():
     <div class="terminal-box" style="text-align: center; border-color: #719253;">
         <div style="font-size: 48px; margin: 20px 0;">✓</div>
         <h1 style="color: #719253;">SETUP COMPLETE</h1>
-        <p style="margin: 20px 0;">Your Gadget is ready!</p>
+        <p style="margin: 20px 0;">Your LEELOO is ready!</p>
         <p style="color: #6A6A8A; font-size: 12px;">You can close this page now.</p>
     </div>
     """
-    return render_page("Gadget - Ready", content)
+    return render_page("LEELOO - Ready", content)
 
 
 @app.route('/connecting')
@@ -580,7 +580,7 @@ def connecting():
         <p style="color: #6A6A8A; font-size: 12px;">Please wait...</p>
     </div>
     """
-    return render_page("Gadget - Connecting", content, auto_refresh=3)
+    return render_page("LEELOO - Connecting", content, auto_refresh=3)
 
 
 # ============================================
@@ -682,7 +682,7 @@ def run_captive_portal(lcd_update_callback=None, dev_mode=False):
 
     if dev_mode:
         print("Starting setup server in DEV MODE (port 8080)...")
-        print("Open http://gadget.local:8080 on your phone")
+        print("Open http://leeloo.local:8080 on your phone")
         update_lcd('phone_connected')  # Show "complete setup on phone" screen
         app.run(host='0.0.0.0', port=8080, debug=False, threaded=True)
     else:

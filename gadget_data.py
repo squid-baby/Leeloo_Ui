@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gadget Data - Persistent storage for hang times and other gadget state
+LEELOO Data - Persistent storage for hang times and other LEELOO state
 Stores data in JSON format on the Pi.
 """
 
@@ -10,11 +10,11 @@ from datetime import datetime
 from typing import Optional, Dict, Any
 
 # Default path on Pi - can be overridden via environment variable
-DATA_FILE_PATH = os.environ.get("GADGET_DATA_PATH", "/home/pi/gadget_data.json")
+DATA_FILE_PATH = os.environ.get("LEELOO_DATA_PATH", "/home/pi/leeloo_data.json")
 
 
 def load_data() -> Dict[str, Any]:
-    """Load gadget data from JSON file. Returns empty dict if file doesn't exist."""
+    """Load LEELOO data from JSON file. Returns empty dict if file doesn't exist."""
     try:
         with open(DATA_FILE_PATH, 'r') as f:
             return json.load(f)
@@ -23,13 +23,13 @@ def load_data() -> Dict[str, Any]:
 
 
 def save_data(data: Dict[str, Any]) -> bool:
-    """Save gadget data to JSON file. Returns True on success."""
+    """Save LEELOO data to JSON file. Returns True on success."""
     try:
         with open(DATA_FILE_PATH, 'w') as f:
             json.dump(data, f, indent=2)
         return True
     except Exception as e:
-        print(f"Error saving gadget data: {e}")
+        print(f"Error saving LEELOO data: {e}")
         return False
 
 
@@ -142,7 +142,7 @@ if __name__ == "__main__":
     # Test the module
     from datetime import timedelta
 
-    print("Testing gadget_data module...")
+    print("Testing leeloo_data module...")
 
     # Test with a hang 2 days from now
     test_time = datetime.now() + timedelta(days=2, hours=4, minutes=20)

@@ -11,7 +11,7 @@ import sys
 import time
 sys.path.insert(0, '/home/pi')
 
-from gadget_display import GadgetDisplay
+from gadget_display import LEELOODisplay
 from PIL import Image, ImageDraw
 import os
 from datetime import datetime
@@ -67,7 +67,7 @@ def write_region_to_framebuffer(frame_bytes, x, y, width, height, fb_path='/dev/
 
 
 def show_standard_ui(display, album_art_path):
-    """Show the standard Gadget UI"""
+    """Show the standard LEELOO UI"""
     # Weather data (mock)
     weather_data = {
         'temp_f': 72,
@@ -189,7 +189,7 @@ def demo_message_then_reaction():
     """Demo the full flow: message -> reaction -> back to standard UI"""
     print("Starting message + reaction demo...")
 
-    display = GadgetDisplay(preview_mode=False)
+    display = LEELOODisplay(preview_mode=False)
 
     # Find album art
     album_art_path = '/home/pi/doorways-album.jpg'

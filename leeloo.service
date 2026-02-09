@@ -1,0 +1,20 @@
+[Unit]
+Description=LEELOO Music Sharing Device
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi
+ExecStartPre=/bin/sleep 5
+ExecStart=/usr/bin/python3 /home/pi/leeloo_main.py
+Restart=always
+RestartSec=5
+Environment=LEELOO_CONFIG_PATH=/home/pi/leeloo_config.json
+Environment=LEELOO_DATA_PATH=/home/pi/leeloo_data.json
+
+# Move console off LCD before starting
+ExecStartPre=/bin/sh -c 'sudo con2fbmap 1 0 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target

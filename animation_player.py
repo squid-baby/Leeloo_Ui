@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Animation Player - Play GIF animations on the LCD framebuffer
-For Gadget tap reactions (Love/Fire)
+For LEELOO tap reactions (Love/Fire)
 """
 
 import os

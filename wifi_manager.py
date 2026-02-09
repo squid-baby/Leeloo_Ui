@@ -8,7 +8,7 @@ import time
 import os
 
 # AP Mode Configuration
-AP_SSID = "Gadget-Setup"
+AP_SSID = "LEE-Setup"
 AP_IP = "192.168.4.1"
 AP_NETMASK = "255.255.255.0"
 AP_DHCP_START = "192.168.4.2"
@@ -16,7 +16,7 @@ AP_DHCP_END = "192.168.4.254"
 
 # Config paths
 HOSTAPD_CONF = "/etc/hostapd/hostapd.conf"
-DNSMASQ_CONF = "/etc/dnsmasq.d/gadget-ap.conf"
+DNSMASQ_CONF = "/etc/dnsmasq.d/leeloo-ap.conf"
 WPA_SUPPLICANT_CONF = "/etc/wpa_supplicant/wpa_supplicant.conf"
 
 
@@ -56,9 +56,9 @@ def get_device_id():
 def write_hostapd_config():
     """Write hostapd configuration for AP mode"""
     device_id = get_device_id()
-    ssid = f"Gadget-{device_id}"
+    ssid = f"LEE-{device_id}"
 
-    config = f"""# Gadget AP Mode Configuration
+    config = f"""# LEELOO AP Mode Configuration
 interface=wlan0
 driver=nl80211
 ssid={ssid}
@@ -83,16 +83,16 @@ ignore_broadcast_ssid=0
 
 def write_dnsmasq_config():
     """Write dnsmasq configuration for DHCP and DNS redirect"""
-    config = f"""# Gadget AP Mode - DHCP and captive portal redirect
+    config = f"""# LEELOO AP Mode - DHCP and captive portal redirect
 interface=wlan0
 dhcp-range={AP_DHCP_START},{AP_DHCP_END},{AP_NETMASK},24h
 address=/#/{AP_IP}
 """
 
     try:
-        with open('/tmp/dnsmasq-gadget.conf', 'w') as f:
+        with open('/tmp/dnsmasq-leeloo.conf', 'w') as f:
             f.write(config)
-        run_command(['sudo', 'cp', '/tmp/dnsmasq-gadget.conf', DNSMASQ_CONF])
+        run_command(['sudo', 'cp', '/tmp/dnsmasq-leeloo.conf', DNSMASQ_CONF])
         return True
     except Exception as e:
         print(f"Error writing dnsmasq config: {e}")
@@ -166,7 +166,7 @@ def scan_wifi_networks():
             for line in result.stdout.split('\n'):
                 if 'ESSID:' in line:
                     ssid = line.split('ESSID:')[1].strip().strip('"')
-                    if ssid and ssid not in networks and not ssid.startswith('Gadget-'):
+                    if ssid and ssid not in networks and not ssid.startswith('LEE-'):
                         networks.append(ssid)
     except Exception as e:
         print(f"Error scanning networks: {e}")

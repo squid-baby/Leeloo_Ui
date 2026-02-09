@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gadget Weather Module
+LEELOO Weather Module
 Fetches real weather data from Open-Meteo API (free, no API key needed)
 """
 

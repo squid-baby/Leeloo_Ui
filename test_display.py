@@ -3,13 +3,13 @@
 Test script to preview different display states
 """
 
-from gadget_display import GadgetDisplay
+from gadget_display import LEELOODisplay
 import time
 
 def test_sunny_day():
     """Test sunny weather display"""
     print("🌞 Testing sunny day...")
-    display = GadgetDisplay(preview_mode=True)
+    display = LEELOODisplay(preview_mode=True)
     
     weather_data = {
         'temp': 85,
@@ -48,7 +48,7 @@ def test_sunny_day():
 def test_rainy_day():
     """Test rainy weather display"""
     print("🌧️  Testing rainy day...")
-    display = GadgetDisplay(preview_mode=True)
+    display = LEELOODisplay(preview_mode=True)
     
     weather_data = {
         'temp': 55,
@@ -87,7 +87,7 @@ def test_rainy_day():
 def test_early_morning():
     """Test early morning display"""
     print("🌅 Testing early morning...")
-    display = GadgetDisplay(preview_mode=True)
+    display = LEELOODisplay(preview_mode=True)
     
     weather_data = {
         'temp': 48,
@@ -126,7 +126,7 @@ def test_early_morning():
 def test_late_night():
     """Test late night display"""
     print("🌙 Testing late night...")
-    display = GadgetDisplay(preview_mode=True)
+    display = LEELOODisplay(preview_mode=True)
     
     weather_data = {
         'temp': 62,
@@ -163,7 +163,7 @@ def test_late_night():
     display.show()
 
 if __name__ == "__main__":
-    print("🎨 Gadget Display Test Suite\n")
+    print("🎨 LEELOO Display Test Suite\n")
     print("Press Enter to see each test scenario...")
     
     input("\n📋 Test 1: Sunny Day")
@@ -178,4 +178,4 @@ if __name__ == "__main__":
     input("\n📋 Test 4: Late Night")
     test_late_night()
     
-    print("\n✅ All tests complete! Check /tmp/gadget_preview.png for the last render.")
+    print("\n✅ All tests complete! Check /tmp/leeloo_preview.png for the last render.")
