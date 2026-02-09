@@ -287,7 +287,7 @@ def setup_wifi():
             <button type="submit">CONNECT →</button>
         </form>
 
-        <div class="progress">Step 1 of 3</div>
+        <div class="progress">Step 1 of 4</div>
     </div>
 
     <script>
@@ -370,7 +370,7 @@ def setup_info():
             <button type="submit">CONTINUE →</button>
         </form>
 
-        <div class="progress">Step 2 of 3</div>
+        <div class="progress">Step 2 of 4</div>
     </div>
 
     <script>
@@ -394,7 +394,7 @@ def setup_info():
                 });
 
                 if (result.success) {
-                    window.location.href = '/setup/guide';
+                    window.location.href = '/setup/crew';
                 } else {
                     btn.disabled = false;
                     btn.textContent = 'CONTINUE →';
@@ -409,6 +409,347 @@ def setup_info():
     </script>
     """
     return render_page("LEELOO Setup - Info", content)
+
+
+@app.route('/setup/crew')
+def setup_crew():
+    """Step 3: Crew setup - create or join"""
+    content = """
+    <div class="header header-line">
+        LEELOO v1.0 ─── SETUP
+    </div>
+
+    <div class="terminal-box">
+        <h1>┌─ JOIN YOUR CREW ─┐</h1>
+
+        <p style="margin-bottom: 20px; color: #A7AFD4;">
+            Connect with friends who have LEELOOs
+        </p>
+
+        <div class="crew-options">
+            <label class="radio-option">
+                <input type="radio" name="crew_action" value="create" checked>
+                <span class="radio-label">Create a new crew</span>
+                <span class="radio-desc">You're the first one setting up</span>
+            </label>
+
+            <label class="radio-option">
+                <input type="radio" name="crew_action" value="join">
+                <span class="radio-label">Join an existing crew</span>
+                <span class="radio-desc">A friend shared a code with you</span>
+            </label>
+        </div>
+
+        <button type="button" id="continueBtn">CONTINUE</button>
+
+        <div class="progress">Step 3 of 4</div>
+    </div>
+
+    <style>
+        .crew-options {
+            margin: 20px 0;
+        }
+        .radio-option {
+            display: block;
+            padding: 15px;
+            margin-bottom: 10px;
+            border: 1px solid #4A4A6A;
+            cursor: pointer;
+            transition: border-color 0.2s;
+        }
+        .radio-option:hover {
+            border-color: #719253;
+        }
+        .radio-option input {
+            margin-right: 10px;
+        }
+        .radio-option input:checked + .radio-label {
+            color: #719253;
+        }
+        .radio-label {
+            font-size: 14px;
+            color: #FFFFFF;
+        }
+        .radio-desc {
+            display: block;
+            margin-top: 5px;
+            margin-left: 25px;
+            font-size: 11px;
+            color: #6A6A8A;
+        }
+    </style>
+
+    <script>
+        document.getElementById('continueBtn').addEventListener('click', function() {
+            const action = document.querySelector('input[name="crew_action"]:checked').value;
+            if (action === 'create') {
+                window.location.href = '/setup/crew/create';
+            } else {
+                window.location.href = '/setup/crew/join';
+            }
+        });
+    </script>
+    """
+    return render_page("LEELOO Setup - Crew", content)
+
+
+@app.route('/setup/crew/create')
+def setup_crew_create():
+    """Step 3a: Create a new crew"""
+    content = """
+    <div class="header header-line">
+        LEELOO v1.0 ─── CREATE CREW
+    </div>
+
+    <div class="terminal-box">
+        <h1>┌─ NAME YOUR CREW ─┐</h1>
+
+        <p style="margin-bottom: 20px; color: #A7AFD4;">
+            Pick something fun your friends will recognize
+        </p>
+
+        <form id="createForm">
+            <label>CREW NAME:</label>
+            <input type="text" name="crew_name" placeholder="The Music Nerds" required maxlength="30">
+
+            <button type="submit">CREATE CREW</button>
+        </form>
+
+        <div class="progress">Step 3 of 4</div>
+    </div>
+
+    <script>
+        document.getElementById('createForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const btn = document.querySelector('button');
+            btn.disabled = true;
+            btn.textContent = 'CREATING...';
+
+            const formData = new FormData(e.target);
+            const data = {
+                crew_name: formData.get('crew_name')
+            };
+
+            try {
+                const result = await fetchJSON('/api/crew/create', {
+                    method: 'POST',
+                    body: JSON.stringify(data)
+                });
+
+                if (result.success) {
+                    window.location.href = '/setup/crew/created?code=' + result.invite_code + '&name=' + encodeURIComponent(result.crew_name);
+                } else {
+                    btn.disabled = false;
+                    btn.textContent = 'CREATE CREW';
+                    alert(result.error || 'Failed to create crew');
+                }
+            } catch (e) {
+                btn.disabled = false;
+                btn.textContent = 'CREATE CREW';
+                alert('Error: ' + e.message);
+            }
+        });
+    </script>
+    """
+    return render_page("LEELOO Setup - Create Crew", content)
+
+
+@app.route('/setup/crew/created')
+def setup_crew_created():
+    """Step 3b: Crew created - show invite code"""
+    invite_code = request.args.get('code', 'XXXX123')
+    crew_name = request.args.get('name', 'Your Crew')
+    invite_url = f"leeloo.app/join/{invite_code}"
+
+    content = f"""
+    <div class="header header-line">
+        LEELOO v1.0 ─── CREW CREATED
+    </div>
+
+    <div class="terminal-box" style="text-align: center;">
+        <div style="font-size: 36px; margin: 10px 0; color: #719253;">✓</div>
+        <h1 style="color: #719253;">CREW CREATED!</h1>
+
+        <p style="margin: 15px 0; color: #FFFFFF;">"{crew_name}"</p>
+
+        <p style="margin: 20px 0; color: #A7AFD4;">
+            Share this with your friends:
+        </p>
+
+        <div class="invite-code" id="inviteCode">
+            {invite_url}
+        </div>
+
+        <div class="share-buttons">
+            <button type="button" class="share-btn" onclick="copyCode()">COPY</button>
+            <button type="button" class="share-btn" onclick="shareText()">TEXT</button>
+            <button type="button" class="share-btn" onclick="shareEmail()">EMAIL</button>
+        </div>
+
+        <button type="button" onclick="window.location.href='/setup/guide'" style="margin-top: 20px;">
+            CONTINUE TO GUIDE
+        </button>
+    </div>
+
+    <style>
+        .invite-code {{
+            background: #2A2D3E;
+            padding: 15px;
+            margin: 15px 0;
+            font-family: monospace;
+            font-size: 14px;
+            color: #719253;
+            border: 1px solid #719253;
+            word-break: break-all;
+        }}
+        .share-buttons {{
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            margin: 15px 0;
+        }}
+        .share-btn {{
+            padding: 10px 20px;
+            font-size: 12px;
+            background: #2A2D3E;
+            border: 1px solid #A7AFD4;
+        }}
+        .share-btn:hover {{
+            background: #3A3D4E;
+        }}
+    </style>
+
+    <script>
+        const inviteUrl = '{invite_url}';
+        const crewName = '{crew_name}';
+        const shareMessage = `Join my LEELOO crew "${{crewName}}"! Go to ${{inviteUrl}}`;
+
+        function copyCode() {{
+            navigator.clipboard.writeText(inviteUrl).then(() => {{
+                alert('Copied to clipboard!');
+            }}).catch(() => {{
+                // Fallback for older browsers
+                const el = document.getElementById('inviteCode');
+                const range = document.createRange();
+                range.selectNode(el);
+                window.getSelection().removeAllRanges();
+                window.getSelection().addRange(range);
+                document.execCommand('copy');
+                window.getSelection().removeAllRanges();
+                alert('Copied!');
+            }});
+        }}
+
+        function shareText() {{
+            if (navigator.share) {{
+                navigator.share({{ text: shareMessage }});
+            }} else {{
+                window.location.href = 'sms:?body=' + encodeURIComponent(shareMessage);
+            }}
+        }}
+
+        function shareEmail() {{
+            const subject = 'Join my LEELOO crew!';
+            window.location.href = 'mailto:?subject=' + encodeURIComponent(subject) + '&body=' + encodeURIComponent(shareMessage);
+        }}
+    </script>
+    """
+    return render_page("LEELOO Setup - Crew Created", content)
+
+
+@app.route('/setup/crew/join')
+def setup_crew_join():
+    """Step 3c: Join an existing crew"""
+    content = """
+    <div class="header header-line">
+        LEELOO v1.0 ─── JOIN CREW
+    </div>
+
+    <div class="terminal-box">
+        <h1>┌─ JOIN A CREW ─┐</h1>
+
+        <p style="margin-bottom: 20px; color: #A7AFD4;">
+            Enter the invite code your friend shared with you
+        </p>
+
+        <form id="joinForm">
+            <label>INVITE CODE:</label>
+            <input type="text" name="invite_code" placeholder="WXYZ123" required
+                   style="text-transform: uppercase;" maxlength="10"
+                   pattern="[A-Za-z0-9]+">
+            <div class="hint">The code at the end of leeloo.app/join/...</div>
+
+            <button type="submit">JOIN CREW</button>
+        </form>
+
+        <div class="progress">Step 3 of 4</div>
+    </div>
+
+    <script>
+        document.getElementById('joinForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const btn = document.querySelector('button');
+            btn.disabled = true;
+            btn.textContent = 'JOINING...';
+
+            const formData = new FormData(e.target);
+            const data = {
+                invite_code: formData.get('invite_code').toUpperCase()
+            };
+
+            try {
+                const result = await fetchJSON('/api/crew/join', {
+                    method: 'POST',
+                    body: JSON.stringify(data)
+                });
+
+                if (result.success) {
+                    window.location.href = '/setup/crew/joined?name=' + encodeURIComponent(result.crew_name) + '&members=' + encodeURIComponent(result.members.join(', '));
+                } else {
+                    btn.disabled = false;
+                    btn.textContent = 'JOIN CREW';
+                    alert(result.error || 'Invalid invite code');
+                }
+            } catch (e) {
+                btn.disabled = false;
+                btn.textContent = 'JOIN CREW';
+                alert('Error: ' + e.message);
+            }
+        });
+    </script>
+    """
+    return render_page("LEELOO Setup - Join Crew", content)
+
+
+@app.route('/setup/crew/joined')
+def setup_crew_joined():
+    """Step 3d: Successfully joined crew"""
+    crew_name = request.args.get('name', 'Your Crew')
+    members = request.args.get('members', '')
+
+    content = f"""
+    <div class="header header-line">
+        LEELOO v1.0 ─── JOINED!
+    </div>
+
+    <div class="terminal-box" style="text-align: center;">
+        <div style="font-size: 36px; margin: 10px 0; color: #719253;">✓</div>
+        <h1 style="color: #719253;">YOU'RE IN!</h1>
+
+        <p style="margin: 20px 0; color: #FFFFFF;">
+            Welcome to "{crew_name}"
+        </p>
+
+        <p style="margin: 15px 0; color: #A7AFD4;">
+            Members: {members if members else 'You'}
+        </p>
+
+        <button type="button" onclick="window.location.href='/setup/guide'" style="margin-top: 20px;">
+            CONTINUE TO GUIDE
+        </button>
+    </div>
+    """
+    return render_page("LEELOO Setup - Joined Crew", content)
 
 
 @app.route('/setup/guide')
@@ -502,7 +843,7 @@ def setup_guide():
             <div class="terminal-box" style="border-color: #719253;">
                 <p>Now put your phone away and enjoy tech that adds value to your life.</p>
                 <div class="tagline">More fun, less phone.</div>
-                <button onclick="window.location.href='/done'">START USING GADGET</button>
+                <button onclick="window.location.href='/done'">START USING LEELOO</button>
                 <div class="dots">
                     <div class="dot"></div>
                     <div class="dot"></div>
@@ -641,13 +982,14 @@ def api_info():
     contacts = [c.strip() for c in contacts_str.split(',') if c.strip()]
 
     # Save config with zip_code (weather API will use this)
-    config = {
+    # Note: setup_complete will be set after crew setup
+    config = load_config()
+    config.update({
         'user_name': user_name,
         'contacts': contacts,
         'location': {'zip_code': zip_code},
         'wifi_ssid': setup_state.get('ssid', ''),
-        'setup_complete': True
-    }
+    })
 
     try:
         with open(CONFIG_PATH, 'w') as f:
@@ -657,10 +999,116 @@ def api_info():
         print(f"Error saving config: {e}")
         return jsonify({'success': False, 'error': 'Failed to save config'})
 
+    return jsonify({'success': True})
+
+
+def load_config():
+    """Load existing config or return empty dict"""
+    try:
+        with open(CONFIG_PATH, 'r') as f:
+            return json.load(f)
+    except:
+        return {}
+
+
+def generate_invite_code():
+    """Generate a random 7-character invite code"""
+    import random
+    import string
+    chars = string.ascii_uppercase + string.digits
+    return ''.join(random.choice(chars) for _ in range(7))
+
+
+@app.route('/api/crew/create', methods=['POST'])
+def api_crew_create():
+    """Create a new crew"""
+    data = request.get_json()
+    crew_name = data.get('crew_name', '').strip()
+
+    if not crew_name:
+        return jsonify({'success': False, 'error': 'Crew name is required'})
+
+    if len(crew_name) > 30:
+        return jsonify({'success': False, 'error': 'Crew name too long (max 30 chars)'})
+
+    # Generate invite code
+    invite_code = generate_invite_code()
+
+    # Save to config
+    config = load_config()
+    config['crew'] = {
+        'name': crew_name,
+        'invite_code': invite_code,
+        'is_creator': True,
+        'members': [config.get('user_name', 'You')]
+    }
+    config['setup_complete'] = True
+
+    try:
+        with open(CONFIG_PATH, 'w') as f:
+            json.dump(config, f, indent=2)
+        print(f"Crew created: {crew_name} ({invite_code})")
+    except Exception as e:
+        print(f"Error saving crew config: {e}")
+        return jsonify({'success': False, 'error': 'Failed to save crew'})
+
     setup_state['step'] = 'done'
     update_lcd('success')
 
-    return jsonify({'success': True})
+    return jsonify({
+        'success': True,
+        'crew_name': crew_name,
+        'invite_code': invite_code
+    })
+
+
+@app.route('/api/crew/join', methods=['POST'])
+def api_crew_join():
+    """Join an existing crew"""
+    data = request.get_json()
+    invite_code = data.get('invite_code', '').strip().upper()
+
+    if not invite_code:
+        return jsonify({'success': False, 'error': 'Invite code is required'})
+
+    # In a real implementation, this would validate against a backend server
+    # For now, we'll accept any code and simulate a successful join
+    # The backend would return the crew name and member list
+
+    # TODO: Replace with actual backend API call
+    # response = requests.post('https://api.leeloo.app/crew/join', json={'code': invite_code})
+
+    # For demo purposes, simulate a successful join
+    # In production, this would validate the code against the server
+    simulated_crew_name = f"Crew {invite_code[:4]}"
+    simulated_members = ['Friend 1', 'Friend 2']
+
+    # Save to config
+    config = load_config()
+    config['crew'] = {
+        'name': simulated_crew_name,
+        'invite_code': invite_code,
+        'is_creator': False,
+        'members': simulated_members + [config.get('user_name', 'You')]
+    }
+    config['setup_complete'] = True
+
+    try:
+        with open(CONFIG_PATH, 'w') as f:
+            json.dump(config, f, indent=2)
+        print(f"Joined crew: {simulated_crew_name}")
+    except Exception as e:
+        print(f"Error saving crew config: {e}")
+        return jsonify({'success': False, 'error': 'Failed to save crew'})
+
+    setup_state['step'] = 'done'
+    update_lcd('success')
+
+    return jsonify({
+        'success': True,
+        'crew_name': simulated_crew_name,
+        'members': simulated_members
+    })
 
 
 # ============================================
