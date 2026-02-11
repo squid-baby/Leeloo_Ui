@@ -6,25 +6,27 @@ Fetches real weather data from Open-Meteo API (free, no API key needed)
 
 import requests
 
-def get_weather(lat=35.9101, lon=-79.0753):
+def get_weather(lat=35.9101, lon=-79.0753, timezone=None):
     """
     Fetch current weather from Open-Meteo API
 
     Args:
         lat: Latitude (default: Carrboro, NC)
         lon: Longitude (default: Carrboro, NC)
+        timezone: IANA timezone string (e.g. 'America/New_York'). Uses 'auto' if not set.
 
     Returns:
         dict with temp_f, uv, rain, temp_slider (all 0-10 scale for sliders)
     """
     try:
+        tz = timezone or "auto"
         url = (
             f"https://api.open-meteo.com/v1/forecast?"
             f"latitude={lat}&longitude={lon}"
             f"&current=temperature_2m,uv_index"
             f"&daily=precipitation_sum"
             f"&temperature_unit=fahrenheit"
-            f"&timezone=America/New_York"
+            f"&timezone={tz}"
             f"&forecast_days=1"
         )
 

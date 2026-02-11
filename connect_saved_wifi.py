@@ -11,7 +11,8 @@ import sys
 import subprocess
 import time
 
-CONFIG_PATH = os.environ.get("LEELOO_CONFIG_PATH", "/home/pi/leeloo_config.json")
+LEELOO_HOME = os.environ.get("LEELOO_HOME", "/home/pi/leeloo-ui")
+DEVICE_CONFIG_PATH = os.path.join(LEELOO_HOME, "device_config.json")
 
 def run_cmd(cmd):
     """Run command and return success status"""
@@ -85,10 +86,10 @@ def connect_with_networkmanager(ssid, password):
 def main():
     """Check if setup is complete and connect to WiFi"""
     try:
-        with open(CONFIG_PATH, 'r') as f:
+        with open(DEVICE_CONFIG_PATH, 'r') as f:
             config = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        print("No config file found")
+        print("No device config file found")
         return 1
 
     # Check if setup is complete
@@ -110,6 +111,17 @@ def main():
     # Connect using NetworkManager
     if connect_with_networkmanager(wifi_ssid, wifi_password):
         print(f"\n✅ Successfully connected to {wifi_ssid}")
+
+        # Now that we have internet, geocode the ZIP code
+        print("\n🌍 Geocoding ZIP code to coordinates for weather...")
+        try:
+            subprocess.run(
+                ['python3', '/home/pi/leeloo-ui/geocode_zip.py'],
+                check=False  # Don't fail if geocoding fails
+            )
+        except Exception as e:
+            print(f"⚠️  Geocoding failed: {e}")
+
         return 0
     else:
         print(f"\n❌ Failed to connect to {wifi_ssid}")

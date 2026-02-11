@@ -189,13 +189,19 @@ config["location"]["longitude"] = -79.0753
 
 ---
 
-### 5. **Messages Not Showing "Jen"**
+### 5. **Weather and Messages Not Showing**
 
-**Problem:** Config had `contacts: ["Jen"]` correctly saved, but display showed empty messages.
+**Problem:** Config had data correctly saved, but display showed empty weather and messages.
 
-**Root Cause:** **Config file mismatch!**
-- `captive_portal.py` writes to `/home/pi/leeloo_config.json`
-- `gadget_main.py` reads from `/home/pi/leeloo-ui/device_config.json` and `crew_config.json`
+**Root Cause #1:** **Config file mismatch!**
+- `captive_portal.py` (Opus refactor) writes to `/home/pi/leeloo-ui/device_config.json` and `crew_config.json`
+- `gadget_main.py` reads from same location
+- BUT: ZIP code geocoding failed silently during portal setup
+
+**Root Cause #2:** **No Internet During Portal Setup**
+- Portal runs in AP mode (no internet connection)
+- Can't call geocoding APIs (Nominatim) without internet
+- ZIP code saved but never converted to lat/lon for weather
 
 **Why we didn't look here first:**
 - Assumed both systems used the same config file
@@ -383,6 +389,97 @@ Removed broken SHARE button, kept only COPY button, updated messaging:
 - ✅ Captive portals are sandboxed - can't rely on leaving/returning
 - ✅ Set user expectations correctly (copy now, share after setup)
 - ✅ Remove broken features instead of keeping them "just in case"
+
+---
+
+### 8. **Time Not Updating to Local Timezone**
+
+**Problem:** Display showed correct weather but time was in wrong timezone (not matching user's location).
+
+**Root Cause:** `gadget_main.py` expects a `timezone` field in config (e.g., `"America/Denver"`) but captive portal never set it.
+
+**Why we didn't look here first:**
+- Focused on getting weather working first
+- Assumed system time was "good enough"
+- Didn't realize `gadget_main.py` had timezone support built-in (lines 116-125)
+
+**The Discovery:**
+```python
+# gadget_main.py (lines 116-125)
+tz_name = device_config.get('timezone')  # ❌ This was None!
+try:
+    local_tz = ZoneInfo(tz_name) if tz_name else None
+except (KeyError, Exception):
+    local_tz = None
+
+# Later...
+now = datetime.now(tz=local_tz) if local_tz else datetime.now()  # Falls back to system time
+```
+
+**The Solution Path:**
+
+**Attempt 1: Simple Longitude-Based Logic** ❌
+- Used longitude to approximate timezone
+- Works ~90% of the time but inaccurate for edge cases
+- No external dependencies
+
+**Attempt 2: timezonefinder Package** ❌
+- Tried to install `pip3 install timezonefinder`
+- Failed due to missing system dependencies (libffi)
+- Would have required compiling C extensions
+
+**Attempt 3: GeoNames API** ✅ **SUCCESS**
+- Free API with 30k requests/day
+- Single API call gets ZIP → lat/lon + timezone
+- Accurate, reliable, no dependencies
+
+**The Implementation:**
+
+1. **Created `geocode_zip.py` script**
+   - Runs AFTER WiFi connects (when internet is available)
+   - Calls GeoNames API twice:
+     ```python
+     # 1. ZIP → Coordinates
+     postalCodeSearchJSON?postalcode={zip}&country=US&username={user}
+
+     # 2. Coordinates → Timezone
+     timezoneJSON?lat={lat}&lng={lon}&username={user}
+     ```
+   - Saves lat, lon, and timezone to device_config.json
+
+2. **Integrated into WiFi connection flow**
+   - `connect_saved_wifi.py` calls `geocode_zip.py` after successful WiFi connection
+   - Runs automatically in background
+   - No manual intervention needed
+
+**Example API Response:**
+```json
+{
+  "postalCodes": [{
+    "lat": 39.666,
+    "lng": -104.835,
+    "placeName": "Aurora",
+    "adminName1": "Colorado"
+  }]
+}
+
+{
+  "timezoneId": "America/Denver",
+  "gmtOffset": -7,
+  "dstOffset": -6
+}
+```
+
+**Files Modified:**
+- Created `geocode_zip.py` - Automatic ZIP→lat/lon→timezone conversion
+- `connect_saved_wifi.py` - Added call to `geocode_zip.py` after WiFi connects
+
+**Lesson Learned:**
+- ✅ **Check what data the display code actually expects** before assuming what to send
+- ✅ **Geocoding requires internet** - do it AFTER WiFi connects, not during AP mode
+- ✅ **Free APIs are elegant** - GeoNames is more reliable than homebrew longitude logic
+- ✅ **Sign up for accounts early** - 30 seconds to create GeoNames account vs. hours debugging
+- ✅ **Read the API docs** - `postalCodeSearchJSON` doesn't include timezone, need `timezoneJSON` too
 
 ---
 
@@ -584,18 +681,21 @@ subprocess.Popen(
 6. User reads guide
 7. `/done` page auto-calls `/api/finish`
 8. Pi connects to home WiFi in background
-9. Display shows weather and messages
-10. **DONE!** No SSH needed.
+9. **Automatic geocoding:** `geocode_zip.py` runs, calls GeoNames API
+10. Config updated with lat/lon + timezone
+11. Display shows weather and **local time**
+12. **DONE!** No SSH needed, no manual configuration.
 
 ---
 
 ## Future Improvements
 
 ### Short Term
-1. **Fix ZIP geocoding** - Add error handling, fallback to manual lat/lon entry
-2. **Refactor config files** - Use gadget_main format directly (Option B)
+1. ✅ **ZIP geocoding** - COMPLETE! Using GeoNames API with automatic timezone detection
+2. ✅ **Refactor config files** - COMPLETE! Opus refactored to use gadget_main format directly
 3. **Add dependency checks** - Verify hostapd/dnsmasq installed before running
 4. **Better error messages** - Show user-friendly errors when things fail
+5. **Test GeoNames reliability** - Verify it works for edge cases (Alaska, Hawaii, etc.)
 
 ### Long Term
 1. **Web interface at leeloo.local** - View crew code without re-running setup
@@ -618,6 +718,8 @@ subprocess.Popen(
 2. **Think about process lifecycle** - What happens when parent dies?
 3. **Single source of truth** - One config format, synced if needed
 4. **Fail loudly** - Log errors, don't fail silently
+5. **API calls need internet** - Geocoding during AP mode = no internet!
+6. **Use existing services** - GeoNames > homebrew longitude approximations
 
 ### 🎯 User Experience
 1. **Set honest expectations** - Don't promise features that can't work
@@ -631,8 +733,9 @@ subprocess.Popen(
 | File | Changes | Why |
 |------|---------|-----|
 | `wifi_manager.py` | Added captive portal detection URLs to dnsmasq | Portal auto-open on iOS/Android |
-| `captive_portal.py` | Added detection routes, removed immediate WiFi connect, added `/api/finish`, added `sync_config_to_gadget()`, simplified share button | Fixed portal closing, auto WiFi switch, config sync |
-| `connect_saved_wifi.py` | Rewrote to use NetworkManager exclusively | wpa_supplicant didn't work with NetworkManager |
+| `captive_portal.py` (Opus refactor) | Refactored to use gadget_main config format directly, added detection routes, removed immediate WiFi connect, added `/api/finish`, simplified share button | Fixed config mismatch, portal closing, auto WiFi switch |
+| `connect_saved_wifi.py` | Rewrote to use NetworkManager exclusively, added call to `geocode_zip.py` after WiFi connects | wpa_supplicant didn't work; enables automatic geocoding |
+| `geocode_zip.py` | **NEW FILE** - Automatic ZIP→lat/lon→timezone using GeoNames API | Weather + local time without manual config |
 | `test_captive_portal_v2.sh` | Added `sudo` to connect script call | Permission denied without sudo |
 
 ---

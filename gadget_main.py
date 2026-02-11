@@ -10,6 +10,7 @@ import json
 import time
 import struct
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from gadget_display import LeelooDisplay
 from gadget_weather import get_weather
@@ -112,6 +113,17 @@ def main_loop():
     longitude = device_config.get('longitude')
     location_configured = latitude is not None and longitude is not None
 
+    # Get timezone from config (set during captive portal setup from ZIP code)
+    tz_name = device_config.get('timezone')
+    try:
+        local_tz = ZoneInfo(tz_name) if tz_name else None
+    except (KeyError, Exception):
+        local_tz = None
+    if local_tz:
+        print(f"Using timezone: {tz_name}")
+    else:
+        print("No timezone configured, using system time")
+
     print(f"Device config: {device_config}")
     print(f"Crew config: {crew_config}")
     print(f"Location configured: {location_configured}")
@@ -125,7 +137,7 @@ def main_loop():
             if location_configured:
                 if weather_data is None or (current_time - last_weather_fetch) > WEATHER_REFRESH_INTERVAL:
                     try:
-                        weather_data = get_weather(latitude, longitude)
+                        weather_data = get_weather(latitude, longitude, timezone=tz_name)
                         last_weather_fetch = current_time
                         print(f"Weather updated: {weather_data.get('temp_f', '?')}°F")
                     except Exception as e:
@@ -136,8 +148,8 @@ def main_loop():
                 weather_data = None
 
             # ===== TIME =====
-            # Always available (uses system time)
-            now = datetime.now()
+            # Use configured timezone from ZIP code, or fall back to system time
+            now = datetime.now(tz=local_tz) if local_tz else datetime.now()
             time_data = {
                 'time_str': now.strftime('%-I:%M %p'),
                 'date_str': now.strftime('%b %-d'),

@@ -18,8 +18,10 @@ from wifi_manager import (
 
 app = Flask(__name__)
 
-# Config path
-CONFIG_PATH = os.environ.get("LEELOO_CONFIG_PATH", "/home/pi/leeloo_config.json")
+# Config paths - write directly to gadget_main format
+LEELOO_HOME = os.environ.get("LEELOO_HOME", "/home/pi/leeloo-ui")
+DEVICE_CONFIG_PATH = os.path.join(LEELOO_HOME, "device_config.json")
+CREW_CONFIG_PATH = os.path.join(LEELOO_HOME, "crew_config.json")
 
 # State
 setup_state = {
@@ -1025,9 +1027,7 @@ def api_wifi():
     config['wifi_password'] = password
 
     try:
-        with open(CONFIG_PATH, 'w') as f:
-            json.dump(config, f, indent=2)
-        sync_config_to_gadget()
+        save_config(config)
         print(f"WiFi credentials saved: {ssid}")
     except Exception as e:
         print(f"Error saving WiFi config: {e}")
@@ -1081,20 +1081,40 @@ def api_info():
     config = load_config()
     config.update({
         'user_name': user_name,
-        'contacts': contacts,
-        'location': {'zip_code': zip_code},
+        'zip_code': zip_code,
         'wifi_ssid': setup_state.get('ssid', ''),
     })
 
-    # Add lat/lon if we got them
+    # Add lat/lon and look up timezone if we got coordinates
     if latitude and longitude:
         config['latitude'] = latitude
         config['longitude'] = longitude
 
+        # Look up timezone from coordinates using Open-Meteo API
+        try:
+            tz_url = (
+                f"https://api.open-meteo.com/v1/forecast?"
+                f"latitude={latitude}&longitude={longitude}"
+                f"&current=temperature_2m&forecast_days=1"
+                f"&timezone=auto"
+            )
+            tz_resp = requests.get(tz_url, headers={'User-Agent': 'LEELOO-Setup/1.0'}, timeout=5)
+            if tz_resp.status_code == 200:
+                tz_data = tz_resp.json()
+                timezone = tz_data.get('timezone')
+                if timezone:
+                    config['timezone'] = timezone
+                    print(f"Detected timezone: {timezone}")
+        except Exception as e:
+            print(f"Timezone lookup failed: {e}")
+            # Falls back to system timezone at runtime
+
+    # Update crew members with contacts from this form
+    if contacts and config.get('crew'):
+        config['crew']['members'] = contacts
+
     try:
-        with open(CONFIG_PATH, 'w') as f:
-            json.dump(config, f, indent=2)
-        sync_config_to_gadget()
+        save_config(config)
         print(f"Config saved: {config}")
     except Exception as e:
         print(f"Error saving config: {e}")
@@ -1104,49 +1124,66 @@ def api_info():
 
 
 def load_config():
-    """Load existing config or return empty dict"""
+    """Load config by merging device_config.json and crew_config.json"""
+    config = {}
+
+    # Load device config
     try:
-        with open(CONFIG_PATH, 'r') as f:
-            return json.load(f)
-    except:
-        return {}
+        with open(DEVICE_CONFIG_PATH, 'r') as f:
+            config.update(json.load(f))
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
 
-
-def sync_config_to_gadget():
-    """Sync captive portal config to gadget_main format"""
+    # Load crew config into 'crew' key
     try:
-        # Read captive portal config
-        with open(CONFIG_PATH, 'r') as f:
-            portal_config = json.load(f)
+        with open(CREW_CONFIG_PATH, 'r') as f:
+            crew_data = json.load(f)
+            config['crew'] = crew_data
+            # Also populate contacts from crew members for compatibility
+            if 'members' in crew_data:
+                config['contacts'] = crew_data['members']
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
 
-        # Create device_config.json for gadget_main
-        device_config = {
-            "latitude": portal_config.get("location", {}).get("latitude"),
-            "longitude": portal_config.get("location", {}).get("longitude"),
-            "zip_code": portal_config.get("location", {}).get("zip_code"),
-            "user_name": portal_config.get("user_name")
-        }
+    return config
 
-        device_config_path = "/home/pi/leeloo-ui/device_config.json"
-        with open(device_config_path, 'w') as f:
-            json.dump(device_config, f, indent=2)
 
-        # Create crew_config.json for gadget_main
-        crew_data = portal_config.get("crew", {})
-        crew_config = {
-            "name": crew_data.get("name"),
-            "invite_code": crew_data.get("invite_code"),
-            "is_creator": crew_data.get("is_creator", False),
-            "members": portal_config.get("contacts", [])
-        }
+def save_device_config(data):
+    """Save device config (latitude, longitude, zip_code, user_name, wifi, setup_complete)"""
+    # Read existing to preserve fields not being updated
+    try:
+        with open(DEVICE_CONFIG_PATH, 'r') as f:
+            existing = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        existing = {}
 
-        crew_config_path = "/home/pi/leeloo-ui/crew_config.json"
-        with open(crew_config_path, 'w') as f:
-            json.dump(crew_config, f, indent=2)
+    existing.update(data)
+    with open(DEVICE_CONFIG_PATH, 'w') as f:
+        json.dump(existing, f, indent=2)
 
-        print(f"Synced config to gadget_main format: device_config.json, crew_config.json")
-    except Exception as e:
-        print(f"Error syncing config to gadget format: {e}")
+
+def save_crew_config(data):
+    """Save crew config (name, invite_code, is_creator, members)"""
+    with open(CREW_CONFIG_PATH, 'w') as f:
+        json.dump(data, f, indent=2)
+
+
+def save_config(config):
+    """Save both device and crew configs from merged dict"""
+    # Extract device fields
+    device_fields = {}
+    for key in ('latitude', 'longitude', 'zip_code', 'user_name',
+                'wifi_ssid', 'wifi_password', 'setup_complete', 'timezone'):
+        if key in config:
+            device_fields[key] = config[key]
+
+    if device_fields:
+        save_device_config(device_fields)
+
+    # Extract crew fields
+    crew_data = config.get('crew')
+    if crew_data:
+        save_crew_config(crew_data)
 
 
 def generate_invite_code():
@@ -1183,9 +1220,7 @@ def api_crew_create():
     config['setup_complete'] = True
 
     try:
-        with open(CONFIG_PATH, 'w') as f:
-            json.dump(config, f, indent=2)
-        sync_config_to_gadget()
+        save_config(config)
         print(f"Crew created: {crew_name} ({invite_code})")
     except Exception as e:
         print(f"Error saving crew config: {e}")
@@ -1236,9 +1271,7 @@ def api_crew_join():
     config['setup_complete'] = True
 
     try:
-        with open(CONFIG_PATH, 'w') as f:
-            json.dump(config, f, indent=2)
-        sync_config_to_gadget()
+        save_config(config)
         print(f"Joined crew: {simulated_crew_name}")
     except Exception as e:
         print(f"Error saving crew config: {e}")
