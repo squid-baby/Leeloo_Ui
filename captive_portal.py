@@ -257,6 +257,39 @@ def index():
     return redirect('/setup/wifi')
 
 
+# ============================================
+# CAPTIVE PORTAL DETECTION ROUTES
+# ============================================
+
+@app.route('/hotspot-detect.html')
+@app.route('/library/test/success.html')
+def apple_captive_portal():
+    """iOS/macOS captive portal detection"""
+    return redirect('/setup/wifi')
+
+
+@app.route('/generate_204')
+@app.route('/gen_204')
+def android_captive_portal():
+    """Android captive portal detection - expects HTTP 204 or redirect"""
+    # Return redirect instead of 204 to force portal open
+    return redirect('/setup/wifi')
+
+
+@app.route('/connecttest.txt')
+@app.route('/redirect')
+def windows_captive_portal():
+    """Windows captive portal detection"""
+    return redirect('/setup/wifi')
+
+
+@app.route('/success.txt')
+@app.route('/canonical.html')
+def firefox_captive_portal():
+    """Firefox captive portal detection"""
+    return redirect('/setup/wifi')
+
+
 @app.route('/setup/wifi')
 def setup_wifi():
     """Step 1: WiFi network selection"""
@@ -328,7 +361,7 @@ def setup_wifi():
                 }});
 
                 if (result.success) {{
-                    window.location.href = '/setup/info';
+                    window.location.href = '/setup/crew';
                 }} else {{
                     btn.disabled = false;
                     btn.textContent = 'CONNECT →';
@@ -360,9 +393,9 @@ def setup_info():
             <label>FIRST NAME:</label>
             <input type="text" name="user_name" placeholder="Enter your first name" required>
 
-            <label>YOUR CREW:</label>
+            <label>FRIEND NAMES (optional):</label>
             <input type="text" name="contacts" placeholder="Amy, Ben, Sarah">
-            <div class="hint">Comma-separated names of friends with LEELOOs</div>
+            <div class="hint">Names of friends you want to share music with</div>
 
             <label>ZIP CODE (for weather):</label>
             <input type="text" name="zip_code" placeholder="27601" pattern="[0-9]{5}" maxlength="5" required>
@@ -394,7 +427,7 @@ def setup_info():
                 });
 
                 if (result.success) {
-                    window.location.href = '/setup/crew';
+                    window.location.href = '/setup/guide';
                 } else {
                     btn.disabled = false;
                     btn.textContent = 'CONTINUE →';
@@ -576,18 +609,24 @@ def setup_crew_created():
             Share this with your friends:
         </p>
 
-        <div class="invite-code" id="inviteCode">
+        <div class="invite-code" id="inviteCode" onclick="selectCode()">
             {invite_url}
         </div>
+        <p style="font-size: 11px; color: #6A6A8A; margin-top: -10px;">
+            ☝️ Tap to select, then copy/paste
+        </p>
 
         <div class="share-buttons">
-            <button type="button" class="share-btn" onclick="copyCode()">COPY</button>
-            <button type="button" class="share-btn" onclick="shareText()">TEXT</button>
-            <button type="button" class="share-btn" onclick="shareEmail()">EMAIL</button>
+            <button type="button" class="share-btn" onclick="copyCode()">COPY TO CLIPBOARD</button>
         </div>
 
-        <button type="button" onclick="window.location.href='/setup/guide'" style="margin-top: 20px;">
-            CONTINUE TO GUIDE
+        <p style="font-size: 12px; color: #C2995E; margin: 15px 0; padding: 10px; background: #2A2D3E;">
+            💡 This code is saved on your device!<br>
+            Send to homies when you're done with setup.
+        </p>
+
+        <button type="button" onclick="window.location.href='/setup/info'" style="margin-top: 10px;">
+            CONTINUE
         </button>
     </div>
 
@@ -624,33 +663,49 @@ def setup_crew_created():
         const crewName = '{crew_name}';
         const shareMessage = `Join my LEELOO crew "${{crewName}}"! Go to ${{inviteUrl}}`;
 
-        function copyCode() {{
-            navigator.clipboard.writeText(inviteUrl).then(() => {{
-                alert('Copied to clipboard!');
-            }}).catch(() => {{
-                // Fallback for older browsers
-                const el = document.getElementById('inviteCode');
-                const range = document.createRange();
-                range.selectNode(el);
-                window.getSelection().removeAllRanges();
-                window.getSelection().addRange(range);
-                document.execCommand('copy');
-                window.getSelection().removeAllRanges();
-                alert('Copied!');
-            }});
+        function selectCode() {{
+            // Select text when tapped
+            const el = document.getElementById('inviteCode');
+            const range = document.createRange();
+            range.selectNodeContents(el);
+            const selection = window.getSelection();
+            selection.removeAllRanges();
+            selection.addRange(range);
         }}
 
-        function shareText() {{
-            if (navigator.share) {{
-                navigator.share({{ text: shareMessage }});
+        function copyCode() {{
+            // Try modern clipboard API first
+            if (navigator.clipboard && navigator.clipboard.writeText) {{
+                navigator.clipboard.writeText(inviteUrl).then(() => {{
+                    alert('✅ Copied to clipboard!\\n\\nYou can now paste it in a text or email.');
+                }}).catch(err => {{
+                    console.error('Clipboard error:', err);
+                    selectCode();
+                    alert('Text selected! Use your phone\\'s copy function.');
+                }});
             }} else {{
-                window.location.href = 'sms:?body=' + encodeURIComponent(shareMessage);
+                // Fallback: select text so user can manually copy
+                selectCode();
+                alert('Text selected! Tap Copy in the menu that appears.');
             }}
         }}
 
-        function shareEmail() {{
-            const subject = 'Join my LEELOO crew!';
-            window.location.href = 'mailto:?subject=' + encodeURIComponent(subject) + '&body=' + encodeURIComponent(shareMessage);
+        function shareNative() {{
+            // Use native share if available (works on iOS/Android)
+            if (navigator.share) {{
+                navigator.share({{
+                    title: 'Join my LEELOO crew!',
+                    text: shareMessage
+                }}).catch(err => {{
+                    // User cancelled or share failed
+                    if (err.name !== 'AbortError') {{
+                        console.error('Share error:', err);
+                    }}
+                }});
+            }} else {{
+                // Fallback to SMS
+                window.open('sms:?body=' + encodeURIComponent(shareMessage), '_blank');
+            }}
         }}
     </script>
     """
@@ -744,8 +799,8 @@ def setup_crew_joined():
             Members: {members if members else 'You'}
         </p>
 
-        <button type="button" onclick="window.location.href='/setup/guide'" style="margin-top: 20px;">
-            CONTINUE TO GUIDE
+        <button type="button" onclick="window.location.href='/setup/info'" style="margin-top: 20px;">
+            CONTINUE
         </button>
     </div>
     """
@@ -895,14 +950,33 @@ def setup_guide():
 
 @app.route('/done')
 def done():
-    """Setup complete"""
+    """Setup complete - trigger WiFi connection"""
     content = """
     <div class="terminal-box" style="text-align: center; border-color: #719253;">
         <div style="font-size: 48px; margin: 20px 0;">✓</div>
         <h1 style="color: #719253;">SETUP COMPLETE</h1>
-        <p style="margin: 20px 0;">Your LEELOO is ready!</p>
-        <p style="color: #6A6A8A; font-size: 12px;">You can close this page now.</p>
+        <p style="margin: 20px 0;" id="status">Connecting to WiFi...</p>
+        <p style="color: #6A6A8A; font-size: 12px;" id="instructions">Please wait...</p>
     </div>
+
+    <script>
+        // Trigger WiFi connection immediately
+        fetch('/api/finish', {method: 'POST'})
+            .then(res => res.json())
+            .then(data => {
+                if (data.success) {
+                    document.getElementById('status').textContent = 'Your LEELOO is ready!';
+                    document.getElementById('instructions').textContent = 'You can close this page now.';
+                } else {
+                    document.getElementById('status').textContent = 'Setup saved!';
+                    document.getElementById('instructions').textContent = 'Power cycle your LEELOO to connect to WiFi.';
+                }
+            })
+            .catch(err => {
+                document.getElementById('status').textContent = 'Setup saved!';
+                document.getElementById('instructions').textContent = 'Power cycle your LEELOO to connect to WiFi.';
+            });
+    </script>
     """
     return render_page("LEELOO - Ready", content)
 
@@ -937,7 +1011,7 @@ def api_networks():
 
 @app.route('/api/wifi', methods=['POST'])
 def api_wifi():
-    """Connect to WiFi network"""
+    """Save WiFi credentials (don't connect yet - wait until setup is complete)"""
     data = request.get_json()
     ssid = data.get('ssid')
     password = data.get('password')
@@ -945,22 +1019,25 @@ def api_wifi():
     if not ssid or not password:
         return jsonify({'success': False, 'error': 'Missing SSID or password'})
 
+    # Save WiFi credentials to config (we'll connect after setup is complete)
+    config = load_config()
+    config['wifi_ssid'] = ssid
+    config['wifi_password'] = password
+
+    try:
+        with open(CONFIG_PATH, 'w') as f:
+            json.dump(config, f, indent=2)
+        sync_config_to_gadget()
+        print(f"WiFi credentials saved: {ssid}")
+    except Exception as e:
+        print(f"Error saving WiFi config: {e}")
+        return jsonify({'success': False, 'error': 'Failed to save WiFi credentials'})
+
     setup_state['ssid'] = ssid
-    setup_state['step'] = 'connecting'
-    update_lcd('connecting', ssid=ssid)
+    setup_state['step'] = 'info'
 
-    # Try to connect
-    if connect_to_wifi(ssid, password):
-        setup_state['connected'] = True
-        update_lcd('connected')
-        return jsonify({'success': True})
-    else:
-        setup_state['error'] = f'Failed to connect to {ssid}'
-        update_lcd('error', message='Connection failed')
-
-        # Restart AP mode so user can try again
-        start_ap_mode()
-        return jsonify({'success': False, 'error': f'Failed to connect to {ssid}'})
+    # Success! Phone can now proceed to step 2
+    return jsonify({'success': True})
 
 
 @app.route('/api/info', methods=['POST'])
@@ -981,7 +1058,25 @@ def api_info():
     # Parse contacts
     contacts = [c.strip() for c in contacts_str.split(',') if c.strip()]
 
-    # Save config with zip_code (weather API will use this)
+    # Convert ZIP to lat/lon using geocoding API (free, no key needed)
+    latitude, longitude = None, None
+    try:
+        import requests
+        # Use Nominatim (OpenStreetMap's free geocoding service)
+        url = f"https://nominatim.openstreetmap.org/search?postalcode={zip_code}&country=US&format=json&limit=1"
+        headers = {'User-Agent': 'LEELOO-Setup/1.0'}
+        resp = requests.get(url, headers=headers, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data:
+                latitude = float(data[0]['lat'])
+                longitude = float(data[0]['lon'])
+                print(f"Converted ZIP {zip_code} to lat/lon: {latitude}, {longitude}")
+    except Exception as e:
+        print(f"ZIP to lat/lon conversion failed: {e}")
+        # Continue without coordinates - weather won't work but setup can complete
+
+    # Save config with lat/lon for weather
     # Note: setup_complete will be set after crew setup
     config = load_config()
     config.update({
@@ -991,9 +1086,15 @@ def api_info():
         'wifi_ssid': setup_state.get('ssid', ''),
     })
 
+    # Add lat/lon if we got them
+    if latitude and longitude:
+        config['latitude'] = latitude
+        config['longitude'] = longitude
+
     try:
         with open(CONFIG_PATH, 'w') as f:
             json.dump(config, f, indent=2)
+        sync_config_to_gadget()
         print(f"Config saved: {config}")
     except Exception as e:
         print(f"Error saving config: {e}")
@@ -1009,6 +1110,43 @@ def load_config():
             return json.load(f)
     except:
         return {}
+
+
+def sync_config_to_gadget():
+    """Sync captive portal config to gadget_main format"""
+    try:
+        # Read captive portal config
+        with open(CONFIG_PATH, 'r') as f:
+            portal_config = json.load(f)
+
+        # Create device_config.json for gadget_main
+        device_config = {
+            "latitude": portal_config.get("location", {}).get("latitude"),
+            "longitude": portal_config.get("location", {}).get("longitude"),
+            "zip_code": portal_config.get("location", {}).get("zip_code"),
+            "user_name": portal_config.get("user_name")
+        }
+
+        device_config_path = "/home/pi/leeloo-ui/device_config.json"
+        with open(device_config_path, 'w') as f:
+            json.dump(device_config, f, indent=2)
+
+        # Create crew_config.json for gadget_main
+        crew_data = portal_config.get("crew", {})
+        crew_config = {
+            "name": crew_data.get("name"),
+            "invite_code": crew_data.get("invite_code"),
+            "is_creator": crew_data.get("is_creator", False),
+            "members": portal_config.get("contacts", [])
+        }
+
+        crew_config_path = "/home/pi/leeloo-ui/crew_config.json"
+        with open(crew_config_path, 'w') as f:
+            json.dump(crew_config, f, indent=2)
+
+        print(f"Synced config to gadget_main format: device_config.json, crew_config.json")
+    except Exception as e:
+        print(f"Error syncing config to gadget format: {e}")
 
 
 def generate_invite_code():
@@ -1047,6 +1185,7 @@ def api_crew_create():
     try:
         with open(CONFIG_PATH, 'w') as f:
             json.dump(config, f, indent=2)
+        sync_config_to_gadget()
         print(f"Crew created: {crew_name} ({invite_code})")
     except Exception as e:
         print(f"Error saving crew config: {e}")
@@ -1054,6 +1193,9 @@ def api_crew_create():
 
     setup_state['step'] = 'done'
     update_lcd('success')
+
+    # Note: WiFi connection happens AFTER portal exits
+    # See connect_saved_wifi.py which runs after Ctrl+C
 
     return jsonify({
         'success': True,
@@ -1096,6 +1238,7 @@ def api_crew_join():
     try:
         with open(CONFIG_PATH, 'w') as f:
             json.dump(config, f, indent=2)
+        sync_config_to_gadget()
         print(f"Joined crew: {simulated_crew_name}")
     except Exception as e:
         print(f"Error saving crew config: {e}")
@@ -1104,11 +1247,38 @@ def api_crew_join():
     setup_state['step'] = 'done'
     update_lcd('success')
 
+    # Note: WiFi connection happens AFTER portal exits
+    # See connect_saved_wifi.py which runs after Ctrl+C
+
     return jsonify({
         'success': True,
         'crew_name': simulated_crew_name,
         'members': simulated_members
     })
+
+
+@app.route('/api/finish', methods=['POST'])
+def api_finish():
+    """Finish setup and connect to WiFi"""
+    import subprocess
+
+    config = load_config()
+
+    if not config.get('setup_complete'):
+        return jsonify({'success': False, 'error': 'Setup not complete'})
+
+    # Trigger WiFi connection in background (don't wait for it)
+    try:
+        subprocess.Popen(
+            ['sudo', 'python3', '/home/pi/leeloo-ui/connect_saved_wifi.py'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True  # Detach from parent
+        )
+        return jsonify({'success': True, 'message': 'Connecting to WiFi...'})
+    except Exception as e:
+        print(f"Failed to trigger WiFi connection: {e}")
+        return jsonify({'success': False, 'error': str(e)})
 
 
 # ============================================

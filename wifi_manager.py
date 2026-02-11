@@ -85,8 +85,36 @@ def write_dnsmasq_config():
     """Write dnsmasq configuration for DHCP and DNS redirect"""
     config = f"""# LEELOO AP Mode - DHCP and captive portal redirect
 interface=wlan0
+bind-interfaces
+
+# DHCP Server
 dhcp-range={AP_DHCP_START},{AP_DHCP_END},{AP_NETMASK},24h
+dhcp-option=3,{AP_IP}
+dhcp-option=6,{AP_IP}
+
+# DNS Settings - don't use upstream servers (no internet)
+no-resolv
+no-poll
+
+# Redirect ALL DNS queries to our portal
 address=/#/{AP_IP}
+
+# Specific captive portal detection URLs
+# iOS/macOS
+address=/captive.apple.com/{AP_IP}
+address=/apple.com/{AP_IP}
+
+# Android
+address=/clients3.google.com/{AP_IP}
+address=/connectivitycheck.gstatic.com/{AP_IP}
+address=/www.google.com/{AP_IP}
+
+# Windows
+address=/msftconnecttest.com/{AP_IP}
+address=/www.msftconnecttest.com/{AP_IP}
+
+# Firefox
+address=/detectportal.firefox.com/{AP_IP}
 """
 
     try:
