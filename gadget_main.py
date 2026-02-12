@@ -166,6 +166,7 @@ def main_loop():
             if music_data:
                 album_data = {
                     'artist': music_data.get('artist', ''),
+                    'album': music_data.get('album', ''),
                     'track': music_data.get('track', ''),
                     'bpm': music_data.get('bpm'),
                     'listeners': music_data.get('listeners'),

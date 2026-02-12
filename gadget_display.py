@@ -431,6 +431,15 @@ class LeelooDisplay:
         self.draw.rectangle([label_x - 2, y - 6, label_x + label_width + 2, y + 6], fill=COLORS['bg'])
         self.draw.text((label_x, y - 5), label, font=self.font_tiny, fill=COLORS['green'])
 
+        # Render album info with text truncation for long names
+        from text_scroller import truncate_text, center_text_in_box
+
+        # Fixed 210px text box constraint - all text must fit within this
+        text_box_width = 210
+        # Calculate left edge of text box (centered within the album frame)
+        box_width = box_right - 7  # Total available width
+        text_box_left = 7 + (box_width - text_box_width) // 2
+
         if album_data is None:
             # Empty state - no music shared yet
             empty_text = "awaiting music"
@@ -438,45 +447,53 @@ class LeelooDisplay:
                 text_width = self.font_tiny.getlength(empty_text)
             except:
                 text_width = len(empty_text) * 7
-            text_x = 7 + (box_right - 7) // 2 - text_width // 2
+            text_x = text_box_left + (text_box_width - text_width) // 2
             text_y = y + box_height // 2 - 6
             self.draw.text((text_x, text_y), empty_text, font=self.font_tiny, fill=self._dim_color(COLORS['green']))
         else:
-            # Artist name (large, bold green) - CENTERED
+            content_y = y + 8
+
+            # Artist name - CENTERED within text box, truncated if too long
             artist_text = album_data.get('artist', '')
             if artist_text:
-                try:
-                    artist_width = self.font_large.getlength(artist_text)
-                except:
-                    artist_width = len(artist_text) * 9
-                artist_x = 7 + (box_right - 7) // 2 - artist_width // 2
-                self.draw.text((artist_x, y + 8), artist_text, font=self.font_large, fill=COLORS['green'])
+                artist_truncated = truncate_text(artist_text, self.font_large, text_box_width)
+                artist_x = text_box_left + center_text_in_box(artist_truncated, self.font_large, text_box_width)
+                self.draw.text((artist_x, content_y), artist_truncated, font=self.font_large, fill=COLORS['green'])
+                content_y += 16
 
-            # Track name (large, same size as artist) - CENTERED
+            # Album name - CENTERED within text box, truncated if too long
+            album_text = album_data.get('album', '')
+            if album_text:
+                album_truncated = truncate_text(album_text, self.font_tiny, text_box_width)
+                album_x = text_box_left + center_text_in_box(album_truncated, self.font_tiny, text_box_width)
+                self.draw.text((album_x, content_y), album_truncated, font=self.font_tiny, fill=COLORS['green'])
+                content_y += 14
+
+            # Track name - CENTERED within text box, in quotes, truncated if too long
             track_text = album_data.get('track', '')
             if track_text:
                 track_display = f'"{track_text}"'
-                try:
-                    track_width = self.font_large.getlength(track_display)
-                except:
-                    track_width = len(track_display) * 9
-                track_x = 7 + (box_right - 7) // 2 - track_width // 2
-                self.draw.text((track_x, y + 24), track_display, font=self.font_large, fill=COLORS['green'])
+                track_truncated = truncate_text(track_display, self.font_large, text_box_width)
+                track_x = text_box_left + center_text_in_box(track_truncated, self.font_large, text_box_width)
+                self.draw.text((track_x, content_y), track_truncated, font=self.font_large, fill=COLORS['green'])
+                content_y += 16
 
-            # BPM (if available)
-            bpm = album_data.get('bpm')
-            if bpm:
-                self.draw.text((12, y + 44), f"{bpm} BPM", font=self.font_tiny, fill=COLORS['green'])
-
-            # Monthly listeners (if available)
+            # Monthly listeners - CENTERED within text box
             listeners = album_data.get('listeners')
             if listeners:
-                self.draw.text((12, y + 58), f"{listeners} monthly listeners", font=self.font_tiny, fill=COLORS['green'])
+                listeners_text = f"{listeners} monthly listeners"
+                listeners_truncated = truncate_text(listeners_text, self.font_tiny, text_box_width)
+                listeners_x = text_box_left + center_text_in_box(listeners_truncated, self.font_tiny, text_box_width)
+                self.draw.text((listeners_x, content_y), listeners_truncated, font=self.font_tiny, fill=COLORS['green'])
+                content_y += 14
 
-            # pushed by (rose color) - if available
+            # "pushed by" - CENTERED within text box
             pushed_by = album_data.get('pushed_by')
             if pushed_by:
-                self.draw.text((12, y + 74), f"pushed by {pushed_by}", font=self.font_tiny, fill=COLORS['rose'])
+                pushed_text = f"pushed by {pushed_by}"
+                pushed_truncated = truncate_text(pushed_text, self.font_tiny, text_box_width)
+                pushed_x = text_box_left + center_text_in_box(pushed_truncated, self.font_tiny, text_box_width)
+                self.draw.text((pushed_x, content_y), pushed_truncated, font=self.font_tiny, fill=COLORS['rose'])
     
     def draw_album_art(self, album_art_path=None, show_empty_scancode=False):
         """

@@ -17,7 +17,9 @@ class Config:
     # =========================================================================
 
     # Base directory (can be overridden with LEELOO_HOME env var)
-    LEELOO_HOME = os.environ.get("LEELOO_HOME", "/home/pi/leeloo-ui")
+    # Default to current directory if not on Pi
+    _default_home = "/home/pi/leeloo-ui" if os.path.exists("/home/pi") else os.getcwd()
+    LEELOO_HOME = os.environ.get("LEELOO_HOME", _default_home)
 
     # Device configuration file
     CONFIG_FILE = os.path.join(LEELOO_HOME, "device_config.json")

@@ -143,6 +143,38 @@ python3 demo_message_expand.py
 sudo systemctl start gadget.service
 ```
 
+### Spotify Integration
+
+Share music with scannable Spotify codes! The display supports:
+- **Spotify scancodes** - Downloadable QR codes from `scannables.scdn.co`
+- **Album art** - Scraped from Spotify web pages (no OAuth required)
+- **Track metadata** - Artist, album, track name, monthly listeners
+- **Persistent display** - Saves to `current_music.json` for main loop
+
+#### Sharing Music
+
+```bash
+# Share a track by URL
+python3 test_spotify_display.py "https://open.spotify.com/track/4LIpeIN0AxFMRhnm5tR0HJ"
+
+# Natural language (requires Spotify API auth)
+python3 test_spotify_display.py "share sabotage by beastie boys"
+```
+
+The display will show:
+- Album art (243x244px) filling the space above the scancode
+- Spotify scancode (243x60px) pinned to the bottom
+- Album info box with artist, album, track, listeners (210px-wide text box)
+
+#### Technical Details
+
+- **Display dimensions**: 243x304px (4:5 aspect ratio, matches Spotify scancode placeholder)
+- **Text constraint**: 210px-wide centered text box with truncation
+- **Scraping**: Uses `og:image` and `og:title` meta tags from Spotify pages
+- **No authentication**: Works without Spotify OAuth (but limited to URL-based sharing)
+
+See `SPOTIFY_SCANCODE_TEST.md` for full testing guide.
+
 ### File Structure
 
 ```
@@ -150,13 +182,17 @@ TipTop UI/
 ├── gadget_main.py           # Main loop service
 ├── gadget_display.py        # LeelooDisplay renderer
 ├── leeloo_ui_manager.py     # Event-driven UI state machine
+├── test_spotify_display.py  # Spotify scancode testing
+├── music_request_parser.py  # Natural language music requests
+├── text_scroller.py         # Text truncation utilities
 ├── demo_weather_typewriter.py   # Weather expansion demo
 ├── demo_message_expand.py   # Reaction GIF demo
 ├── display/
 │   ├── __init__.py
 │   ├── frame_animator.py    # Expand/collapse animations
 │   └── fast_fb.py           # Fast framebuffer (numpy)
-├── doorways-album.jpg       # Album artwork
+├── album_art/               # Downloaded scancodes & album art
+├── lessons_*.md             # Debugging lessons learned
 └── README.md
 ```
 
