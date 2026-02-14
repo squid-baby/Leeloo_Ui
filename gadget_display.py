@@ -31,11 +31,11 @@ def get_moon_phase():
 # Color palette - matches React UI exactly
 COLORS = {
     'bg': '#1A1D2E',            # leeloo-navy (dark background)
-    'green': '#719253',          # leeloo-green (album box)
+    'green': '#7beec0',          # leeloo-green (album box) - updated to mint/teal
     'purple': '#9C93DD',         # leeloo-purple (time box)
     'rose': '#D6697F',           # leeloo-rose (pushed by text)
     'tan': '#C2995E',            # leeloo-tan (weather box)
-    'lavender': '#A7AFD4',       # leeloo-lavender (messages box)
+    'lavender': '#d978f9',       # leeloo-lavender (messages box) - updated to purple-pink
     'white': '#FFFFFF',
     'orange': '#FF8800',         # Spotify code / UV high
     'yellow': '#D4A84B',         # UV moderate (muted yellow)
@@ -478,23 +478,30 @@ class LeelooDisplay:
                 self.draw.text((track_x, content_y), track_truncated, font=self.font_large, fill=COLORS['green'])
                 content_y += 16
 
-            # Monthly listeners - CENTERED within text box
+            # Monthly listeners - LEFT-ALIGNED, 4px from album frame edge, in yellow
             listeners = album_data.get('listeners')
             if listeners:
                 listeners_text = f"{listeners} monthly listeners"
                 listeners_truncated = truncate_text(listeners_text, self.font_tiny, text_box_width)
-                listeners_x = text_box_left + center_text_in_box(listeners_truncated, self.font_tiny, text_box_width)
-                self.draw.text((listeners_x, content_y), listeners_truncated, font=self.font_tiny, fill=COLORS['green'])
+                listeners_x = 7 + 4  # 4px buffer from album frame left edge
+                self.draw.text((listeners_x, content_y), listeners_truncated, font=self.font_tiny, fill=COLORS['yellow'])
                 content_y += 14
 
-            # "pushed by" - CENTERED within text box
+            # "pushed by" - LEFT-ALIGNED, 4px from album frame edge
             pushed_by = album_data.get('pushed_by')
             if pushed_by:
                 pushed_text = f"pushed by {pushed_by}"
                 pushed_truncated = truncate_text(pushed_text, self.font_tiny, text_box_width)
-                pushed_x = text_box_left + center_text_in_box(pushed_truncated, self.font_tiny, text_box_width)
+                pushed_x = 7 + 4  # 4px buffer from album frame left edge
                 self.draw.text((pushed_x, content_y), pushed_truncated, font=self.font_tiny, fill=COLORS['rose'])
-    
+                content_y += 14
+
+            # "ask for more info" - LEFT-ALIGNED, 4px from album frame edge, in lavender (messages purple)
+            ask_text = "ask for more info"
+            ask_truncated = truncate_text(ask_text, self.font_tiny, text_box_width)
+            ask_x = 7 + 4  # 4px buffer from album frame left edge
+            self.draw.text((ask_x, content_y), ask_truncated, font=self.font_tiny, fill=COLORS['lavender'])
+
     def draw_album_art(self, album_art_path=None, show_empty_scancode=False):
         """
         Draw the album art on the right side - maintains aspect ratio, with frame

@@ -206,8 +206,137 @@ async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
 2. 🔄 Implement token expiry tracking (don't wait for 401)
 3. 🔄 Add retry logic for network failures
 4. 🔄 Cache album art for offline display
-5. 🔄 Add album art for shared music with scancodes
+5. ✅ ~~Add album art for shared music with scancodes~~
 
 ---
 
-Made with ♪ by squid-baby & Claude Sonnet 4.5
+# Session 2 - Album Info & Monthly Listeners (Feb 14, 2026 evening)
+
+## Session Summary
+Added real monthly listeners to the album info display by web scraping Spotify artist pages. Replaced the plain-text "Now Playing" bar with a custom pixel-art `nowplaying.png`. Refined album info layout with color-coded, left-justified text.
+
+---
+
+## Key Lessons
+
+### 11. **Spotify API Does NOT Return Followers/Popularity**
+**Problem:** The `/v1/artists/{id}` endpoint returns an empty `followers: {}` object — no `total`, no `popularity`, no `genres`. This affects both user tokens AND client credentials tokens, even for major artists (Drake, Taylor Swift).
+**Solution:** Web scrape the public Spotify artist page (`open.spotify.com/artist/{id}`). The `og:description` meta tag reliably contains `"Artist · X.XM monthly listeners."` — parse with regex.
+
+### 12. **Web Scraping Spotify for Monthly Listeners Works Reliably**
+- The `og:description` meta tag format: `"Artist · 3.6M monthly listeners."`
+- Regex: `r'<meta\s+property="og:description"\s+content="[^"]*?(\d[\d,.]*[MKB]?)\s*monthly\s*listener'`
+- Exact count also in page body: `3,625,445 monthly listeners`
+- Simple `requests.get()` with User-Agent header — no JS rendering needed
+- Works on Pi with no extra dependencies
+
+### 13. **Cache Scraped Data to Avoid Rate Limiting**
+- Monthly listeners don't change frequently — cache per artist for 1 hour
+- In-memory dict: `_listeners_cache = {artist_id: (listeners_str, timestamp)}`
+- Prevents hitting Spotify's web page every 30-second music update cycle
+- Cache survives across update cycles within same process
+
+### 14. **Running Process Uses Old Code Until Restarted**
+- Editing files on Pi does NOT affect the running `gadget_main.py` process
+- The process loaded code at startup and keeps using it
+- Must `sudo pkill -f gadget_main.py` — auto-restarts with new code within seconds
+- Always verify new PID and start time with `ps aux`
+
+### 15. **Album Art Cache Must Be Cleared When Changing Image Composition**
+- Cached `.jpg` files in `album_art/` are the final composited images (art + bar)
+- Changing `nowplaying.png` or the composition code requires clearing the cache
+- `rm -f /home/pi/leeloo-ui/album_art/*.jpg` forces regeneration on next cycle
+- The `download_and_create_album_art()` function skips download if cache exists
+
+### 16. **Custom Image Assets Need Aspect-Aware Scaling**
+- `nowplaying.png` is 800x201, target bar is 243x60
+- Scale to fit width first, then check if height exceeds bar — if so, fit to height instead
+- Center the scaled image in the bar area for clean positioning
+- Handle RGBA mode for transparency support in PNG overlays
+
+### 17. **Shared Music Also Needs Listeners Data**
+- When crew members push songs, the payload doesn't include listeners
+- Added `get_listeners_for_artist_name()` — searches Spotify for artist ID, then scrapes
+- `update_music_display()` backfills listeners on shared music that arrives without them
+- Uses client credentials token for search (no user scope needed)
+
+---
+
+## Technical Patterns
+
+### Web Scraping Pattern for Spotify Data
+```python
+def scrape_monthly_listeners(artist_id):
+    url = f"https://open.spotify.com/artist/{artist_id}"
+    headers = {"User-Agent": "Mozilla/5.0 ..."}
+    resp = requests.get(url, headers=headers, timeout=10)
+
+    # Parse og:description meta tag
+    match = re.search(
+        r'<meta\s+property="og:description"\s+content="[^"]*?'
+        r'(\d[\d,.]*[MKB]?)\s*monthly\s*listener',
+        resp.text, re.IGNORECASE
+    )
+    if match:
+        return match.group(1)  # e.g., "3.6M"
+```
+
+### Deploy-to-Pi Pattern
+```bash
+# 1. Copy files
+sshpass -p 'gadget' scp file.py pi@leeloo.local:/home/pi/leeloo-ui/
+
+# 2. Clear cache if image composition changed
+sshpass -p 'gadget' ssh pi@leeloo.local "rm -f /home/pi/leeloo-ui/album_art/*.jpg"
+
+# 3. Restart process (auto-restarts within seconds)
+sshpass -p 'gadget' ssh pi@leeloo.local "sudo pkill -f gadget_main.py"
+
+# 4. Verify
+sshpass -p 'gadget' ssh pi@leeloo.local "ps aux | grep gadget_main"
+```
+
+---
+
+## Files Modified This Session
+
+### Pi Scripts (deployed to `/home/pi/leeloo-ui/`)
+- `leeloo_music_manager.py` - Replaced broken API call with web scraping for real monthly listeners
+- `leeloo_album_art.py` - Now uses `nowplaying.png` instead of plain text for "Now Playing" bar
+- `gadget_display.py` - Monthly listeners in yellow, "pushed by" + "ask for more info" left-aligned
+
+### New Assets
+- `nowplaying.png` - Custom pixel-art "NOW PLAYING" bar (800x201, scaled to 243x60)
+
+### React UI
+- `Retro-Music-Panel/client/src/index.css` - Added `--color-gadget-yellow: #D4A84B`
+- `Retro-Music-Panel/client/src/components/Gadget.tsx` - Listeners in yellow, pushed by left-aligned
+
+---
+
+## Album Info Layout (in album frame)
+```
+  Artist Name          (centered, green, bold)
+  Album Name           (centered, green)
+  "Track Name"         (centered, green, bold, in quotes)
+  3.6M monthly listeners  (left, yellow, 4px from frame)
+  pushed by Amy           (left, rose, 4px from frame)
+  ask for more info       (left, lavender/purple, 4px from frame)
+```
+
+---
+
+## Color Reference
+| Element | Color Name | Hex | Usage |
+|---------|-----------|-----|-------|
+| Monthly listeners | yellow | `#D4A84B` | Left-aligned in album box |
+| Pushed by | rose | `#D6697F` | Left-aligned in album box |
+| Ask for more info | lavender | `#d978f9` | Left-aligned in album box |
+| Artist/Album/Track | green | `#7beec0` | Centered in album box |
+| Weather | tan | `#C2995E` | Weather box data |
+| Time | purple | `#9C93DD` | Time box data |
+| Messages | lavender | `#d978f9` | Messages box frame |
+
+---
+
+Made with ♪ by squid-baby & Claude Opus 4.6
