@@ -520,4 +520,151 @@ async def _handle_message_with_music(self, sender, text):
 
 ---
 
+---
+
+# Session 5 — Spotify OAuth Restore, Portal UX Fixes, Weather Accuracy (Feb 15, 2026)
+
+## Session Summary
+Restored the full Spotify OAuth flow as a 3-touchpoint experience (portal teaser → welcome screen QR → background Now Playing). Fixed captive portal crashes, clipboard failures, display race conditions, weather inaccuracy, text overflow, and nowplaying.png sizing. Four clean-slate tests performed to validate each fix round.
+
+---
+
+## Key Lessons
+
+### 34. **Captive Portals Have No Internet — Don't Open External URLs**
+**Problem:** Adding a "Connect Spotify" button in the captive portal crashed the flow. The Pi is in AP mode during setup — there is NO internet.
+**Solution:** Make the Spotify step info-only ("SOUNDS GOOD" button → next step). Defer actual OAuth to the welcome screen after boot when WiFi is connected.
+**Lesson:** During AP mode, the Pi IS the network. No external URLs, no OAuth, no API calls. Portal steps must be self-contained.
+
+### 35. **navigator.clipboard Requires Secure Context (HTTPS)**
+**Problem:** "Copy to Clipboard" button in captive portal only highlighted text instead of copying.
+**Root Cause:** `navigator.clipboard.writeText()` requires HTTPS or localhost. Captive portals run on HTTP (port 80).
+**Solution:** Use `document.execCommand('copy')` with a hidden textarea. Falls back to `window.getSelection()` text selection if even that fails.
+**Lesson:** Captive portals run in a degraded browser environment. No clipboard API, no service workers, no crypto.subtle. Use legacy DOM APIs.
+
+### 36. **Deferred Token Delivery via Pending Map**
+**Problem:** User completes Spotify OAuth on their phone while the Pi is still in AP mode (no WebSocket connection). Tokens have nowhere to go.
+**Solution:** Server stores tokens in `pendingSpotifyTokens` Map keyed by device_id. On device registration/crew join, checks map and delivers tokens. 1-hour expiry.
+**Lesson:** When the receiver might be offline during an async flow, implement a pending delivery queue on the intermediary.
+
+### 37. **OAuth state= Parameter Must Use Actual Device ID**
+**Problem:** Portal-generated device ID was `leeloo_leeloo_wfjs` (double prefix bug). Device registered on WebSocket as `leeloo_b4e8a0df00da`. Pending tokens stored under wrong key — never delivered.
+**Solution:** Generate OAuth URL in the brain using `self.ws_client.config.device_id` (the actual WebSocket device ID), not a computed one.
+**Lesson:** For token delivery to work, the OAuth `state` parameter must exactly match the ID the server knows the device by. Get it from the source of truth.
+
+### 38. **asyncio.create_task() Doesn't Execute Immediately**
+**Problem:** Set `_welcome_qr_active = True` as first line inside the async welcome task, but the display loop overwrote the QR on the very first tick — before the task had a chance to run.
+**Root Cause:** `asyncio.create_task()` schedules the coroutine but doesn't execute it until the event loop yields. The display loop tick fires first.
+**Solution:** Set the guard flag BEFORE `create_task()`:
+```python
+self._welcome_qr_active = True  # Block display loop NOW
+self._expand_task = asyncio.create_task(self._show_welcome_with_qr())
+```
+**Lesson:** Guard flags for async tasks must be set synchronously before task creation, not inside the task body. The task might not start executing for several event loop iterations.
+
+### 39. **Guard the Entire Display Tick, Not Just Sub-functions**
+**Problem:** Guarded `_update_music()` with `_welcome_qr_active` flag, but `_display_tick()` still called `_render_normal()` which used the fallback empty scancode image.
+**Solution:** Guard at the top of `_display_tick()`:
+```python
+def _display_tick(self):
+    if self._welcome_qr_active:
+        return  # Don't touch display during welcome QR
+    self._update_weather()
+    self._update_music()
+    self._render_normal()
+```
+**Lesson:** Belt AND suspenders. Guard at the highest level (entire tick) plus individual functions. Race conditions need multiple layers of defense.
+
+### 40. **Weather API: Request Current Conditions, Not Just Forecasts**
+**Problem:** User said "it's pouring outside" but LEELOO said "chance of rain." Rain slider showed 1 dot. Claude context showed all `?` for weather fields.
+**Root Cause:** `gadget_weather.py` only fetched `daily=precipitation_sum` (24hr forecast total), not `current=precipitation,weather_code`. And `build_context()` in `leeloo_intent.py` referenced fields (`condition`, `precipitation_chance`, `humidity`, `wind_speed`) that the API never returned.
+**Solution:**
+1. Added `current=precipitation,weather_code` to Open-Meteo API call
+2. Added WMO weather code lookup (`_weather_code_to_desc()`)
+3. Used `max(daily_rain, current_precip * 4)` for rain slider so active rain shows prominently
+4. Updated `build_context()` to use actual fields: `is_raining`, `weather_desc`, `current_precip_inches`
+**Lesson:** When an LLM reports stale/wrong data, check the ENTIRE pipeline: API request → response parsing → context building → LLM prompt. The bug was in 3 places.
+
+### 41. **Typewriter Text Width Must Account for Wrap + Frame Border**
+**Problem:** "spotify connected" text in expand frame overflowed the right border by ~5px.
+**Solution:** `text_region_width = box_right - 7 - 25` (was `- 20`). The extra 5px accounts for the frame border stroke width.
+**Lesson:** Text region width should leave margin for: left padding + right padding + border stroke + safety buffer.
+
+### 42. **Image Assets: Stretch to Fill, Don't Aspect-Fit**
+**Problem:** `nowplaying.png` was aspect-ratio fitted into the 243×60 scancode box, leaving empty space.
+**Solution:** `np_img.resize((ALBUM_ART_WIDTH, SCANCODE_HEIGHT))` — stretch to fill the entire box. The slight aspect ratio distortion is invisible at this scale (800×201 → 243×60).
+**Lesson:** For UI bars/decorative elements at small sizes, stretch-to-fill looks better than aspect-preserving fit with gaps.
+
+### 43. **lightdm on Raspberry Pi Shows Desktop on First Boot**
+**Problem:** Pi displayed the Raspberry Pi desktop wallpaper on first plug-in before LEELOO's splash screen.
+**Solution:** `sudo systemctl disable lightdm.service && sudo systemctl stop lightdm.service`
+**Lesson:** Pi OS Lite doesn't include lightdm, but full Pi OS does. If using framebuffer directly, disable the display manager.
+
+---
+
+## Technical Patterns
+
+### Deferred Token Delivery Pattern
+```javascript
+// Server-side: store if device offline
+const pendingSpotifyTokens = new Map();
+
+// On OAuth callback:
+if (device?.ws.readyState === WebSocket.OPEN) {
+    device.ws.send(JSON.stringify({ type: 'spotify_auth_complete', tokens }));
+} else {
+    pendingSpotifyTokens.set(deviceId, { tokens, timestamp: Date.now() });
+}
+
+// On device registration:
+if (pendingSpotifyTokens.has(deviceId)) {
+    const pending = pendingSpotifyTokens.get(deviceId);
+    if (Date.now() - pending.timestamp < 3600000) {
+        ws.send(JSON.stringify({ type: 'spotify_auth_complete', tokens: pending.tokens }));
+    }
+    pendingSpotifyTokens.delete(deviceId);
+}
+```
+
+### Async Guard Flag Pattern
+```python
+# ❌ BAD: Flag set inside task (race condition)
+self._expand_task = asyncio.create_task(self._show_welcome())
+# display loop fires before task starts → overwrites QR
+
+# ✅ GOOD: Flag set before task creation
+self._welcome_qr_active = True
+self._expand_task = asyncio.create_task(self._show_welcome())
+# display loop sees flag immediately → skips tick
+```
+
+### Full Weather Context Pattern
+```python
+# ❌ BAD: Referencing fields that don't exist
+weather_str = f"Condition: {weather.get('condition', '?')}"  # always '?'
+
+# ✅ GOOD: Use actual API response fields
+weather_desc = weather.get('weather_desc', 'unknown')
+is_raining = weather.get('is_raining', False)
+weather_str = f"Weather: {temp}F, {weather_desc}"
+if is_raining:
+    weather_str += f", CURRENTLY RAINING ({current_precip:.2f} in/hr)"
+```
+
+---
+
+## Files Modified This Session
+
+| File | Changes |
+|------|---------|
+| `captive_portal.py` | Added Spotify teaser step (info-only), fixed clipboard with textarea fallback, updated step indicators 5→6 |
+| `leeloo_server/server.js` | Added `pendingSpotifyTokens` Map, deferred token delivery on register/create/join |
+| `leeloo_client.py` | Added `on_spotify_auth` callback, `spotify_auth_complete` message handler |
+| `leeloo_brain.py` | Two-phase welcome (Telegram QR → Spotify QR), `_welcome_qr_active` guard, OAuth URL from device_id, text width fix |
+| `gadget_weather.py` | Added `current=precipitation,weather_code`, WMO code lookup, `is_raining`/`weather_desc` fields |
+| `leeloo_intent.py` | Updated `build_context()` to use actual weather fields instead of nonexistent ones |
+| `leeloo_album_art.py` | nowplaying.png stretch-to-fill instead of aspect-fit |
+
+---
+
 Made with ♪ by squid-baby & Claude Opus 4.6

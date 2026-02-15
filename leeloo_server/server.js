@@ -19,6 +19,7 @@ const TELEGRAM_API_SECRET = process.env.TELEGRAM_API_SECRET || '';
 // In-memory storage
 const devices = new Map(); // device_id -> { ws, crew_code, device_name, connected_at }
 const crews = new Map();   // crew_code -> { created_at, telegram_users: Set<int> }
+const pendingSpotifyTokens = new Map(); // device_id -> { tokens, timestamp }
 
 // Serve static landing page
 app.use(express.static('public'));
@@ -226,25 +227,38 @@ app.get('/spotify/callback', async (req, res) => {
     const tokens = await tokenResponse.json();
 
     const deviceId = state;
+    const tokenPayload = {
+      access_token: tokens.access_token,
+      refresh_token: tokens.refresh_token,
+      expires_in: tokens.expires_in
+    };
+
     const device = devices.get(deviceId);
 
     if (device && device.ws.readyState === WebSocket.OPEN) {
+      // Device is online — send tokens immediately
       device.ws.send(JSON.stringify({
         type: 'spotify_auth_complete',
-        tokens: {
-          access_token: tokens.access_token,
-          refresh_token: tokens.refresh_token,
-          expires_in: tokens.expires_in
-        }
+        tokens: tokenPayload
       }));
+      console.log(`[SPOTIFY] Tokens sent to device ${deviceId}`);
+    } else {
+      // Device not connected yet (e.g. still in portal AP mode)
+      // Store tokens for delivery when device connects
+      pendingSpotifyTokens.set(deviceId, {
+        tokens: tokenPayload,
+        timestamp: Date.now()
+      });
+      console.log(`[SPOTIFY] Tokens stored for device ${deviceId} (pending delivery)`);
     }
 
     res.send(`
       <html>
         <head><title>LEELOO - Spotify Connected</title></head>
-        <body style="font-family: Arial; text-align: center; padding: 50px;">
+        <body style="font-family: Arial; text-align: center; padding: 50px; background: #1A1D2E; color: #7beec0;">
           <h1>Spotify Connected!</h1>
-          <p>You can close this window and return to your LEELOO device.</p>
+          <p style="color: #A7AFD4;">Your LEELOO will start showing your music once it boots up.</p>
+          <p style="color: #A7AFD4;">You can close this window.</p>
         </body>
       </html>
     `);
@@ -287,6 +301,20 @@ wss.on('connection', (ws, req) => {
             device_id: deviceId
           }));
 
+          // Deliver any pending Spotify tokens
+          if (pendingSpotifyTokens.has(deviceId)) {
+            const pending = pendingSpotifyTokens.get(deviceId);
+            // Only deliver if less than 1 hour old (token expiry)
+            if (Date.now() - pending.timestamp < 3600000) {
+              ws.send(JSON.stringify({
+                type: 'spotify_auth_complete',
+                tokens: pending.tokens
+              }));
+              console.log(`[SPOTIFY] Delivered pending tokens to ${deviceId}`);
+            }
+            pendingSpotifyTokens.delete(deviceId);
+          }
+
           console.log(`Device registered: ${deviceId} (${data.device_name}) crew=${crewCode}`);
           break;
         }
@@ -313,6 +341,19 @@ wss.on('connection', (ws, req) => {
             device_id: deviceId,
             crew_code: crewCode
           }));
+
+          // Deliver any pending Spotify tokens
+          if (pendingSpotifyTokens.has(deviceId)) {
+            const pending = pendingSpotifyTokens.get(deviceId);
+            if (Date.now() - pending.timestamp < 3600000) {
+              ws.send(JSON.stringify({
+                type: 'spotify_auth_complete',
+                tokens: pending.tokens
+              }));
+              console.log(`[SPOTIFY] Delivered pending tokens to ${deviceId}`);
+            }
+            pendingSpotifyTokens.delete(deviceId);
+          }
 
           console.log(`Device ${deviceId} created crew ${crewCode}`);
           break;
@@ -360,6 +401,19 @@ wss.on('connection', (ws, req) => {
             crew_code: joinCode,
             crew_members: memberCount
           }));
+
+          // Deliver any pending Spotify tokens
+          if (pendingSpotifyTokens.has(deviceId)) {
+            const pending = pendingSpotifyTokens.get(deviceId);
+            if (Date.now() - pending.timestamp < 3600000) {
+              ws.send(JSON.stringify({
+                type: 'spotify_auth_complete',
+                tokens: pending.tokens
+              }));
+              console.log(`[SPOTIFY] Delivered pending tokens to ${deviceId}`);
+            }
+            pendingSpotifyTokens.delete(deviceId);
+          }
 
           // Notify others
           broadcastToCrew(joinCode, {

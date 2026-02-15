@@ -177,18 +177,18 @@ def build_context(weather_data=None, music_data=None, contacts=None, messages=No
     # Weather
     if weather_data:
         temp = weather_data.get('temp_f', '?')
-        condition = weather_data.get('condition', 'unknown')
-        uv = weather_data.get('uv_index', '?')
-        rain = weather_data.get('precipitation_chance', '?')
-        humidity = weather_data.get('humidity', '?')
-        wind = weather_data.get('wind_speed', '?')
-        high = weather_data.get('high_f', '?')
-        low = weather_data.get('low_f', '?')
-        parts.append(
-            f"Weather: {temp}F, {condition}, UV {uv}, "
-            f"Rain {rain}%, Humidity {humidity}%, Wind {wind}mph, "
-            f"High {high}F / Low {low}F"
-        )
+        uv = weather_data.get('uv_raw', '?')
+        rain_inches = weather_data.get('rain_24h_inches', 0)
+        weather_desc = weather_data.get('weather_desc', 'unknown')
+        is_raining = weather_data.get('is_raining', False)
+        current_precip = weather_data.get('current_precip_inches', 0)
+
+        weather_str = f"Weather: {temp}F, {weather_desc}, UV {uv}"
+        if is_raining:
+            weather_str += f", CURRENTLY RAINING ({current_precip:.2f} inches/hr)"
+        if rain_inches > 0.01:
+            weather_str += f", 24hr rain total: {rain_inches:.2f} inches"
+        parts.append(weather_str)
     else:
         parts.append("Weather: not available")
 

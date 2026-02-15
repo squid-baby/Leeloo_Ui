@@ -61,21 +61,10 @@ def create_now_playing_image(album_art_img):
     if os.path.exists(NOW_PLAYING_PNG):
         try:
             np_img = Image.open(NOW_PLAYING_PNG).convert('RGBA')
-            # Scale to fit 243 wide, maintaining aspect ratio
-            np_w, np_h = np_img.size
-            aspect = np_w / np_h
-            new_width = ALBUM_ART_WIDTH
-            new_height = int(new_width / aspect)
-            # If scaled height is taller than the bar, fit to height instead
-            if new_height > SCANCODE_HEIGHT:
-                new_height = SCANCODE_HEIGHT
-                new_width = int(new_height * aspect)
-            np_resized = np_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            # Center in the bar area
-            paste_x = (ALBUM_ART_WIDTH - new_width) // 2
-            paste_y = bar_top + (SCANCODE_HEIGHT - new_height) // 2
-            # Composite with alpha support
-            full_img.paste(np_resized, (paste_x, paste_y), np_resized if np_resized.mode == 'RGBA' else None)
+            # Stretch to fill the entire scancode box (243x60)
+            np_resized = np_img.resize((ALBUM_ART_WIDTH, SCANCODE_HEIGHT), Image.Resampling.LANCZOS)
+            # Paste directly at the bar position — fills the whole box
+            full_img.paste(np_resized, (0, bar_top), np_resized if np_resized.mode == 'RGBA' else None)
             return full_img
         except Exception as e:
             print(f"   ⚠️  Could not load nowplaying.png: {e}, falling back to text")

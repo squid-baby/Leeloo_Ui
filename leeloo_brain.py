@@ -205,6 +205,7 @@ class LeelooBrain:
 
         # Animation
         self._expand_task = None  # Current expand/hold/collapse task
+        self._welcome_qr_active = False  # Prevents display loop from overwriting QR
 
         # Fonts for typewriter
         try:
@@ -279,6 +280,7 @@ class LeelooBrain:
         self.ws_client.on_hang_confirm = self._on_ws_hang_confirm
         self.ws_client.on_member_joined = lambda name: print(f"[BRAIN] {name} came online")
         self.ws_client.on_member_offline = lambda name: print(f"[BRAIN] {name} went offline")
+        self.ws_client.on_spotify_auth = self._on_spotify_auth
 
     def _on_ws_message(self, sender, text):
         """Handle incoming crew message — detect music mentions and show album art"""
@@ -395,6 +397,30 @@ class LeelooBrain:
             self.expand_frame(FrameType.MESSAGES, lines, duration=10.0)
         )
 
+    def _on_spotify_auth(self, tokens):
+        """Handle Spotify OAuth tokens received via WebSocket"""
+        print(f"[BRAIN] Spotify connected! Triggering music refresh...")
+        # Force immediate music update to show currently playing
+        self.last_music_fetch = 0
+        # Dismiss welcome screen if showing (user just authed)
+        if self._expand_task and not self._expand_task.done():
+            self._expand_task.cancel()
+        # Show confirmation
+        asyncio.ensure_future(self._show_spotify_connected())
+
+    async def _show_spotify_connected(self):
+        """Brief confirmation that Spotify connected successfully"""
+        await asyncio.sleep(1.0)  # Let cancel settle
+        lines = [
+            ("spotify connected!", "large", COLORS['green']),
+            ("", None, None),
+            ("your music will now", "normal", COLORS['white']),
+            ("show on your LEELOO", "normal", COLORS['white']),
+        ]
+        self._expand_task = asyncio.create_task(
+            self.expand_frame(FrameType.ALBUM, lines, duration=10.0)
+        )
+
     # =========================================================================
     # DATA REFRESH
     # =========================================================================
@@ -424,9 +450,36 @@ class LeelooBrain:
                 print(f"[BRAIN] Weather fetch failed: {e}")
 
     def _update_music(self):
-        """Refresh music data"""
+        """Refresh music data — uses Spotify OAuth if tokens exist, else reads cache file."""
+        # Don't overwrite album art while welcome QR is being displayed
+        if self._welcome_qr_active:
+            return
+
         now = time.time()
         if now - self.last_music_fetch > MUSIC_REFRESH_INTERVAL:
+            # Check if user has Spotify OAuth tokens for "currently playing"
+            spotify_tokens_path = os.path.join(LEELOO_HOME, "spotify_tokens.json")
+            if os.path.exists(spotify_tokens_path):
+                try:
+                    from leeloo_music_manager import update_music_display
+                    result = update_music_display()
+                    if result:
+                        self.music_data = {
+                            'artist': result.get('artist', ''),
+                            'album': result.get('album', ''),
+                            'track': result.get('track', ''),
+                            'bpm': result.get('bpm'),
+                            'listeners': result.get('listeners'),
+                            'pushed_by': result.get('pushed_by'),
+                            'spotify_uri': result.get('spotify_uri'),
+                        }
+                        self.album_art_path = get_album_art_path(result)
+                        self.last_music_fetch = now
+                        return
+                except Exception as e:
+                    print(f"[BRAIN] Spotify currently-playing error: {e}")
+
+            # Fallback: read from current_music.json (shared music, voice-pushed, etc.)
             music_path = os.path.join(LEELOO_HOME, "current_music.json")
             music = load_json(music_path)
             if music:
@@ -547,7 +600,7 @@ class LeelooBrain:
         content_x = 7 + 10
         content_y = 16 + 25
         line_height = 22
-        text_region_width = box_right - 7 - 20
+        text_region_width = box_right - 7 - 25
         char_delay = 0.025
         line_delay = 0.08
 
@@ -1385,6 +1438,8 @@ Examples:
 
     def _display_tick(self):
         """Synchronous display update — runs in thread executor"""
+        if self._welcome_qr_active:
+            return  # Don't overwrite QR during welcome screen
         self._update_weather()
         self._update_music()
         self._render_normal()
@@ -1428,15 +1483,41 @@ Examples:
 
         return True
 
-    def _generate_welcome_qr_image(self):
+    def _should_show_spotify_qr(self):
+        """Check if we should show Spotify QR on welcome screen.
+        Only if: Telegram setup happened AND Spotify NOT already connected."""
+        telegram_opted = self.device_config.get('telegram_opted_in', False)
+        spotify_tokens_path = os.path.join(LEELOO_HOME, "spotify_tokens.json")
+        spotify_connected = os.path.exists(spotify_tokens_path)
+
+        return telegram_opted and not spotify_connected
+
+    def _generate_spotify_oauth_url(self):
+        """Generate the Spotify OAuth URL for QR code."""
+        from urllib.parse import quote
+        # Use the actual WebSocket device_id that the server knows us by.
+        # This is critical — the server uses state param to route tokens back.
+        device_id = self.ws_client.config.device_id
+        if not device_id:
+            print("[BRAIN] WARNING: No device_id yet for Spotify OAuth URL")
+            device_id = 'leeloo_unknown'
+        client_id = "f8c3c0120e694af283d7d7f7c2f67d4c"
+        redirect_uri = "https://leeloobot.xyz/spotify/callback"
+        scopes = "user-read-currently-playing user-read-playback-state"
+        return (
+            f"https://accounts.spotify.com/authorize?"
+            f"client_id={client_id}&"
+            f"response_type=code&"
+            f"redirect_uri={quote(redirect_uri)}&"
+            f"scope={quote(scopes)}&"
+            f"state={device_id}"
+        )
+
+    def _generate_qr_image(self, qr_url, label_text, sublabel_text, label_color, hint_text=None):
         """Generate a 243x304 image with QR code for the album art box.
         Returns path to temp image, or None on failure."""
         try:
             import qrcode
-
-            crew_code = self.crew_config.get('invite_code',
-                        self.crew_config.get('crew_code', ''))
-            telegram_opted = self.device_config.get('telegram_opted_in', False)
 
             # Match album art dimensions: 243x304
             W, H = 243, 304
@@ -1444,46 +1525,50 @@ Examples:
             img = Image.new('RGB', (W, H), bg)
             draw = ImageDraw.Draw(img)
 
-            if telegram_opted and crew_code:
-                # Generate Telegram deep-link QR code
-                qr_url = f"https://t.me/Leeloo2259_bot?start={crew_code.replace('-', '')}"
-                qr = qrcode.QRCode(
-                    version=1,
-                    error_correction=qrcode.constants.ERROR_CORRECT_L,
-                    box_size=8,
-                    border=2,
-                )
-                qr.add_data(qr_url)
-                qr.make(fit=True)
-                qr_img = qr.make_image(fill_color="white", back_color=bg)
-                # Center QR in the top portion
-                qr_size = min(W - 20, 200)
-                qr_img = qr_img.resize((qr_size, qr_size), Image.Resampling.NEAREST).convert('RGB')
-                qr_x = (W - qr_size) // 2
-                qr_y = 15
-                img.paste(qr_img, (qr_x, qr_y))
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_L,
+                box_size=8,
+                border=2,
+            )
+            qr.add_data(qr_url)
+            qr.make(fit=True)
+            qr_img = qr.make_image(fill_color="white", back_color=bg)
+            # Center QR in the top portion
+            qr_size = min(W - 20, 200)
+            qr_img = qr_img.resize((qr_size, qr_size), Image.Resampling.NEAREST).convert('RGB')
+            qr_x = (W - qr_size) // 2
+            qr_y = 15
+            img.paste(qr_img, (qr_x, qr_y))
 
-                # "scan to connect" label below QR
-                y = qr_y + qr_size + 10
-                label = "scan for Telegram"
-                try:
-                    tw = self.font_small.getlength(label)
-                except:
-                    tw = len(label) * 7
-                draw.text(((W - tw) // 2, y), label, font=self.font_small, fill=COLORS['lavender'])
+            # Label below QR
+            y = qr_y + qr_size + 10
+            try:
+                tw = self.font_small.getlength(label_text)
+            except:
+                tw = len(label_text) * 7
+            draw.text(((W - tw) // 2, y), label_text, font=self.font_small, fill=label_color)
 
-                # Crew code at bottom
+            # Sublabel
+            y += 22
+            try:
+                tw = self.font_small.getlength(sublabel_text)
+            except:
+                tw = len(sublabel_text) * 7
+            draw.text(((W - tw) // 2, y), sublabel_text, font=self.font_small, fill=label_color)
+
+            if hint_text:
                 y += 22
                 try:
-                    tw = self.font_small.getlength(crew_code)
+                    tw = self.font_small.getlength(hint_text)
                 except:
-                    tw = len(crew_code) * 7
-                draw.text(((W - tw) // 2, y), crew_code, font=self.font_small, fill=COLORS['green'])
+                    tw = len(hint_text) * 7
+                draw.text(((W - tw) // 2, y), hint_text, font=self.font_small, fill=(74, 74, 106))
 
             # Save to temp file
             qr_path = os.path.join(LEELOO_HOME, '.welcome_qr.png')
             img.save(qr_path, 'PNG')
-            print(f"[BRAIN] Welcome QR image saved: {qr_path}")
+            print(f"[BRAIN] QR image saved: {qr_path}")
             return qr_path
 
         except Exception as e:
@@ -1491,46 +1576,81 @@ Examples:
             return None
 
     async def _show_welcome_with_qr(self):
-        """Show first-boot welcome: QR in album art box, text in messages expand."""
+        """Show first-boot welcome in two phases:
+        Phase 1: Telegram QR (always, if opted in) — 60s
+        Phase 2: Spotify OAuth QR (if conditions met) — 60s
+        """
         user_name = self.device_config.get('user_name', '')
         crew_code = self.crew_config.get('invite_code',
                     self.crew_config.get('crew_code', ''))
         telegram_opted = self.device_config.get('telegram_opted_in', False)
+        show_spotify = self._should_show_spotify_qr()
 
         # Save original album art path to restore later
         original_art_path = self.album_art_path
 
         try:
-            # Generate QR image and swap into album art box
-            qr_path = self._generate_welcome_qr_image()
-            if qr_path:
-                self.album_art_path = qr_path
-                self._render_normal()  # Re-render with QR in album box
-                print("[BRAIN] QR code shown in album art box")
+            # _welcome_qr_active already set True before task creation
 
-            # Build welcome text for messages expand
-            lines = [
-                (f"welcome {user_name}!", "large", COLORS['lavender']),
-                ("", None, None),
-            ]
-            if crew_code:
-                lines.append((f"crew: {crew_code}", "normal", COLORS['green']))
-                lines.append(("share with friends to join", "small", COLORS['white']))
-                lines.append(("", None, None))
-            if telegram_opted:
-                lines.append(("scan QR to connect", "normal", COLORS['tan']))
-                lines.append(("Telegram", "large", COLORS['tan']))
-                lines.append(("", None, None))
-            lines.append(('ask leeloo "setup help"', "small", COLORS['lavender']))
-            lines.append(("anytime you forget", "small", COLORS['lavender']))
+            # --- PHASE 1: Telegram QR (always if opted) ---
+            if telegram_opted and crew_code:
+                qr_path = self._generate_qr_image(
+                    qr_url=f"https://t.me/Leeloo2259_bot?start={crew_code.replace('-', '')}",
+                    label_text="scan for Telegram",
+                    sublabel_text=crew_code,
+                    label_color=COLORS['lavender']
+                )
+                if qr_path:
+                    self.album_art_path = qr_path
+                    self._render_normal()
+                    print("[BRAIN] Telegram QR shown in album art box")
 
-            # Expand messages frame with welcome text
-            await self.expand_frame(FrameType.MESSAGES, lines, duration=60.0)
+                lines = [
+                    (f"welcome {user_name}!", "large", COLORS['lavender']),
+                    ("", None, None),
+                    (f"crew: {crew_code}", "normal", COLORS['green']),
+                    ("share with friends to join", "small", COLORS['white']),
+                    ("", None, None),
+                    ("scan QR to connect", "normal", COLORS['tan']),
+                    ("Telegram", "large", COLORS['tan']),
+                    ("", None, None),
+                    ('ask leeloo "setup help"', "small", COLORS['lavender']),
+                    ("anytime you forget", "small", COLORS['lavender']),
+                ]
+                await self.expand_frame(FrameType.MESSAGES, lines, duration=60.0)
+
+            # --- PHASE 2: Spotify OAuth QR (conditional) ---
+            if show_spotify:
+                qr_path = self._generate_qr_image(
+                    qr_url=self._generate_spotify_oauth_url(),
+                    label_text="scan to sync",
+                    sublabel_text="your Spotify",
+                    label_color=COLORS['green'],
+                    hint_text="(optional)"
+                )
+                if qr_path:
+                    self.album_art_path = qr_path
+                    self._render_normal()
+                    print("[BRAIN] Spotify OAuth QR shown in album art box")
+
+                lines = [
+                    ("one more thing...", "large", COLORS['green']),
+                    ("", None, None),
+                    ("scan QR to sync", "normal", COLORS['green']),
+                    ("your Spotify", "large", COLORS['green']),
+                    ("", None, None),
+                    ("shows what you're", "small", COLORS['white']),
+                    ("currently listening to", "small", COLORS['white']),
+                    ("", None, None),
+                    ("tap device to skip", "small", (74, 74, 106)),
+                ]
+                await self.expand_frame(FrameType.MESSAGES, lines, duration=60.0)
 
         except asyncio.CancelledError:
             print("[BRAIN] Welcome screen cancelled")
             raise
         finally:
+            self._welcome_qr_active = False
             # Restore original album art
             self.album_art_path = original_art_path
             # Clean up temp QR file
@@ -1573,6 +1693,7 @@ Examples:
 
         # Auto-expand welcome screen with QR code on first boot
         if is_first_boot:
+            self._welcome_qr_active = True  # Block music updates BEFORE task starts
             self._expand_task = asyncio.create_task(
                 self._show_welcome_with_qr()
             )

@@ -54,6 +54,7 @@ class LeelooClient:
         self.on_connected: Optional[Callable] = None
         self.on_disconnected: Optional[Callable] = None
         self.on_crew_joined: Optional[Callable] = None
+        self.on_spotify_auth: Optional[Callable] = None
 
         self._load_config()
 
@@ -363,6 +364,26 @@ class LeelooClient:
             print(f"[CREW] {name} went offline")
             if self.on_member_offline:
                 self.on_member_offline(name)
+
+        elif msg_type == 'spotify_auth_complete':
+            # Spotify OAuth tokens received from relay server
+            tokens = data.get('tokens', {})
+            print(f"[CLIENT] Spotify auth complete! access_token={'yes' if tokens.get('access_token') else 'no'}")
+            if tokens.get('access_token'):
+                # Save tokens to disk
+                tokens_path = os.path.join(
+                    os.environ.get("LEELOO_HOME", "/home/pi/leeloo-ui"),
+                    "spotify_tokens.json"
+                )
+                try:
+                    with open(tokens_path, 'w') as f:
+                        json.dump(tokens, f, indent=2)
+                    print(f"[CLIENT] Spotify tokens saved to {tokens_path}")
+                except Exception as e:
+                    print(f"[CLIENT] Error saving Spotify tokens: {e}")
+
+                if self.on_spotify_auth:
+                    self.on_spotify_auth(tokens)
 
         elif msg_type == 'pong':
             pass  # Keepalive response

@@ -12,7 +12,8 @@ Steps:
   2. You     — first name + ZIP code
   3. Crew    — start a new crew (show device code) or join a friend's crew
   4. Telegram — teaser/opt-in (never tells user to leave the portal)
-  5. Done    — triggers WiFi switch, user can close page
+  5. Spotify  — optional OAuth teaser (connect now or skip)
+  6. Done    — triggers WiFi switch, user can close page
 
 Terminal aesthetic using LEELOO device color palette.
 """
@@ -478,7 +479,7 @@ def setup_wifi():
             <button type="submit" class="btn" id="wifiBtn">CONNECT</button>
         </form>
 
-        <div class="step-indicator">[step 1 of 5]</div>
+        <div class="step-indicator">[step 1 of 6]</div>
     </div>
 
     <script>
@@ -560,7 +561,7 @@ def setup_you():
             <button type="submit" class="btn" id="youBtn">CONTINUE</button>
         </form>
 
-        <div class="step-indicator">[step 2 of 5]</div>
+        <div class="step-indicator">[step 2 of 6]</div>
     </div>
 
     <script>
@@ -628,7 +629,7 @@ def setup_crew():
 
         <button type="button" class="btn" id="crewBtn">CONTINUE</button>
 
-        <div class="step-indicator">[step 3 of 5]</div>
+        <div class="step-indicator">[step 3 of 6]</div>
     </div>
 
     <script>
@@ -672,33 +673,46 @@ def setup_crew_create():
             CONTINUE
         </button>
 
-        <div class="step-indicator">[step 3 of 5]</div>
+        <div class="step-indicator">[step 3 of 6]</div>
     </div>
 
     <script>
         function copyCode() {{
             const code = '{code}';
-            if (navigator.clipboard && navigator.clipboard.writeText) {{
-                navigator.clipboard.writeText(code).then(() => {{
-                    document.getElementById('copyBtn').textContent = 'COPIED!';
-                    setTimeout(() => {{
-                        document.getElementById('copyBtn').textContent = 'COPY TO CLIPBOARD';
-                    }}, 2000);
-                }}).catch(() => {{
-                    fallbackCopy();
-                }});
-            }} else {{
-                fallbackCopy();
-            }}
-        }}
+            // Captive portals have no secure context, so navigator.clipboard
+            // won't work. Use the textarea trick which works everywhere.
+            const textarea = document.createElement('textarea');
+            textarea.value = code;
+            textarea.style.position = 'fixed';
+            textarea.style.left = '-9999px';
+            textarea.style.top = '-9999px';
+            document.body.appendChild(textarea);
+            textarea.focus();
+            textarea.select();
+            let copied = false;
+            try {{
+                copied = document.execCommand('copy');
+            }} catch (e) {{}}
+            document.body.removeChild(textarea);
 
-        function fallbackCopy() {{
-            const el = document.getElementById('crewCode');
-            const range = document.createRange();
-            range.selectNodeContents(el);
-            const sel = window.getSelection();
-            sel.removeAllRanges();
-            sel.addRange(range);
+            if (copied) {{
+                document.getElementById('copyBtn').textContent = 'COPIED!';
+                setTimeout(() => {{
+                    document.getElementById('copyBtn').textContent = 'COPY TO CLIPBOARD';
+                }}, 2000);
+            }} else {{
+                // Last resort: select the visible text so user can manually copy
+                const el = document.getElementById('crewCode');
+                const range = document.createRange();
+                range.selectNodeContents(el);
+                const sel = window.getSelection();
+                sel.removeAllRanges();
+                sel.addRange(range);
+                document.getElementById('copyBtn').textContent = 'TEXT SELECTED — LONG PRESS TO COPY';
+                setTimeout(() => {{
+                    document.getElementById('copyBtn').textContent = 'COPY TO CLIPBOARD';
+                }}, 3000);
+            }}
         }}
 
         async function createCrew() {{
@@ -763,7 +777,7 @@ def setup_crew_join():
             BACK
         </button>
 
-        <div class="step-indicator">[step 3 of 5]</div>
+        <div class="step-indicator">[step 3 of 6]</div>
     </div>
 
     <script>
@@ -844,7 +858,7 @@ def setup_telegram():
             CONTINUE
         </button>
 
-        <div class="step-indicator">[step 4 of 5]</div>
+        <div class="step-indicator">[step 4 of 6]</div>
     </div>
 
     <script>
@@ -861,7 +875,7 @@ def setup_telegram():
                     body: JSON.stringify({ telegram_opted_in: opted })
                 });
                 if (result.success) {
-                    window.location.href = '/setup/done';
+                    window.location.href = '/setup/spotify';
                 } else {
                     btn.disabled = false;
                     btn.textContent = 'CONTINUE';
@@ -879,7 +893,53 @@ def setup_telegram():
 
 
 # ============================================
-# STEP 5: DONE
+# STEP 5: SPOTIFY (optional OAuth teaser)
+# ============================================
+
+@app.route('/setup/spotify')
+def setup_spotify():
+    content = """
+    <div class="term-box green">
+        <div class="term-label">spotify</div>
+
+        <h1>want to sync your music?<span class="cursor">\u258a</span></h1>
+
+        <p class="prompt">connect Spotify after setup to unlock Now Playing</p>
+
+        <p style="color: #A7AFD4; font-size: 13px; margin-bottom: 16px; line-height: 1.5;">
+            once your LEELOO boots up, it'll show you<br>
+            how to connect Spotify. when connected:
+        </p>
+
+        <p style="color: #7beec0; font-size: 13px; margin-bottom: 16px; line-height: 1.7;">
+            &bull; see what you're currently listening to<br>
+            &bull; album art &amp; monthly listeners<br>
+            &bull; a scancode your friends can scan
+        </p>
+
+        <div class="note">
+            this is optional &amp; takes 30 seconds.<br>
+            your LEELOO will walk you through it.
+        </div>
+
+        <button type="button" class="btn" onclick="continueSetup()">
+            SOUNDS GOOD
+        </button>
+
+        <div class="step-indicator">[step 5 of 6]</div>
+    </div>
+
+    <script>
+        function continueSetup() {
+            window.location.href = '/setup/done';
+        }
+    </script>
+    """
+    return render_page("LEELOO - Spotify", content)
+
+
+# ============================================
+# STEP 6: DONE
 # ============================================
 
 @app.route('/setup/done')
@@ -900,7 +960,7 @@ def setup_done():
             you can close this page.
         </p>
 
-        <div class="step-indicator">[step 5 of 5]</div>
+        <div class="step-indicator">[step 6 of 6]</div>
     </div>
 
     <script>
