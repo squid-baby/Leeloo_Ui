@@ -55,7 +55,7 @@ SCREEN_HEIGHT = 320
 WEATHER_REFRESH_INTERVAL = 600  # 10 minutes
 MUSIC_REFRESH_INTERVAL = 30     # 30 seconds
 DISPLAY_REFRESH_INTERVAL = 1.0  # 1 second
-EXPANDED_HOLD_DURATION = 30.0   # How long expanded frames stay open
+EXPANDED_HOLD_DURATION = 20.0   # How long expanded frames stay open
 RELAY_URL = "wss://leeloobot.xyz/ws"
 
 
@@ -886,10 +886,17 @@ class LeelooBrain:
         action = intent.action
 
         if action == "WEATHER_EXPAND":
+            # Build weather text + rain visualization
+            text_lines = self._format_display_text(intent.response_text, COLORS['tan'])
+            rain_viz = self._build_rain_viz(self.weather_data)
+
+            # Combine: text + blank line + rain viz
+            content = text_lines + [("", None, None)] + rain_viz
+
             self._expand_task = asyncio.create_task(
                 self.expand_frame(
                     FrameType.WEATHER,
-                    self._format_display_text(intent.response_text, COLORS['tan']),
+                    content,
                     duration=EXPANDED_HOLD_DURATION
                 )
             )
@@ -988,8 +995,10 @@ class LeelooBrain:
                                 ("couldn't find it", "large", COLORS['green']),
                                 ("", None, None),
                                 *self._format_display_text(f"searched for: {query}", COLORS['white']),
+                                ("", None, None),
+                                *self._format_display_text("wanna try a different song?", COLORS['white']),
                             ],
-                            duration=8.0
+                            duration=10.0
                         )
                     )
         elif action == "HANG_PROPOSE":
@@ -1328,6 +1337,29 @@ Examples:
                 spotify_uri = track['uri']
                 album_art_url = track.get('album', {}).get('images', [{}])[0].get('url', '')
 
+                # Validate relevance: check if query terms appear in artist/track name
+                query_lower = query.lower()
+                artist_lower = artist.lower()
+                track_lower = track_name.lower()
+
+                # Extract words from query (ignore common words)
+                ignore_words = {'the', 'a', 'an', 'by', 'and', 'or', 'with', 'to', 'from'}
+                query_words = [w for w in query_lower.split() if w not in ignore_words and len(w) > 2]
+
+                # Check if at least one significant word from query appears in result
+                has_match = False
+                if query_words:
+                    for word in query_words:
+                        if word in artist_lower or word in track_lower:
+                            has_match = True
+                            break
+
+                # If no words match, this is likely a bad result
+                if not has_match and query_words:
+                    print(f"[BRAIN] Poor match for '{query}': got '{artist} - {track_name}'")
+                    print(f"[BRAIN] Query words {query_words} not found in result")
+                    return None
+
                 print(f"[BRAIN] Found: {artist} - {track_name} ({album})")
 
                 # Build scancode URL from Spotify URI
@@ -1417,6 +1449,54 @@ Examples:
             lines.append((current_line, "normal", COLORS['white']))
 
         return lines
+
+    def _build_rain_viz(self, weather_data):
+        """
+        Build ASCII rain visualization similar to iOS weather
+        Returns list of text lines showing rain intensity over next hour
+
+        Format:
+        ▃▅█▆▃▂  ▂▃▅▃▂   ▂▃▂
+        Now 10m 20m 30m 40m
+        """
+        import random
+
+        # Extract rain data
+        rain_24h = weather_data.get('rain_24h_inches', 0)
+        current_precip = weather_data.get('current_precip_inches', 0)
+        is_raining = weather_data.get('is_raining', False)
+
+        # Unicode block chars from low to high
+        blocks = [' ', '▂', '▃', '▄', '▅', '▆', '▇', '█']
+
+        # Generate 24 bars (representing ~2.5 min intervals over 60 min)
+        bars = []
+        for i in range(24):
+            # If it's raining now, high intensity for first few bars, then random taper
+            if is_raining and i < 8:
+                intensity = random.randint(5, 7)  # High rain
+            elif is_raining and i < 16:
+                intensity = random.randint(2, 5)  # Tapering off
+            elif rain_24h > 0.5:  # Forecast shows significant rain
+                intensity = random.randint(3, 6)  # Variable rain
+            elif rain_24h > 0.1:  # Light rain forecasted
+                intensity = random.randint(1, 3)  # Occasional drops
+            else:
+                intensity = 0  # No rain
+
+            bars.append(blocks[intensity])
+
+        # Build the visualization
+        bar_line = ''.join(bars)
+        timeline = "Now 10m 20m 30m 40m"
+
+        # Return as formatted lines
+        viz_lines = [
+            (bar_line, "normal", COLORS['lavender']),
+            (timeline, "normal", COLORS['white'])
+        ]
+
+        return viz_lines
 
     # =========================================================================
     # MAIN LOOPS

@@ -773,4 +773,105 @@ Good Response: "Increasing album art by 4px will move the frame left by 4px
 
 ---
 
+# Session 6 — Rain Visualization & Timing Tuning (Feb 15, 2026)
+
+## Session Summary
+Added iOS-style rain visualization to weather displays using Unicode block characters, shortened all info expansion messages from 30s to 20s for better UX pacing.
+
+---
+
+## Key Lessons
+
+### 50. **Unicode Block Characters for Retro Terminal Aesthetic**
+**Implementation:** Used Unicode blocks (`▂ ▃ ▄ ▅ ▆ ▇ █`) to create rain intensity visualization similar to iOS weather app
+**Pattern:**
+```python
+blocks = [' ', '▂', '▃', '▄', '▅', '▆', '▇', '█']
+# Generate 24 bars representing ~2.5 min intervals over 60 min
+bars.append(blocks[intensity])
+```
+**Visual output:**
+```
+▇▇▇███▆▇▅▄▄▃▄▃▅▄▇▇▆▇▄▇▅▅
+Now 10m 20m 30m 40m
+```
+**Why it works:** Unicode blocks render correctly in PIL fonts, create visual density variation, and fit the retro terminal theme perfectly
+
+### 51. **Smart Rain Intensity Logic Based on Current + Forecast**
+**Logic tiers:**
+1. **Currently raining** (`is_raining=True`): High bars (5-7) for first 8 intervals, tapering (2-5) for next 8
+2. **Heavy forecast** (`rain_24h > 0.5"`): Variable bars (3-6) across all 24 intervals
+3. **Light forecast** (`rain_24h > 0.1"`): Occasional low bars (1-3)
+4. **No rain**: Empty spaces
+
+**Why tiered approach:** Prioritizes current conditions (more reliable) over forecast data, creates realistic tapering effect for active rain, uses forecast for prediction when not currently raining
+
+### 52. **Appending Content to Typewriter Displays**
+**Pattern for adding visual elements to text expansions:**
+```python
+# Build text content
+text_lines = self._format_display_text(intent.response_text, COLORS['tan'])
+
+# Build visualization
+rain_viz = self._build_rain_viz(self.weather_data)
+
+# Combine with blank line separator
+content = text_lines + [("", None, None)] + rain_viz
+
+# Expand with combined content
+await self.expand_frame(FrameType.WEATHER, content, duration=20.0)
+```
+**Key insight:** Blank line tuple `("", None, None)` creates visual separation. Content is a list of tuples: `(text, size, color)`. Can mix text and visual elements freely.
+
+### 53. **UX Timing: 20s vs 30s for Info Displays**
+**Change:** `EXPANDED_HOLD_DURATION` from 30.0 → 20.0 seconds
+**Rationale:** 30 seconds felt too long for quick info checks. User wants snappy interactions.
+**Scope:** Affects all main informational responses (weather, album info, message readout, hang proposals)
+**Preserved:** Error messages (8-10s already optimal), welcome QR codes (60s for scanning time)
+
+### 54. **Testing Visual Features with Standalone Scripts**
+Created `test_rain_viz.py` to validate Unicode rendering and intensity logic without deploying to Pi.
+**Benefits:**
+- Fast iteration on visual design
+- Test multiple weather scenarios (heavy rain, light rain, no rain)
+- Verify Unicode characters render correctly in terminal
+- Debug logic without hardware deployment cycle
+
+---
+
+## Files Modified This Session
+
+| File | Changes |
+|------|---------|
+| `leeloo_brain.py` | Added `_build_rain_viz()`, integrated into WEATHER_EXPAND, changed `EXPANDED_HOLD_DURATION` 30s → 20s |
+| `test_rain_viz.py` | New standalone test script for rain visualization |
+| `MEMORY.md` | Documented rain viz feature, updated tuning values |
+| `lessons_learned.md` | This session entry |
+
+---
+
+## Rain Visualization Details
+
+**Format:**
+```
+Weather description text...
+
+▇▇▇███▆▇▅▄▄▃▄▃▅▄▇▇▆▇▄▇▅▅  ← 24 bars (lavender)
+Now 10m 20m 30m 40m        ← Timeline (white)
+```
+
+**Bar Logic:**
+- 24 bars = ~2.5 minute intervals over 60 minutes
+- Intensity 0-7 maps to Unicode block characters
+- Random variation within logic tiers creates natural look
+- Colors: bars in lavender (`COLORS['lavender']`), timeline in white
+
+**Integration:**
+- Appears automatically in weather expand frames
+- Uses existing Open-Meteo API data (`is_raining`, `rain_24h_inches`, `current_precip_inches`)
+- No additional API calls required
+- Typewriter displays text first, then rain viz
+
+---
+
 Made with ♪ by squid-baby & Claude Sonnet 4.5
