@@ -281,14 +281,19 @@ class LeelooBrain:
         self.ws_client.on_member_offline = lambda name: print(f"[BRAIN] {name} went offline")
 
     def _on_ws_message(self, sender, text):
-        """Handle incoming crew message"""
+        """Handle incoming crew message — detect music mentions and show album art"""
         print(f"[BRAIN] Message from {sender}: {text}")
         self.message_mgr.add_message(sender, text)
 
         # LED notification
         asyncio.ensure_future(self.led.message_received())
 
-        # Show message on display
+        # Show message on display AND check for music mentions
+        asyncio.ensure_future(self._handle_message_with_music(sender, text))
+
+    async def _handle_message_with_music(self, sender, text):
+        """Show crew message and detect music mentions for album art display"""
+        # First, show the message immediately
         lines = [
             (f"from {sender.lower()}", "large", COLORS['lavender']),
             ("", None, None),
@@ -297,6 +302,25 @@ class LeelooBrain:
         self._expand_task = asyncio.ensure_future(
             self.expand_frame(FrameType.MESSAGES, lines, duration=EXPANDED_HOLD_DURATION)
         )
+
+        # While message is showing, check for music mentions in background
+        try:
+            query = await self._detect_music_in_message(text)
+            if query:
+                print(f"[BRAIN] Music detected in message: '{query}'")
+                result = await self._search_spotify_display_only(query, pushed_by=sender)
+                if result:
+                    print(f"[BRAIN] Album art updated: {result['artist']} - {result['track']}")
+                    # Force display refresh to show new album art
+                    self.last_music_fetch = 0
+                    self._update_music()
+                    self._render_normal()
+                else:
+                    print(f"[BRAIN] No Spotify result for: {query}")
+            else:
+                print(f"[BRAIN] No music detected in message")
+        except Exception as e:
+            print(f"[BRAIN] Music detection error: {e}")
 
     def _on_ws_reaction(self, sender, reaction_type):
         """Handle incoming reaction"""
@@ -947,6 +971,27 @@ class LeelooBrain:
                     duration=10.0
                 )
             )
+        elif action == "TELEGRAM_SETUP":
+            # Show Telegram setup instructions
+            print("[BRAIN] Telegram setup requested")
+            crew_code = self.crew_config.get('invite_code',
+                        self.crew_config.get('crew_code', ''))
+            lines = [
+                ("telegram setup", "large", COLORS['lavender']),
+                ("", None, None),
+                ("message @Leeloo2259_bot", "normal", COLORS['white']),
+                ("on Telegram and send /start", "normal", COLORS['white']),
+                ("", None, None),
+            ]
+            if crew_code:
+                lines.append((f"your crew code: {crew_code}", "normal", COLORS['green']))
+            self._expand_task = asyncio.create_task(
+                self.expand_frame(
+                    FrameType.MESSAGES,
+                    lines,
+                    duration=EXPANDED_HOLD_DURATION
+                )
+            )
         elif action == "UNKNOWN":
             # Show the response text if any
             if intent.response_text:
@@ -959,6 +1004,213 @@ class LeelooBrain:
                 )
         else:
             print(f"[BRAIN] Unknown intent: {action}")
+
+    # =========================================================================
+    # MUSIC DETECTION IN MESSAGES
+    # =========================================================================
+
+    async def _detect_music_in_message(self, text):
+        """Detect if a crew message mentions a song/artist/album.
+        Returns a Spotify search query string, or None if no music detected.
+
+        Handles three cases:
+        1. Spotify links (open.spotify.com/track/...) — extract URI directly
+        2. Spotify URIs (spotify:track:...) — use directly
+        3. Natural language mentions — use Claude Haiku to extract search query
+        """
+        import re
+
+        # Case 1: Spotify track link  (e.g. https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC)
+        link_match = re.search(r'open\.spotify\.com/track/([a-zA-Z0-9]+)', text)
+        if link_match:
+            track_id = link_match.group(1)
+            print(f"[BRAIN] Spotify link detected, track ID: {track_id}")
+            return f"spotify:track:{track_id}"
+
+        # Case 2: Spotify URI (e.g. spotify:track:4uLU6hMCjMI75M1A2tKUQC)
+        uri_match = re.search(r'(spotify:track:[a-zA-Z0-9]+)', text)
+        if uri_match:
+            print(f"[BRAIN] Spotify URI detected: {uri_match.group(1)}")
+            return uri_match.group(1)
+
+        # Case 3: Natural language — use Claude Haiku to detect music mentions
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not anthropic_key:
+            print("[BRAIN] No Anthropic key for music detection")
+            return None
+
+        try:
+            loop = asyncio.get_event_loop()
+
+            def _classify():
+                import anthropic
+                client = anthropic.Anthropic(api_key=anthropic_key)
+                resp = client.messages.create(
+                    model="claude-3-haiku-20240307",
+                    max_tokens=100,
+                    messages=[{"role": "user", "content": text}],
+                    system="""You detect music mentions in casual messages between friends.
+If the message mentions a specific song, artist, album, or track — extract the best Spotify search query.
+
+Respond with ONLY a JSON object (no markdown, no code fences):
+{"music": true, "query": "artist name song title"}
+OR
+{"music": false}
+
+Examples:
+- "Yall have to listen to that new Fred again song Feisty" → {"music": true, "query": "Fred again Feisty"}
+- "check out Blonde by Frank Ocean" → {"music": true, "query": "Frank Ocean Blonde"}
+- "hey whats up tonight" → {"music": false}
+- "that Kendrick album is fire" → {"music": true, "query": "Kendrick Lamar"}
+- "been bumping Tame Impala all day" → {"music": true, "query": "Tame Impala"}"""
+                )
+                return resp.content[0].text.strip()
+
+            raw = await loop.run_in_executor(None, _classify)
+            print(f"[BRAIN] Music detection result: {raw}")
+
+            # Parse JSON response
+            result = json.loads(raw)
+            if result.get('music') and result.get('query'):
+                return result['query']
+            return None
+
+        except Exception as e:
+            print(f"[BRAIN] Music detection classify error: {e}")
+            return None
+
+    async def _search_spotify_display_only(self, query, pushed_by=None):
+        """Search Spotify and update album art display WITHOUT pushing to crew.
+        Used for incoming messages that mention music.
+
+        If query is a spotify:track: URI, fetches track directly by ID.
+        Otherwise searches by text query.
+        Returns the music result dict, or None on failure."""
+        if not query:
+            return None
+
+        try:
+            import requests
+            import base64
+            from leeloo_music_manager import (
+                SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET,
+                SPOTIFY_API_BASE, SPOTIFY_TOKEN_URL,
+                ALBUM_ART_DIR, CURRENT_MUSIC_FILE
+            )
+            from leeloo_album_art import download_and_create_album_art
+
+            loop = asyncio.get_event_loop()
+            is_uri = query.startswith('spotify:track:')
+
+            def _do_search():
+                auth_str = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}"
+                auth_b64 = base64.b64encode(auth_str.encode()).decode()
+
+                token_resp = requests.post(
+                    SPOTIFY_TOKEN_URL,
+                    data={'grant_type': 'client_credentials'},
+                    headers={
+                        'Authorization': f'Basic {auth_b64}',
+                        'Content-Type': 'application/x-www-form-urlencoded'
+                    },
+                    timeout=5
+                )
+                if token_resp.status_code != 200:
+                    print(f"[BRAIN] Spotify token error: {token_resp.status_code}")
+                    return None
+
+                cc_token = token_resp.json()['access_token']
+                headers = {"Authorization": f"Bearer {cc_token}"}
+
+                if is_uri:
+                    # Direct track lookup by ID
+                    track_id = query.split(':')[-1]
+                    track_resp = requests.get(
+                        f"{SPOTIFY_API_BASE}/tracks/{track_id}",
+                        headers=headers,
+                        timeout=5
+                    )
+                    if track_resp.status_code != 200:
+                        print(f"[BRAIN] Spotify track lookup error: {track_resp.status_code}")
+                        return None
+                    track = track_resp.json()
+                else:
+                    # Text search
+                    search_resp = requests.get(
+                        f"{SPOTIFY_API_BASE}/search",
+                        params={"q": query, "type": "track", "limit": 1},
+                        headers=headers,
+                        timeout=5
+                    )
+                    if search_resp.status_code != 200:
+                        print(f"[BRAIN] Spotify search error: {search_resp.status_code}")
+                        return None
+
+                    tracks = search_resp.json().get('tracks', {}).get('items', [])
+                    if not tracks:
+                        print(f"[BRAIN] No tracks found for: {query}")
+                        return None
+                    track = tracks[0]
+
+                artist = track['artists'][0]['name'] if track.get('artists') else 'Unknown'
+                track_name = track['name']
+                album = track.get('album', {}).get('name', '')
+                spotify_uri = track['uri']
+                album_art_url = track.get('album', {}).get('images', [{}])[0].get('url', '')
+
+                print(f"[BRAIN] Found: {artist} - {track_name} ({album})")
+
+                # Build scancode URL
+                from urllib.parse import quote
+                encoded_uri = quote(spotify_uri, safe=':')
+                scancode_url = f"https://scannables.scdn.co/uri/plain/png/1A1D2E/white/280/{encoded_uri}"
+
+                # Clear stale cache
+                from leeloo_album_art import get_album_art_path as _get_art_path
+                stale_path = _get_art_path(spotify_uri, ALBUM_ART_DIR)
+                if os.path.exists(stale_path):
+                    os.remove(stale_path)
+
+                # Download album art + scancode
+                album_art_cached = download_and_create_album_art(
+                    album_art_url,
+                    spotify_uri,
+                    ALBUM_ART_DIR,
+                    source='shared',
+                    scancode_url=scancode_url
+                )
+
+                # Write to current_music.json
+                import time as _time
+                result = {
+                    'artist': artist,
+                    'track': track_name,
+                    'album': album,
+                    'spotify_uri': spotify_uri,
+                    'album_art_url': album_art_url,
+                    'album_art_cached': album_art_cached,
+                    'source': 'shared',
+                    'pushed_by': pushed_by or 'crew',
+                    'timestamp': _time.time(),
+                }
+
+                with open(CURRENT_MUSIC_FILE, 'w') as f:
+                    json.dump(result, f, indent=2)
+
+                return result
+
+            result = await loop.run_in_executor(None, _do_search)
+
+            if result:
+                self.last_music_fetch = 0
+                return result
+
+        except Exception as e:
+            print(f"[BRAIN] Spotify display search error: {e}")
+            import traceback
+            traceback.print_exc()
+
+        return None
 
     async def _search_and_push_song(self, query):
         """Search Spotify for a song, update display, and push to crew.
@@ -1137,6 +1389,157 @@ class LeelooBrain:
         self._update_music()
         self._render_normal()
 
+    # =========================================================================
+    # FIRST BOOT WELCOME
+    # =========================================================================
+
+    def _send_first_boot_welcome(self):
+        """Send welcome message on first boot after setup.
+        Returns True if this is the first boot (welcome not yet sent)."""
+        welcome_flag = os.path.join(LEELOO_HOME, '.welcome_sent')
+        if os.path.exists(welcome_flag):
+            return False
+
+        user_name = self.device_config.get('user_name', '')
+        crew_code = self.crew_config.get('invite_code',
+                    self.crew_config.get('crew_code', ''))
+        telegram_opted = self.device_config.get('telegram_opted_in', False)
+
+        if not user_name:
+            return False
+
+        # Build welcome text
+        welcome = f"welcome {user_name}!"
+        if crew_code:
+            welcome += f" your crew code is {crew_code}."
+        if telegram_opted:
+            welcome += " say 'telegram setup' for help anytime"
+
+        # Add as a message from LEELOO
+        self.message_mgr.add_message("leeloo", welcome)
+        print(f"[BRAIN] Welcome message sent: {welcome[:60]}...")
+
+        # Mark welcome as sent
+        try:
+            with open(welcome_flag, 'w') as f:
+                f.write('1')
+        except Exception:
+            pass
+
+        return True
+
+    def _generate_welcome_qr_image(self):
+        """Generate a 243x304 image with QR code for the album art box.
+        Returns path to temp image, or None on failure."""
+        try:
+            import qrcode
+
+            crew_code = self.crew_config.get('invite_code',
+                        self.crew_config.get('crew_code', ''))
+            telegram_opted = self.device_config.get('telegram_opted_in', False)
+
+            # Match album art dimensions: 243x304
+            W, H = 243, 304
+            bg = COLORS['bg']
+            img = Image.new('RGB', (W, H), bg)
+            draw = ImageDraw.Draw(img)
+
+            if telegram_opted and crew_code:
+                # Generate Telegram deep-link QR code
+                qr_url = f"https://t.me/Leeloo2259_bot?start={crew_code.replace('-', '')}"
+                qr = qrcode.QRCode(
+                    version=1,
+                    error_correction=qrcode.constants.ERROR_CORRECT_L,
+                    box_size=8,
+                    border=2,
+                )
+                qr.add_data(qr_url)
+                qr.make(fit=True)
+                qr_img = qr.make_image(fill_color="white", back_color=bg)
+                # Center QR in the top portion
+                qr_size = min(W - 20, 200)
+                qr_img = qr_img.resize((qr_size, qr_size), Image.Resampling.NEAREST).convert('RGB')
+                qr_x = (W - qr_size) // 2
+                qr_y = 15
+                img.paste(qr_img, (qr_x, qr_y))
+
+                # "scan to connect" label below QR
+                y = qr_y + qr_size + 10
+                label = "scan for Telegram"
+                try:
+                    tw = self.font_small.getlength(label)
+                except:
+                    tw = len(label) * 7
+                draw.text(((W - tw) // 2, y), label, font=self.font_small, fill=COLORS['lavender'])
+
+                # Crew code at bottom
+                y += 22
+                try:
+                    tw = self.font_small.getlength(crew_code)
+                except:
+                    tw = len(crew_code) * 7
+                draw.text(((W - tw) // 2, y), crew_code, font=self.font_small, fill=COLORS['green'])
+
+            # Save to temp file
+            qr_path = os.path.join(LEELOO_HOME, '.welcome_qr.png')
+            img.save(qr_path, 'PNG')
+            print(f"[BRAIN] Welcome QR image saved: {qr_path}")
+            return qr_path
+
+        except Exception as e:
+            print(f"[BRAIN] QR image generation failed: {e}")
+            return None
+
+    async def _show_welcome_with_qr(self):
+        """Show first-boot welcome: QR in album art box, text in messages expand."""
+        user_name = self.device_config.get('user_name', '')
+        crew_code = self.crew_config.get('invite_code',
+                    self.crew_config.get('crew_code', ''))
+        telegram_opted = self.device_config.get('telegram_opted_in', False)
+
+        # Save original album art path to restore later
+        original_art_path = self.album_art_path
+
+        try:
+            # Generate QR image and swap into album art box
+            qr_path = self._generate_welcome_qr_image()
+            if qr_path:
+                self.album_art_path = qr_path
+                self._render_normal()  # Re-render with QR in album box
+                print("[BRAIN] QR code shown in album art box")
+
+            # Build welcome text for messages expand
+            lines = [
+                (f"welcome {user_name}!", "large", COLORS['lavender']),
+                ("", None, None),
+            ]
+            if crew_code:
+                lines.append((f"crew: {crew_code}", "normal", COLORS['green']))
+                lines.append(("share with friends to join", "small", COLORS['white']))
+                lines.append(("", None, None))
+            if telegram_opted:
+                lines.append(("scan QR to connect", "normal", COLORS['tan']))
+                lines.append(("Telegram", "large", COLORS['tan']))
+                lines.append(("", None, None))
+            lines.append(('ask leeloo "setup help"', "small", COLORS['lavender']))
+            lines.append(("anytime you forget", "small", COLORS['lavender']))
+
+            # Expand messages frame with welcome text
+            await self.expand_frame(FrameType.MESSAGES, lines, duration=60.0)
+
+        except asyncio.CancelledError:
+            print("[BRAIN] Welcome screen cancelled")
+            raise
+        finally:
+            # Restore original album art
+            self.album_art_path = original_art_path
+            # Clean up temp QR file
+            qr_path = os.path.join(LEELOO_HOME, '.welcome_qr.png')
+            try:
+                os.remove(qr_path)
+            except:
+                pass
+
     async def run(self):
         """Main entry point — start all subsystems"""
         print("[BRAIN] Starting LEELOO Brain...")
@@ -1152,6 +1555,9 @@ class LeelooBrain:
         self._update_music()
         self._render_normal()
 
+        # Send welcome message on first boot after setup
+        is_first_boot = self._send_first_boot_welcome()
+
         # Start concurrent tasks
         tasks = [
             asyncio.create_task(self._display_loop()),
@@ -1164,6 +1570,13 @@ class LeelooBrain:
 
         print("[BRAIN] All subsystems started. LEELOO is alive!")
         print("[BRAIN] Tap the device to interact.")
+
+        # Auto-expand welcome screen with QR code on first boot
+        if is_first_boot:
+            self._expand_task = asyncio.create_task(
+                self._show_welcome_with_qr()
+            )
+            print("[BRAIN] First boot welcome screen launched")
 
         try:
             await asyncio.gather(*tasks)
@@ -1185,8 +1598,17 @@ class LeelooBrain:
             try:
                 print(f"[BRAIN] Connecting to relay ({RELAY_URL})...")
                 if await self.ws_client.connect():
-                    # Rejoin crew
-                    if await self.ws_client.rejoin_crew():
+                    # Try to join crew — if it doesn't exist yet, create it
+                    joined = await self.ws_client.rejoin_crew()
+                    if not joined and self.crew_config.get('is_creator', False):
+                        # We created this crew locally but it doesn't exist on server yet
+                        display_name = self.device_config.get('user_name', 'LEELOO')
+                        print(f"[BRAIN] Crew not found, creating on server...")
+                        crew_code = await self.ws_client.create_crew(display_name)
+                        if crew_code:
+                            print(f"[BRAIN] Crew created on server: {crew_code}")
+                            joined = True
+                    if joined:
                         print("[BRAIN] WebSocket connected and crew joined!")
                         retry_delay = 5  # Reset on success
 

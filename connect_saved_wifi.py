@@ -23,17 +23,25 @@ def run_cmd(cmd):
         return False, "", str(e)
 
 def stop_ap_mode():
-    """Stop AP mode services"""
+    """Stop AP mode services and restore NetworkManager"""
     print("Stopping AP mode...")
     run_cmd("sudo systemctl stop hostapd")
     run_cmd("sudo systemctl stop dnsmasq")
-    time.sleep(1)
+    run_cmd("sudo killall hostapd 2>/dev/null")
+    # Reset wlan0
+    run_cmd("sudo ip addr flush dev wlan0")
+    run_cmd("sudo ip link set wlan0 down")
+    time.sleep(0.5)
+    # Restart NetworkManager (it was stopped for AP mode)
+    print("Restarting NetworkManager...")
+    run_cmd("sudo systemctl start NetworkManager")
+    time.sleep(3)
 
 def connect_with_networkmanager(ssid, password):
     """Connect to WiFi using NetworkManager (more reliable)"""
     print(f"Connecting to {ssid} using NetworkManager...")
 
-    # Re-enable NetworkManager control of wlan0
+    # Ensure NM is managing wlan0
     run_cmd("sudo nmcli dev set wlan0 managed yes")
     time.sleep(1)
 

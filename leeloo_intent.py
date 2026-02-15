@@ -14,6 +14,7 @@ Actions:
 - HANG_PROPOSE:     Propose a hangout time
 - HANG_CONFIRM:     Confirm a proposed hangout
 - NUDGE:            Send a nudge/wink to the crew
+- TELEGRAM_SETUP:   Show Telegram setup instructions
 - UNKNOWN:          Could not classify
 """
 
@@ -37,7 +38,7 @@ Current device state:
 
 Respond with JSON only (no markdown, no code fences):
 {{
-  "action": "WEATHER_EXPAND|MESSAGE_SEND|MESSAGE_READOUT|ALBUM_INFO|SONG_PUSH|HANG_PROPOSE|HANG_CONFIRM|NUDGE|UNKNOWN",
+  "action": "WEATHER_EXPAND|MESSAGE_SEND|MESSAGE_READOUT|ALBUM_INFO|SONG_PUSH|HANG_PROPOSE|HANG_CONFIRM|NUDGE|TELEGRAM_SETUP|UNKNOWN",
   "params": {{ }},
   "display_text": "text to show on the retro LCD screen (keep under 200 chars)"
 }}
@@ -51,6 +52,7 @@ Action details:
 - HANG_PROPOSE: User wants to schedule hanging out. Extract params.datetime (ISO format) and params.description. If vague like "this weekend", make reasonable assumptions.
 - HANG_CONFIRM: User confirms a proposed hang. Set params.confirm=true.
 - NUDGE: User wants to nudge/wink/poke friends. Set params.nudge=true.
+- TELEGRAM_SETUP: User asks about Telegram setup, how to message from phone, or how to connect Telegram. Set params.telegram=true.
 - UNKNOWN: Can't determine intent. display_text = a brief confused but friendly response.
 
 Keep display_text concise — this shows on a small 480x320 retro LCD. Use lowercase, casual tone. No emojis.

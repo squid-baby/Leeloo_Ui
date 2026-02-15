@@ -411,4 +411,113 @@ Typewriter writes visible portion, then if overflow, pre-renders ALL lines to of
 
 ---
 
+---
+
+# Session 4 — Captive Portal, First Boot Welcome, Crew Registration & Message-to-Music (Feb 15, 2026)
+
+## Session Summary
+Recovered a bricked Pi (portal left NetworkManager stopped), deployed full captive portal setup flow, implemented first-boot welcome screen with QR code + crew code, fixed crew registration on relay server, added Telegram messaging end-to-end, and built music detection in incoming crew messages (natural language → Spotify album art + scancode).
+
+---
+
+## Key Lessons
+
+### 25. **NetworkManager Must Be Restarted After AP Mode**
+**Problem:** Pi bricked after portal — `connect_saved_wifi.py` stopped hostapd/dnsmasq but never restarted NetworkManager, leaving WiFi permanently dead.
+**Solution:** `sudo systemctl start NetworkManager` in `stop_ap_mode()` before calling `nmcli device wifi connect`.
+**Lesson:** Any script that stops NetworkManager for AP mode MUST restart it. This is the single most critical line in the portal flow.
+
+### 26. **systemd.mask in cmdline.txt Persists Until Reboot**
+**Problem:** Added `systemd.mask=leeloo.service` to cmdline.txt for safe recovery, then removed it — but service stayed masked at runtime.
+**Root Cause:** Kernel cmdline parameters create generator-based masks processed at boot. Removing from cmdline.txt doesn't unmask until next reboot.
+**Lesson:** `systemd.mask=` in cmdline.txt requires a reboot to clear. Can't unmask at runtime with `systemctl unmask`.
+
+### 27. **QR Code Belongs in the Album Art Box, Not the Messages Frame**
+**Problem:** First attempt put QR code inside the messages expand frame — cluttered and wrong visual area.
+**User feedback:** "nope. the qr code goes in where the Album art / scan code is located. message box is for text and reaction animation"
+**Solution:** Generate 243×304 QR image, swap into `self.album_art_path`, re-render normal UI, then expand messages with text only. Restore original album art after collapse.
+**Lesson:** Album art box = visual media (art, QR, scancode). Messages frame = text only.
+
+### 28. **Portal Creates Crew Locally But Must Register on Server**
+**Problem:** Portal saved crew config (`crew_config.json` with `is_creator: true, crew_code: LEELOO-WFJS`) but the relay server had no record of it. `rejoin_crew()` always failed with "crew not found."
+**Solution:** Modified `_ws_connection_loop` to call `create_crew()` if `rejoin_crew()` fails and `is_creator=True`. Modified server.js to accept optional `crew_code` parameter so portal-assigned codes persist.
+**Lesson:** Two-phase crew setup: (1) portal creates crew config locally, (2) brain registers crew on relay server at first WebSocket connection.
+
+### 29. **Server Response Fields Vary — Use .get() Defensively**
+**Problem:** `data['crew_id']` KeyError crashed WebSocket loop. Server `crew_joined` response sends `crew_code` but NOT `crew_id`.
+**Solution:** `data.get('crew_id', data.get('crew_code', self.config.crew_id))`
+**Lesson:** Never use dict bracket access on WebSocket/API responses. Always `.get()` with fallbacks.
+
+### 30. **Anthropic Model Names Differ Between SDK Versions**
+**Problem:** Music detection failed with `404 - model: claude-3-5-haiku-latest`. The Pi's older Anthropic SDK doesn't support the `latest` alias.
+**Solution:** Use the explicit version `claude-3-haiku-20240307` matching what intent router already uses.
+**Lesson:** Always match model names to what's already working in the codebase. Check existing code before using new aliases.
+
+### 31. **Claude Haiku Can Classify Music Mentions in Casual Messages**
+Simple system prompt extracts Spotify search queries from natural language:
+- "Yall have to listen to that new Fred again song Feisty" → `{"music": true, "query": "Fred again Feisty"}`
+- "hey whats up tonight" → `{"music": false}`
+Cost: ~0.001¢ per classification. Latency: <2s on Pi Zero (via thread executor).
+
+### 32. **Three-Path Music Detection Covers All Cases**
+1. **Spotify links** (`open.spotify.com/track/...`) → regex extract track ID → direct API lookup
+2. **Spotify URIs** (`spotify:track:...`) → use directly with tracks endpoint
+3. **Natural language** → Claude Haiku classification → Spotify text search
+Path 1 & 2 are instant (no LLM call). Path 3 adds ~2s but runs in background while message displays.
+
+### 33. **Telegram-Only Crew Members Work Without a Device**
+Friends can join a crew via Telegram bot (`/start {crew_code}`) without owning a LEELOO device. Messages flow Telegram → relay server → device. This enables testing crew messaging with a single Pi.
+
+---
+
+## Technical Patterns
+
+### Defensive WebSocket Response Parsing
+```python
+# ❌ BAD: Crashes on missing fields
+self.config.crew_id = data['crew_id']
+
+# ✅ GOOD: Fallback chain
+self.config.crew_id = data.get('crew_id', data.get('crew_code', self.config.crew_id))
+```
+
+### Two-Phase Crew Registration
+```python
+# Phase 1: Portal saves locally
+crew_config.json = {"crew_code": "LEELOO-WFJS", "is_creator": true}
+
+# Phase 2: Brain registers on server at first connect
+joined = await ws_client.rejoin_crew()
+if not joined and crew_config.get('is_creator'):
+    await ws_client.create_crew(display_name)  # passes existing crew_code
+```
+
+### Background Music Detection in Messages
+```python
+def _on_ws_message(self, sender, text):
+    # Show message immediately (don't block on music detection)
+    asyncio.ensure_future(self._handle_message_with_music(sender, text))
+
+async def _handle_message_with_music(self, sender, text):
+    # 1. Expand message frame with text (instant)
+    # 2. Detect music in background (Claude Haiku, ~2s)
+    # 3. If found, search Spotify + update album art (no crew push)
+    # 4. Force display refresh to show new album art
+```
+
+---
+
+## Files Modified This Session
+
+| File | Changes |
+|------|---------|
+| `leeloo_brain.py` | Welcome screen with QR, crew creation fallback, message-to-music detection |
+| `leeloo_client.py` | Defensive `.get()` for crew_id, pass existing crew_code in create_crew |
+| `leeloo_server/server.js` | Accept optional `crew_code` in create_crew |
+| `connect_saved_wifi.py` | Critical fix: restart NetworkManager after AP mode |
+| `leeloo_boot.py` | Full portal boot flow (first run detection, WiFi disconnect for AP) |
+| `captive_portal.py` | Pre-scan WiFi before AP mode, crew creation UI |
+
+---
+
 Made with ♪ by squid-baby & Claude Opus 4.6

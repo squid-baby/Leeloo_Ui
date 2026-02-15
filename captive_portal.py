@@ -1,213 +1,381 @@
 #!/usr/bin/env python3
 """
-Captive Portal - Web-based setup flow for LEELOO
-Serves a cyberpunk terminal-styled UI on phone
+Captive Portal — 5-step offline setup flow for LEELOO
+
+Runs on the Pi's own WiFi AP with NO internet access.
+All data is saved locally to JSON config files.
+Real relay server work happens AFTER the portal closes
+and the device connects to home WiFi.
+
+Steps:
+  1. WiFi    — pick home network, enter password (saved, not connected)
+  2. You     — first name + ZIP code
+  3. Crew    — start a new crew (show device code) or join a friend's crew
+  4. Telegram — teaser/opt-in (never tells user to leave the portal)
+  5. Done    — triggers WiFi switch, user can close page
+
+Terminal aesthetic using LEELOO device color palette.
 """
 
 import os
 import json
-import time
-import threading
+import sys
+import subprocess
 from flask import Flask, request, jsonify, redirect
 
-# Import our modules
 from wifi_manager import (
     start_ap_mode, stop_ap_mode, scan_wifi_networks,
-    connect_to_wifi, is_connected, get_device_id
+    get_device_id
 )
+from leeloo_device_id import get_device_crew_code
 
 app = Flask(__name__)
 
-# Config paths - write directly to gadget_main format
+# Config paths
 LEELOO_HOME = os.environ.get("LEELOO_HOME", "/home/pi/leeloo-ui")
 DEVICE_CONFIG_PATH = os.path.join(LEELOO_HOME, "device_config.json")
 CREW_CONFIG_PATH = os.path.join(LEELOO_HOME, "crew_config.json")
 
 # State
 setup_state = {
-    'step': 'wifi',  # wifi, info, connecting, guide, done
+    'step': 'wifi',
     'ssid': None,
-    'connected': False,
-    'error': None,
-    'dev_mode': False  # If True, skip AP mode and WiFi setup
+    'dev_mode': False,
 }
 
-# LCD update callback (set by main app)
+# Cached network list (scanned before AP mode starts)
+cached_networks = []
+
+# LCD update callback (set by boot sequence)
 lcd_callback = None
 
 
 def set_lcd_callback(callback):
-    """Set callback for LCD updates"""
     global lcd_callback
     lcd_callback = callback
 
 
 def update_lcd(screen, **kwargs):
-    """Update LCD display"""
     if lcd_callback:
         lcd_callback(screen, **kwargs)
 
 
 # ============================================
-# HTML TEMPLATES (Cyberpunk Terminal Style)
+# DEVICE CREW CODE (cached)
+# ============================================
+_device_crew_code = None
+
+def device_crew_code():
+    global _device_crew_code
+    if _device_crew_code is None:
+        _device_crew_code = get_device_crew_code()
+    return _device_crew_code
+
+
+# ============================================
+# CONFIG HELPERS
 # ============================================
 
-STYLE = """
+def load_device_config():
+    try:
+        with open(DEVICE_CONFIG_PATH, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_device_config(data):
+    existing = load_device_config()
+    existing.update(data)
+    os.makedirs(os.path.dirname(DEVICE_CONFIG_PATH), exist_ok=True)
+    with open(DEVICE_CONFIG_PATH, 'w') as f:
+        json.dump(existing, f, indent=2)
+
+
+def save_crew_config(data):
+    os.makedirs(os.path.dirname(CREW_CONFIG_PATH), exist_ok=True)
+    with open(CREW_CONFIG_PATH, 'w') as f:
+        json.dump(data, f, indent=2)
+
+
+# ============================================
+# TERMINAL CSS — CRT phosphor aesthetic
+# ============================================
+
+TERMINAL_CSS = """
 <style>
+    @keyframes blink {
+        0%, 49% { opacity: 1; }
+        50%, 100% { opacity: 0; }
+    }
+
     * { box-sizing: border-box; margin: 0; padding: 0; }
+
     body {
-        font-family: 'Courier New', monospace;
+        font-family: 'Courier New', Courier, monospace;
         background: #1A1D2E;
-        color: #A7AFD4;
+        color: #FFFFFF;
         min-height: 100vh;
         padding: 20px;
+        /* Scanline overlay */
+        background-image: repeating-linear-gradient(
+            0deg,
+            transparent,
+            transparent 2px,
+            rgba(26, 29, 46, 0.3) 2px,
+            rgba(26, 29, 46, 0.3) 3px
+        );
     }
+
     .container {
         max-width: 400px;
         margin: 0 auto;
     }
-    .terminal-box {
-        border: 2px solid #719253;
-        padding: 20px;
-        margin-bottom: 20px;
+
+    /* ---- Terminal box with frame-breaking label ---- */
+    .term-box {
+        border: 2px solid #9C93DD;
+        padding: 24px 18px 18px 18px;
+        margin-bottom: 24px;
+        position: relative;
     }
-    .header {
-        color: #9C93DD;
-        font-size: 14px;
-        margin-bottom: 20px;
-        text-align: center;
+    .term-box.green  { border-color: #7beec0; }
+    .term-box.purple { border-color: #9C93DD; }
+    .term-box.tan    { border-color: #C2995E; }
+    .term-box.lav    { border-color: #d978f9; }
+    .term-box.rose   { border-color: #D6697F; }
+
+    .term-label {
+        position: absolute;
+        top: -10px;
+        left: 12px;
+        background: #1A1D2E;
+        padding: 0 6px;
+        font-size: 12px;
+        letter-spacing: 1px;
     }
-    .header-line {
-        border-bottom: 1px solid #9C93DD;
-        margin-bottom: 10px;
-        padding-bottom: 10px;
-    }
+    .term-box.green  .term-label { color: #7beec0; }
+    .term-box.purple .term-label { color: #9C93DD; }
+    .term-box.tan    .term-label { color: #C2995E; }
+    .term-box.lav    .term-label { color: #d978f9; }
+    .term-box.rose   .term-label { color: #D6697F; }
+
+    /* ---- Headings ---- */
     h1 {
-        font-size: 18px;
-        color: #719253;
-        margin-bottom: 20px;
+        font-size: 16px;
+        color: #9C93DD;
+        margin-bottom: 16px;
+        font-weight: normal;
     }
+    h1 .cursor {
+        animation: blink 1s step-end infinite;
+        color: #9C93DD;
+    }
+
+    /* ---- Prompt lines ---- */
+    .prompt {
+        color: #d978f9;
+        font-size: 14px;
+        margin-bottom: 12px;
+    }
+    .prompt::before {
+        content: '> ';
+        opacity: 0.6;
+    }
+
+    /* ---- Form elements ---- */
     label {
         display: block;
         color: #C2995E;
-        margin-bottom: 5px;
         font-size: 12px;
+        margin-bottom: 4px;
+        letter-spacing: 0.5px;
     }
     select, input[type="text"], input[type="password"] {
         width: 100%;
         padding: 12px;
-        margin-bottom: 15px;
+        margin-bottom: 14px;
         background: #2A2D3E;
-        border: 1px solid #A7AFD4;
+        border: 1px solid #4A4A6A;
         color: #FFFFFF;
-        font-family: monospace;
+        font-family: 'Courier New', Courier, monospace;
         font-size: 16px;
+        border-radius: 0;
+        -webkit-appearance: none;
     }
     select:focus, input:focus {
         outline: none;
-        border-color: #719253;
+        border-color: #7beec0;
     }
-    button {
+    select {
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%237beec0' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+        background-repeat: no-repeat;
+        background-position: right 12px center;
+        padding-right: 32px;
+    }
+
+    /* ---- Buttons ---- */
+    .btn {
         width: 100%;
-        padding: 15px;
-        background: #719253;
+        padding: 14px;
+        background: #7beec0;
         border: none;
         color: #1A1D2E;
-        font-family: monospace;
+        font-family: 'Courier New', Courier, monospace;
         font-size: 16px;
         font-weight: bold;
         cursor: pointer;
-        margin-top: 10px;
+        margin-top: 8px;
+        letter-spacing: 1px;
     }
-    button:hover {
-        background: #8BA76A;
-    }
-    button:disabled {
+    .btn:hover { background: #9af5d5; }
+    .btn:disabled {
         background: #4A4A6A;
+        color: #6A6A8A;
         cursor: not-allowed;
     }
-    .hint {
+    .btn:active { transform: scale(0.98); }
+
+    .btn-secondary {
+        background: transparent;
+        border: 1px solid #4A4A6A;
+        color: #A7AFD4;
+        font-weight: normal;
+    }
+    .btn-secondary:hover {
+        border-color: #9C93DD;
+        color: #FFFFFF;
+        background: transparent;
+    }
+
+    /* ---- Crew code display ---- */
+    .crew-code {
+        background: #2A2D3E;
+        border: 2px solid #7beec0;
+        padding: 16px;
+        text-align: center;
+        font-size: 22px;
+        font-weight: bold;
+        color: #7beec0;
+        letter-spacing: 3px;
+        margin: 16px 0;
+        user-select: all;
+        cursor: pointer;
+        text-shadow: 0 0 10px rgba(123, 238, 192, 0.4);
+    }
+
+    /* ---- Step indicator ---- */
+    .step-indicator {
+        text-align: center;
+        color: #9C93DD;
+        font-size: 12px;
+        margin-top: 16px;
+        opacity: 0.7;
+    }
+
+    /* ---- Radio options ---- */
+    .radio-opt {
+        display: block;
+        padding: 14px;
+        margin-bottom: 10px;
+        border: 1px solid #4A4A6A;
+        cursor: pointer;
+        transition: border-color 0.15s;
+    }
+    .radio-opt:hover { border-color: #7beec0; }
+    .radio-opt input { margin-right: 10px; vertical-align: middle; }
+    .radio-opt input:checked + .radio-text { color: #7beec0; }
+    .radio-text {
+        font-size: 14px;
+        color: #FFFFFF;
+    }
+    .radio-desc {
+        display: block;
+        margin-top: 4px;
+        margin-left: 26px;
         font-size: 11px;
         color: #6A6A8A;
+    }
+
+    /* ---- Misc ---- */
+    .hint {
+        font-size: 11px;
+        color: #4A4A6A;
         margin-top: -10px;
-        margin-bottom: 15px;
+        margin-bottom: 14px;
     }
-    .error {
-        background: #D6697F;
-        color: #1A1D2E;
+    .error-msg {
+        background: rgba(214, 105, 127, 0.15);
+        border: 1px solid #D6697F;
+        color: #D6697F;
         padding: 10px;
-        margin-bottom: 15px;
+        margin-bottom: 14px;
         font-size: 12px;
     }
-    .success {
-        background: #719253;
-        color: #1A1D2E;
+    .success-msg {
+        background: rgba(123, 238, 192, 0.1);
+        border: 1px solid #7beec0;
+        color: #7beec0;
         padding: 10px;
-        margin-bottom: 15px;
+        margin-bottom: 14px;
         font-size: 12px;
     }
-    .loading {
-        text-align: center;
-        padding: 40px;
+    .note {
+        background: #2A2D3E;
+        padding: 12px;
+        font-size: 12px;
+        color: #C2995E;
+        margin: 14px 0;
+        border-left: 3px solid #C2995E;
     }
-    .spinner {
-        display: inline-block;
-        animation: spin 1s linear infinite;
+    .glow {
+        text-shadow: 0 0 8px currentColor;
     }
-    @keyframes spin {
-        0% { content: '|'; }
-        25% { content: '/'; }
-        50% { content: '-'; }
-        75% { content: '\\\\'; }
-    }
-    .progress {
-        font-size: 14px;
-        color: #719253;
-        margin-top: 20px;
-    }
-    /* Guide slides */
-    .slide {
-        text-align: center;
-        padding: 20px 0;
-    }
-    .slide h2 {
-        color: #719253;
-        font-size: 20px;
-        margin-bottom: 15px;
-    }
-    .slide p {
-        font-size: 14px;
-        line-height: 1.6;
-        margin-bottom: 10px;
-    }
-    .reaction-list {
-        text-align: left;
-        margin: 15px auto;
-        max-width: 200px;
-    }
-    .reaction-list div {
-        padding: 5px 0;
-    }
-    .tagline {
-        color: #719253;
-        font-size: 24px;
-        font-weight: bold;
-        margin: 20px 0;
-    }
-    .dots {
+    .dim { color: #4A4A6A; }
+
+    /* Toggle switch */
+    .toggle-row {
         display: flex;
-        justify-content: center;
-        gap: 8px;
-        margin-top: 20px;
+        align-items: center;
+        justify-content: space-between;
+        padding: 12px 0;
     }
-    .dot {
-        width: 8px;
-        height: 8px;
-        border-radius: 50%;
+    .toggle-label { color: #FFFFFF; font-size: 14px; }
+    .toggle {
+        position: relative;
+        width: 48px;
+        height: 26px;
+    }
+    .toggle input { opacity: 0; width: 0; height: 0; }
+    .toggle .slider {
+        position: absolute;
+        inset: 0;
         background: #4A4A6A;
+        cursor: pointer;
+        transition: 0.2s;
+        border-radius: 26px;
     }
-    .dot.active {
-        background: #719253;
+    .toggle .slider::before {
+        content: '';
+        position: absolute;
+        height: 20px;
+        width: 20px;
+        left: 3px;
+        bottom: 3px;
+        background: #1A1D2E;
+        transition: 0.2s;
+        border-radius: 50%;
+    }
+    .toggle input:checked + .slider { background: #7beec0; }
+    .toggle input:checked + .slider::before { transform: translateX(22px); }
+
+    /* Done screen */
+    .done-check {
+        font-size: 48px;
+        color: #7beec0;
+        text-align: center;
+        margin: 16px 0;
+        text-shadow: 0 0 20px rgba(123, 238, 192, 0.5);
     }
 </style>
 """
@@ -225,17 +393,14 @@ async function fetchJSON(url, options = {}) {
 """
 
 
-def render_page(title, content, auto_refresh=None):
-    """Render a complete HTML page"""
-    refresh_meta = f'<meta http-equiv="refresh" content="{auto_refresh}">' if auto_refresh else ''
+def render_page(title, content):
     return f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
     <title>{title}</title>
-    {refresh_meta}
-    {STYLE}
+    {TERMINAL_CSS}
     {SCRIPT_COMMON}
 </head>
 <body>
@@ -247,113 +412,102 @@ def render_page(title, content, auto_refresh=None):
 
 
 # ============================================
-# ROUTES
+# CAPTIVE PORTAL DETECTION ROUTES
 # ============================================
 
 @app.route('/')
 def index():
-    """Main setup page - redirect based on mode"""
     if setup_state.get('dev_mode'):
-        # In dev mode, skip WiFi setup (already connected)
-        return redirect('/setup/info')
+        return redirect('/setup/wifi')
     return redirect('/setup/wifi')
 
-
-# ============================================
-# CAPTIVE PORTAL DETECTION ROUTES
-# ============================================
 
 @app.route('/hotspot-detect.html')
 @app.route('/library/test/success.html')
 def apple_captive_portal():
-    """iOS/macOS captive portal detection"""
     return redirect('/setup/wifi')
 
 
 @app.route('/generate_204')
 @app.route('/gen_204')
 def android_captive_portal():
-    """Android captive portal detection - expects HTTP 204 or redirect"""
-    # Return redirect instead of 204 to force portal open
     return redirect('/setup/wifi')
 
 
 @app.route('/connecttest.txt')
 @app.route('/redirect')
 def windows_captive_portal():
-    """Windows captive portal detection"""
     return redirect('/setup/wifi')
 
 
 @app.route('/success.txt')
 @app.route('/canonical.html')
 def firefox_captive_portal():
-    """Firefox captive portal detection"""
     return redirect('/setup/wifi')
 
 
+# ============================================
+# STEP 1: WIFI
+# ============================================
+
 @app.route('/setup/wifi')
 def setup_wifi():
-    """Step 1: WiFi network selection"""
     error_html = ''
     if setup_state.get('error'):
-        error_html = f'<div class="error">{setup_state["error"]}</div>'
+        error_html = f'<div class="error-msg">{setup_state["error"]}</div>'
         setup_state['error'] = None
 
     content = f"""
-    <div class="header header-line">
-        LEELOO v1.0 ─── SETUP
-    </div>
+    <div class="term-box tan">
+        <div class="term-label">wifi</div>
 
-    <div class="terminal-box">
-        <h1>┌─ CONNECT TO WIFI ─┐</h1>
+        <h1>connect to your home wifi<span class="cursor">\u258a</span></h1>
 
         {error_html}
 
-        <form action="/api/wifi" method="POST">
-            <label>SELECT NETWORK:</label>
+        <form id="wifiForm">
+            <label>NETWORK</label>
             <select name="ssid" id="ssid" required>
-                <option value="">Scanning...</option>
+                <option value="">scanning...</option>
             </select>
 
-            <label>PASSWORD:</label>
-            <input type="password" name="password" id="password" placeholder="Enter WiFi password" required>
+            <label>PASSWORD</label>
+            <input type="password" name="password" id="password"
+                   placeholder="enter wifi password" required>
 
-            <button type="submit">CONNECT →</button>
+            <button type="submit" class="btn" id="wifiBtn">CONNECT</button>
         </form>
 
-        <div class="progress">Step 1 of 4</div>
+        <div class="step-indicator">[step 1 of 5]</div>
     </div>
 
     <script>
-        // Load networks on page load
         async function loadNetworks() {{
             try {{
                 const data = await fetchJSON('/api/networks');
                 const select = document.getElementById('ssid');
-                select.innerHTML = data.networks.map(n =>
-                    `<option value="${{n}}">${{n}}</option>`
-                ).join('');
-                if (data.networks.length === 0) {{
-                    select.innerHTML = '<option value="">No networks found</option>';
+                if (data.networks && data.networks.length > 0) {{
+                    select.innerHTML = data.networks.map(n =>
+                        '<option value="' + n + '">' + n + '</option>'
+                    ).join('');
+                }} else {{
+                    select.innerHTML = '<option value="">no networks found</option>';
                 }}
             }} catch (e) {{
-                console.error('Failed to load networks:', e);
+                console.error('scan failed:', e);
             }}
         }}
         loadNetworks();
 
-        // Handle form submit
-        document.querySelector('form').addEventListener('submit', async (e) => {{
+        document.getElementById('wifiForm').addEventListener('submit', async (e) => {{
             e.preventDefault();
-            const btn = document.querySelector('button');
+            const btn = document.getElementById('wifiBtn');
             btn.disabled = true;
-            btn.textContent = 'CONNECTING...';
+            btn.textContent = 'SAVING...';
 
-            const formData = new FormData(e.target);
             const data = {{
-                ssid: formData.get('ssid'),
-                password: formData.get('password')
+                ssid: document.getElementById('ssid').value,
+                password: document.getElementById('password').value
             }};
 
             try {{
@@ -361,65 +515,64 @@ def setup_wifi():
                     method: 'POST',
                     body: JSON.stringify(data)
                 }});
-
                 if (result.success) {{
-                    window.location.href = '/setup/crew';
+                    window.location.href = '/setup/you';
                 }} else {{
                     btn.disabled = false;
-                    btn.textContent = 'CONNECT →';
-                    alert(result.error || 'Connection failed');
+                    btn.textContent = 'CONNECT';
+                    alert(result.error || 'failed to save');
                 }}
-            }} catch (e) {{
+            }} catch (err) {{
                 btn.disabled = false;
-                btn.textContent = 'CONNECT →';
-                alert('Error: ' + e.message);
+                btn.textContent = 'CONNECT';
+                alert('error: ' + err.message);
             }}
         }});
     </script>
     """
-    return render_page("LEELOO Setup - WiFi", content)
+    return render_page("LEELOO - WiFi", content)
 
 
-@app.route('/setup/info')
-def setup_info():
-    """Step 2: User info (name, contacts, location)"""
+# ============================================
+# STEP 2: YOU (name + zip)
+# ============================================
+
+@app.route('/setup/you')
+def setup_you():
     content = """
-    <div class="header header-line">
-        LEELOO v1.0 ─── SETUP
-    </div>
+    <div class="term-box purple">
+        <div class="term-label">you</div>
 
-    <div class="terminal-box">
-        <h1>┌─ WHO ARE YOU? ─┐</h1>
+        <h1>tell me about yourself<span class="cursor">\u258a</span></h1>
 
-        <form action="/api/info" method="POST">
-            <label>FIRST NAME:</label>
-            <input type="text" name="user_name" placeholder="Enter your first name" required>
+        <form id="youForm">
+            <label>FIRST NAME</label>
+            <input type="text" name="user_name" id="userName"
+                   placeholder="your first name" required maxlength="20"
+                   autocomplete="given-name">
 
-            <label>FRIEND NAMES (optional):</label>
-            <input type="text" name="contacts" placeholder="Amy, Ben, Sarah">
-            <div class="hint">Names of friends you want to share music with</div>
+            <label>ZIP CODE</label>
+            <input type="text" name="zip_code" id="zipCode"
+                   placeholder="27601" pattern="[0-9]{5}" maxlength="5" required
+                   inputmode="numeric" autocomplete="postal-code">
+            <div class="hint">for weather and time zone</div>
 
-            <label>ZIP CODE (for weather):</label>
-            <input type="text" name="zip_code" placeholder="27601" pattern="[0-9]{5}" maxlength="5" required>
-
-            <button type="submit">CONTINUE →</button>
+            <button type="submit" class="btn" id="youBtn">CONTINUE</button>
         </form>
 
-        <div class="progress">Step 2 of 4</div>
+        <div class="step-indicator">[step 2 of 5]</div>
     </div>
 
     <script>
-        document.querySelector('form').addEventListener('submit', async (e) => {
+        document.getElementById('youForm').addEventListener('submit', async (e) => {
             e.preventDefault();
-            const btn = document.querySelector('button');
+            const btn = document.getElementById('youBtn');
             btn.disabled = true;
             btn.textContent = 'SAVING...';
 
-            const formData = new FormData(e.target);
             const data = {
-                user_name: formData.get('user_name'),
-                contacts: formData.get('contacts'),
-                zip_code: formData.get('zip_code')
+                user_name: document.getElementById('userName').value.trim(),
+                zip_code: document.getElementById('zipCode').value.trim()
             };
 
             try {
@@ -427,577 +580,337 @@ def setup_info():
                     method: 'POST',
                     body: JSON.stringify(data)
                 });
-
                 if (result.success) {
-                    window.location.href = '/setup/guide';
+                    window.location.href = '/setup/crew';
                 } else {
                     btn.disabled = false;
-                    btn.textContent = 'CONTINUE →';
-                    alert(result.error || 'Save failed');
+                    btn.textContent = 'CONTINUE';
+                    alert(result.error || 'failed to save');
                 }
-            } catch (e) {
+            } catch (err) {
                 btn.disabled = false;
-                btn.textContent = 'CONTINUE →';
-                alert('Error: ' + e.message);
+                btn.textContent = 'CONTINUE';
+                alert('error: ' + err.message);
             }
         });
     </script>
     """
-    return render_page("LEELOO Setup - Info", content)
+    return render_page("LEELOO - You", content)
 
+
+# ============================================
+# STEP 3: CREW (create or join)
+# ============================================
 
 @app.route('/setup/crew')
 def setup_crew():
-    """Step 3: Crew setup - create or join"""
-    content = """
-    <div class="header header-line">
-        LEELOO v1.0 ─── SETUP
+    code = device_crew_code()
+
+    content = f"""
+    <div class="term-box green">
+        <div class="term-label">crew</div>
+
+        <h1>your crew<span class="cursor">\u258a</span></h1>
+
+        <p class="prompt">are you the first one setting up?</p>
+
+        <label class="radio-opt" id="optCreate">
+            <input type="radio" name="crew_action" value="create" checked>
+            <span class="radio-text">start a new crew</span>
+            <span class="radio-desc">you're the first one with a LEELOO</span>
+        </label>
+
+        <label class="radio-opt" id="optJoin">
+            <input type="radio" name="crew_action" value="join">
+            <span class="radio-text">join a friend's crew</span>
+            <span class="radio-desc">a friend shared a crew code with you</span>
+        </label>
+
+        <button type="button" class="btn" id="crewBtn">CONTINUE</button>
+
+        <div class="step-indicator">[step 3 of 5]</div>
     </div>
-
-    <div class="terminal-box">
-        <h1>┌─ JOIN YOUR CREW ─┐</h1>
-
-        <p style="margin-bottom: 20px; color: #A7AFD4;">
-            Connect with friends who have LEELOOs
-        </p>
-
-        <div class="crew-options">
-            <label class="radio-option">
-                <input type="radio" name="crew_action" value="create" checked>
-                <span class="radio-label">Create a new crew</span>
-                <span class="radio-desc">You're the first one setting up</span>
-            </label>
-
-            <label class="radio-option">
-                <input type="radio" name="crew_action" value="join">
-                <span class="radio-label">Join an existing crew</span>
-                <span class="radio-desc">A friend shared a code with you</span>
-            </label>
-        </div>
-
-        <button type="button" id="continueBtn">CONTINUE</button>
-
-        <div class="progress">Step 3 of 4</div>
-    </div>
-
-    <style>
-        .crew-options {
-            margin: 20px 0;
-        }
-        .radio-option {
-            display: block;
-            padding: 15px;
-            margin-bottom: 10px;
-            border: 1px solid #4A4A6A;
-            cursor: pointer;
-            transition: border-color 0.2s;
-        }
-        .radio-option:hover {
-            border-color: #719253;
-        }
-        .radio-option input {
-            margin-right: 10px;
-        }
-        .radio-option input:checked + .radio-label {
-            color: #719253;
-        }
-        .radio-label {
-            font-size: 14px;
-            color: #FFFFFF;
-        }
-        .radio-desc {
-            display: block;
-            margin-top: 5px;
-            margin-left: 25px;
-            font-size: 11px;
-            color: #6A6A8A;
-        }
-    </style>
 
     <script>
-        document.getElementById('continueBtn').addEventListener('click', function() {
+        document.getElementById('crewBtn').addEventListener('click', function() {{
             const action = document.querySelector('input[name="crew_action"]:checked').value;
-            if (action === 'create') {
+            if (action === 'create') {{
                 window.location.href = '/setup/crew/create';
-            } else {
+            }} else {{
                 window.location.href = '/setup/crew/join';
-            }
-        });
+            }}
+        }});
     </script>
     """
-    return render_page("LEELOO Setup - Crew", content)
+    return render_page("LEELOO - Crew", content)
 
 
 @app.route('/setup/crew/create')
 def setup_crew_create():
-    """Step 3a: Create a new crew"""
-    content = """
-    <div class="header header-line">
-        LEELOO v1.0 ─── CREATE CREW
-    </div>
-
-    <div class="terminal-box">
-        <h1>┌─ NAME YOUR CREW ─┐</h1>
-
-        <p style="margin-bottom: 20px; color: #A7AFD4;">
-            Pick something fun your friends will recognize
-        </p>
-
-        <form id="createForm">
-            <label>CREW NAME:</label>
-            <input type="text" name="crew_name" placeholder="The Music Nerds" required maxlength="30">
-
-            <button type="submit">CREATE CREW</button>
-        </form>
-
-        <div class="progress">Step 3 of 4</div>
-    </div>
-
-    <script>
-        document.getElementById('createForm').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const btn = document.querySelector('button');
-            btn.disabled = true;
-            btn.textContent = 'CREATING...';
-
-            const formData = new FormData(e.target);
-            const data = {
-                crew_name: formData.get('crew_name')
-            };
-
-            try {
-                const result = await fetchJSON('/api/crew/create', {
-                    method: 'POST',
-                    body: JSON.stringify(data)
-                });
-
-                if (result.success) {
-                    window.location.href = '/setup/crew/created?code=' + result.invite_code + '&name=' + encodeURIComponent(result.crew_name);
-                } else {
-                    btn.disabled = false;
-                    btn.textContent = 'CREATE CREW';
-                    alert(result.error || 'Failed to create crew');
-                }
-            } catch (e) {
-                btn.disabled = false;
-                btn.textContent = 'CREATE CREW';
-                alert('Error: ' + e.message);
-            }
-        });
-    </script>
-    """
-    return render_page("LEELOO Setup - Create Crew", content)
-
-
-@app.route('/setup/crew/created')
-def setup_crew_created():
-    """Step 3b: Crew created - show invite code"""
-    invite_code = request.args.get('code', 'XXXX123')
-    crew_name = request.args.get('name', 'Your Crew')
-    invite_url = f"leeloo.app/join/{invite_code}"
+    code = device_crew_code()
 
     content = f"""
-    <div class="header header-line">
-        LEELOO v1.0 ─── CREW CREATED
-    </div>
+    <div class="term-box green">
+        <div class="term-label">crew</div>
 
-    <div class="terminal-box" style="text-align: center;">
-        <div style="font-size: 36px; margin: 10px 0; color: #719253;">✓</div>
-        <h1 style="color: #719253;">CREW CREATED!</h1>
+        <h1>your crew code<span class="cursor">\u258a</span></h1>
 
-        <p style="margin: 15px 0; color: #FFFFFF;">"{crew_name}"</p>
+        <p class="prompt">this is your device's unique crew code</p>
 
-        <p style="margin: 20px 0; color: #A7AFD4;">
-            Share this with your friends:
-        </p>
+        <div class="crew-code" id="crewCode" onclick="copyCode()">{code}</div>
 
-        <div class="invite-code" id="inviteCode" onclick="selectCode()">
-            {invite_url}
-        </div>
-        <p style="font-size: 11px; color: #6A6A8A; margin-top: -10px;">
-            ☝️ Tap to select, then copy/paste
-        </p>
+        <button type="button" class="btn" onclick="copyCode()" id="copyBtn">
+            COPY TO CLIPBOARD
+        </button>
 
-        <div class="share-buttons">
-            <button type="button" class="share-btn" onclick="copyCode()">COPY TO CLIPBOARD</button>
+        <div class="note">
+            copy this code now. after setup, text it to your
+            friend so they can join your crew.
         </div>
 
-        <p style="font-size: 12px; color: #C2995E; margin: 15px 0; padding: 10px; background: #2A2D3E;">
-            💡 This code is saved on your device!<br>
-            Send to homies when you're done with setup.
-        </p>
-
-        <button type="button" onclick="window.location.href='/setup/info'" style="margin-top: 10px;">
+        <button type="button" class="btn" id="createBtn" onclick="createCrew()">
             CONTINUE
         </button>
+
+        <div class="step-indicator">[step 3 of 5]</div>
     </div>
 
-    <style>
-        .invite-code {{
-            background: #2A2D3E;
-            padding: 15px;
-            margin: 15px 0;
-            font-family: monospace;
-            font-size: 14px;
-            color: #719253;
-            border: 1px solid #719253;
-            word-break: break-all;
-        }}
-        .share-buttons {{
-            display: flex;
-            gap: 10px;
-            justify-content: center;
-            margin: 15px 0;
-        }}
-        .share-btn {{
-            padding: 10px 20px;
-            font-size: 12px;
-            background: #2A2D3E;
-            border: 1px solid #A7AFD4;
-        }}
-        .share-btn:hover {{
-            background: #3A3D4E;
-        }}
-    </style>
-
     <script>
-        const inviteUrl = '{invite_url}';
-        const crewName = '{crew_name}';
-        const shareMessage = `Join my LEELOO crew "${{crewName}}"! Go to ${{inviteUrl}}`;
-
-        function selectCode() {{
-            // Select text when tapped
-            const el = document.getElementById('inviteCode');
-            const range = document.createRange();
-            range.selectNodeContents(el);
-            const selection = window.getSelection();
-            selection.removeAllRanges();
-            selection.addRange(range);
-        }}
-
         function copyCode() {{
-            // Try modern clipboard API first
+            const code = '{code}';
             if (navigator.clipboard && navigator.clipboard.writeText) {{
-                navigator.clipboard.writeText(inviteUrl).then(() => {{
-                    alert('✅ Copied to clipboard!\\n\\nYou can now paste it in a text or email.');
-                }}).catch(err => {{
-                    console.error('Clipboard error:', err);
-                    selectCode();
-                    alert('Text selected! Use your phone\\'s copy function.');
+                navigator.clipboard.writeText(code).then(() => {{
+                    document.getElementById('copyBtn').textContent = 'COPIED!';
+                    setTimeout(() => {{
+                        document.getElementById('copyBtn').textContent = 'COPY TO CLIPBOARD';
+                    }}, 2000);
+                }}).catch(() => {{
+                    fallbackCopy();
                 }});
             }} else {{
-                // Fallback: select text so user can manually copy
-                selectCode();
-                alert('Text selected! Tap Copy in the menu that appears.');
+                fallbackCopy();
             }}
         }}
 
-        function shareNative() {{
-            // Use native share if available (works on iOS/Android)
-            if (navigator.share) {{
-                navigator.share({{
-                    title: 'Join my LEELOO crew!',
-                    text: shareMessage
-                }}).catch(err => {{
-                    // User cancelled or share failed
-                    if (err.name !== 'AbortError') {{
-                        console.error('Share error:', err);
-                    }}
+        function fallbackCopy() {{
+            const el = document.getElementById('crewCode');
+            const range = document.createRange();
+            range.selectNodeContents(el);
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(range);
+        }}
+
+        async function createCrew() {{
+            const btn = document.getElementById('createBtn');
+            btn.disabled = true;
+            btn.textContent = 'SAVING...';
+
+            try {{
+                const result = await fetchJSON('/api/crew/create', {{
+                    method: 'POST',
+                    body: JSON.stringify({{ crew_code: '{code}' }})
                 }});
-            }} else {{
-                // Fallback to SMS
-                window.open('sms:?body=' + encodeURIComponent(shareMessage), '_blank');
+                if (result.success) {{
+                    window.location.href = '/setup/telegram';
+                }} else {{
+                    btn.disabled = false;
+                    btn.textContent = 'CONTINUE';
+                    alert(result.error || 'failed');
+                }}
+            }} catch (err) {{
+                btn.disabled = false;
+                btn.textContent = 'CONTINUE';
+                alert('error: ' + err.message);
             }}
         }}
     </script>
     """
-    return render_page("LEELOO Setup - Crew Created", content)
+    return render_page("LEELOO - Create Crew", content)
 
 
 @app.route('/setup/crew/join')
 def setup_crew_join():
-    """Step 3c: Join an existing crew"""
-    content = """
-    <div class="header header-line">
-        LEELOO v1.0 ─── JOIN CREW
-    </div>
-
-    <div class="terminal-box">
-        <h1>┌─ JOIN A CREW ─┐</h1>
-
-        <p style="margin-bottom: 20px; color: #A7AFD4;">
-            Enter the invite code your friend shared with you
-        </p>
-
-        <form id="joinForm">
-            <label>INVITE CODE:</label>
-            <input type="text" name="invite_code" placeholder="WXYZ123" required
-                   style="text-transform: uppercase;" maxlength="10"
-                   pattern="[A-Za-z0-9]+">
-            <div class="hint">The code at the end of leeloo.app/join/...</div>
-
-            <button type="submit">JOIN CREW</button>
-        </form>
-
-        <div class="progress">Step 3 of 4</div>
-    </div>
-
-    <script>
-        document.getElementById('joinForm').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const btn = document.querySelector('button');
-            btn.disabled = true;
-            btn.textContent = 'JOINING...';
-
-            const formData = new FormData(e.target);
-            const data = {
-                invite_code: formData.get('invite_code').toUpperCase()
-            };
-
-            try {
-                const result = await fetchJSON('/api/crew/join', {
-                    method: 'POST',
-                    body: JSON.stringify(data)
-                });
-
-                if (result.success) {
-                    window.location.href = '/setup/crew/joined?name=' + encodeURIComponent(result.crew_name) + '&members=' + encodeURIComponent(result.members.join(', '));
-                } else {
-                    btn.disabled = false;
-                    btn.textContent = 'JOIN CREW';
-                    alert(result.error || 'Invalid invite code');
-                }
-            } catch (e) {
-                btn.disabled = false;
-                btn.textContent = 'JOIN CREW';
-                alert('Error: ' + e.message);
-            }
-        });
-    </script>
-    """
-    return render_page("LEELOO Setup - Join Crew", content)
-
-
-@app.route('/setup/crew/joined')
-def setup_crew_joined():
-    """Step 3d: Successfully joined crew"""
-    crew_name = request.args.get('name', 'Your Crew')
-    members = request.args.get('members', '')
+    own_code = device_crew_code()
 
     content = f"""
-    <div class="header header-line">
-        LEELOO v1.0 ─── JOINED!
-    </div>
+    <div class="term-box green">
+        <div class="term-label">crew</div>
 
-    <div class="terminal-box" style="text-align: center;">
-        <div style="font-size: 36px; margin: 10px 0; color: #719253;">✓</div>
-        <h1 style="color: #719253;">YOU'RE IN!</h1>
+        <h1>join a crew<span class="cursor">\u258a</span></h1>
 
-        <p style="margin: 20px 0; color: #FFFFFF;">
-            Welcome to "{crew_name}"
-        </p>
+        <p class="prompt">enter the crew code your friend shared</p>
 
-        <p style="margin: 15px 0; color: #A7AFD4;">
-            Members: {members if members else 'You'}
-        </p>
+        <form id="joinForm">
+            <label>CREW CODE</label>
+            <input type="text" name="invite_code" id="inviteCode"
+                   placeholder="LEELOO-XXXX" required maxlength="11"
+                   style="text-transform: uppercase; text-align: center;
+                          font-size: 20px; letter-spacing: 2px;"
+                   autocomplete="off" autocorrect="off" autocapitalize="characters">
 
-        <button type="button" onclick="window.location.href='/setup/info'" style="margin-top: 20px;">
-            CONTINUE
+            <button type="submit" class="btn" id="joinBtn">JOIN CREW</button>
+        </form>
+
+        <div class="note" style="margin-top: 18px;">
+            your device code is <strong style="color: #7beec0;">{own_code}</strong><br>
+            in case you want to start a different crew later
+        </div>
+
+        <button type="button" class="btn btn-secondary"
+                onclick="window.location.href='/setup/crew'"
+                style="margin-top: 8px;">
+            BACK
         </button>
-    </div>
-    """
-    return render_page("LEELOO Setup - Joined Crew", content)
 
-
-@app.route('/setup/guide')
-def setup_guide():
-    """Step 3: Quick start guide"""
-    content = """
-    <div class="header header-line">
-        LEELOO v1.0 ─── QUICK GUIDE
-    </div>
-
-    <div class="slides" id="slides">
-        <!-- Slide 1: Welcome -->
-        <div class="slide" data-slide="0">
-            <div class="terminal-box">
-                <h2>You're all set!</h2>
-                <p>Quick guide to your new LEELOO.</p>
-                <p style="color: #6A6A8A; margin-top: 20px;">Swipe to learn →</p>
-                <div class="dots">
-                    <div class="dot active"></div>
-                    <div class="dot"></div>
-                    <div class="dot"></div>
-                    <div class="dot"></div>
-                    <div class="dot"></div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Slide 2: Share Things -->
-        <div class="slide" data-slide="1" style="display:none;">
-            <div class="terminal-box">
-                <h2>Share Things</h2>
-                <p>Tap the TOP of your LEELOO (not the screen) and talk to it.</p>
-                <p style="margin-top: 10px;">Ask about weather, time, send messages, and music.</p>
-                <p style="background:#2A2D3E; padding:10px; margin:15px 0; font-size: 13px;">"send my homies Lets Dance by David Bowie"</p>
-                <p style="font-size: 12px; color: #6A6A8A;">Tap and ask "what can I ask?" for more help.</p>
-                <div class="dots">
-                    <div class="dot"></div>
-                    <div class="dot active"></div>
-                    <div class="dot"></div>
-                    <div class="dot"></div>
-                    <div class="dot"></div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Slide 3: Tap Reactions -->
-        <div class="slide" data-slide="2" style="display:none;">
-            <div class="terminal-box">
-                <h2>Tap Reactions</h2>
-                <p>During a message or music share:</p>
-                <div class="reaction-list" style="text-align: center; margin: 20px 0;">
-                    <div style="margin-bottom: 10px;">Double tap = Love</div>
-                    <div>Triple tap = Fire</div>
-                    <pre style="color: #C2995E; font-size: 10px; margin: 10px 0;">    )
-   ) \\
-  (   )
-   ) (
-  (   )
- __)  (__</pre>
-                </div>
-                <div class="dots">
-                    <div class="dot"></div>
-                    <div class="dot"></div>
-                    <div class="dot active"></div>
-                    <div class="dot"></div>
-                    <div class="dot"></div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Slide 4: Thinking of You -->
-        <div class="slide" data-slide="3" style="display:none;">
-            <div class="terminal-box">
-                <h2>Thinking of You</h2>
-                <p>Miss your friends?</p>
-                <p style="margin-top: 15px;">Double tap when NOT receiving music or messages.</p>
-                <p style="margin-top: 10px;">It sends a "thinking of you" notification.</p>
-                <p style="background:#2A2D3E; padding:10px; margin:15px 0; font-size: 13px;">Like passing a note under the table in class.</p>
-                <div class="dots">
-                    <div class="dot"></div>
-                    <div class="dot"></div>
-                    <div class="dot"></div>
-                    <div class="dot active"></div>
-                    <div class="dot"></div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Slide 5: Done -->
-        <div class="slide" data-slide="4" style="display:none;">
-            <div class="terminal-box" style="border-color: #719253;">
-                <p>Now put your phone away and enjoy tech that adds value to your life.</p>
-                <div class="tagline">More fun, less phone.</div>
-                <button onclick="window.location.href='/done'">START USING LEELOO</button>
-                <div class="dots">
-                    <div class="dot"></div>
-                    <div class="dot"></div>
-                    <div class="dot"></div>
-                    <div class="dot"></div>
-                    <div class="dot active"></div>
-                </div>
-            </div>
-        </div>
+        <div class="step-indicator">[step 3 of 5]</div>
     </div>
 
     <script>
-        let currentSlide = 0;
-        const totalSlides = 5;
+        const input = document.getElementById('inviteCode');
 
-        function showSlide(n) {
-            document.querySelectorAll('.slide').forEach((s, i) => {
-                s.style.display = i === n ? 'block' : 'none';
-            });
-            currentSlide = n;
-        }
+        // Auto-prepend LEELOO- prefix
+        input.addEventListener('input', function() {{
+            let val = this.value.toUpperCase().replace(/[^A-Z0-9-]/g, '');
+            if (val.length > 0 && !val.startsWith('LEELOO-') && !val.startsWith('L')) {{
+                val = 'LEELOO-' + val;
+            }}
+            this.value = val;
+        }});
 
-        // Swipe detection
-        let startX = 0;
-        document.addEventListener('touchstart', e => startX = e.touches[0].clientX);
-        document.addEventListener('touchend', e => {
-            const diff = startX - e.changedTouches[0].clientX;
-            if (Math.abs(diff) > 50) {
-                if (diff > 0 && currentSlide < totalSlides - 1) {
-                    showSlide(currentSlide + 1);
-                } else if (diff < 0 && currentSlide > 0) {
-                    showSlide(currentSlide - 1);
-                }
-            }
-        });
+        document.getElementById('joinForm').addEventListener('submit', async (e) => {{
+            e.preventDefault();
+            const btn = document.getElementById('joinBtn');
+            btn.disabled = true;
+            btn.textContent = 'SAVING...';
 
-        // Also allow click to advance
-        document.addEventListener('click', e => {
-            if (e.target.tagName !== 'BUTTON') {
-                if (currentSlide < totalSlides - 1) {
-                    showSlide(currentSlide + 1);
-                }
-            }
-        });
+            let code = document.getElementById('inviteCode').value.trim().toUpperCase();
+            // Normalize: if they just typed the 4-char suffix, prepend LEELOO-
+            if (code.length === 4 && !code.startsWith('L')) {{
+                code = 'LEELOO-' + code;
+            }}
+
+            try {{
+                const result = await fetchJSON('/api/crew/join', {{
+                    method: 'POST',
+                    body: JSON.stringify({{ invite_code: code }})
+                }});
+                if (result.success) {{
+                    window.location.href = '/setup/telegram';
+                }} else {{
+                    btn.disabled = false;
+                    btn.textContent = 'JOIN CREW';
+                    alert(result.error || 'invalid code');
+                }}
+            }} catch (err) {{
+                btn.disabled = false;
+                btn.textContent = 'JOIN CREW';
+                alert('error: ' + err.message);
+            }}
+        }});
     </script>
     """
-    return render_page("LEELOO - Quick Guide", content)
+    return render_page("LEELOO - Join Crew", content)
 
 
-@app.route('/done')
-def done():
-    """Setup complete - trigger WiFi connection"""
+# ============================================
+# STEP 4: TELEGRAM TEASER
+# ============================================
+
+@app.route('/setup/telegram')
+def setup_telegram():
     content = """
-    <div class="terminal-box" style="text-align: center; border-color: #719253;">
-        <div style="font-size: 48px; margin: 20px 0;">✓</div>
-        <h1 style="color: #719253;">SETUP COMPLETE</h1>
-        <p style="margin: 20px 0;" id="status">Connecting to WiFi...</p>
-        <p style="color: #6A6A8A; font-size: 12px;" id="instructions">Please wait...</p>
+    <div class="term-box lav">
+        <div class="term-label">telegram</div>
+
+        <h1>message your crew from your phone<span class="cursor">\u258a</span></h1>
+
+        <p class="prompt">want to send messages to your crew's LEELOOs from your phone?</p>
+
+        <p style="color: #A7AFD4; font-size: 13px; margin-bottom: 16px; line-height: 1.5;">
+            after LEELOO boots up, it'll show you how to connect
+            Telegram. nothing to do right now.
+        </p>
+
+        <div class="toggle-row">
+            <span class="toggle-label">show me Telegram setup after boot</span>
+            <label class="toggle">
+                <input type="checkbox" id="telegramToggle" checked>
+                <span class="slider"></span>
+            </label>
+        </div>
+
+        <button type="button" class="btn" id="telegramBtn" onclick="saveTelegram()">
+            CONTINUE
+        </button>
+
+        <div class="step-indicator">[step 4 of 5]</div>
     </div>
 
     <script>
-        // Trigger WiFi connection immediately
-        fetch('/api/finish', {method: 'POST'})
-            .then(res => res.json())
-            .then(data => {
-                if (data.success) {
-                    document.getElementById('status').textContent = 'Your LEELOO is ready!';
-                    document.getElementById('instructions').textContent = 'You can close this page now.';
+        async function saveTelegram() {
+            const btn = document.getElementById('telegramBtn');
+            btn.disabled = true;
+            btn.textContent = 'SAVING...';
+
+            const opted = document.getElementById('telegramToggle').checked;
+
+            try {
+                const result = await fetchJSON('/api/telegram-optin', {
+                    method: 'POST',
+                    body: JSON.stringify({ telegram_opted_in: opted })
+                });
+                if (result.success) {
+                    window.location.href = '/setup/done';
                 } else {
-                    document.getElementById('status').textContent = 'Setup saved!';
-                    document.getElementById('instructions').textContent = 'Power cycle your LEELOO to connect to WiFi.';
+                    btn.disabled = false;
+                    btn.textContent = 'CONTINUE';
+                    alert(result.error || 'failed');
                 }
-            })
-            .catch(err => {
-                document.getElementById('status').textContent = 'Setup saved!';
-                document.getElementById('instructions').textContent = 'Power cycle your LEELOO to connect to WiFi.';
-            });
+            } catch (err) {
+                btn.disabled = false;
+                btn.textContent = 'CONTINUE';
+                alert('error: ' + err.message);
+            }
+        }
+    </script>
+    """
+    return render_page("LEELOO - Telegram", content)
+
+
+# ============================================
+# STEP 5: DONE
+# ============================================
+
+@app.route('/setup/done')
+def setup_done():
+    content = """
+    <div class="term-box green">
+        <div class="term-label">done</div>
+
+        <div class="done-check">OK</div>
+
+        <h1 style="text-align: center; color: #7beec0;" class="glow">
+            all set!
+        </h1>
+
+        <p style="text-align: center; color: #A7AFD4; font-size: 14px;
+                  margin: 16px 0; line-height: 1.5;">
+            your LEELOO is booting up.<br>
+            you can close this page.
+        </p>
+
+        <div class="step-indicator">[step 5 of 5]</div>
+    </div>
+
+    <script>
+        // Trigger WiFi switch
+        fetch('/api/finish', { method: 'POST' })
+            .then(r => r.json())
+            .catch(() => {});
     </script>
     """
     return render_page("LEELOO - Ready", content)
-
-
-@app.route('/connecting')
-def connecting():
-    """Connecting screen (auto-refreshes)"""
-    ssid = setup_state.get('ssid', 'WiFi')
-    content = f"""
-    <div class="terminal-box" style="text-align: center;">
-        <h1>CONNECTING...</h1>
-        <p style="margin: 20px 0;">Connecting to {ssid}</p>
-        <div class="loading">
-            <span class="spinner">|</span>
-        </div>
-        <p style="color: #6A6A8A; font-size: 12px;">Please wait...</p>
-    </div>
-    """
-    return render_page("LEELOO - Connecting", content, auto_refresh=3)
 
 
 # ============================================
@@ -1006,351 +919,179 @@ def connecting():
 
 @app.route('/api/networks', methods=['GET'])
 def api_networks():
-    """Return list of available WiFi networks"""
+    # Use cached networks (scanned before AP mode started)
+    # because wlan0 is owned by hostapd and can't scan
+    if cached_networks:
+        return jsonify({'networks': cached_networks})
+    # Fallback: try scanning anyway (might work in dev mode)
     networks = scan_wifi_networks()
     return jsonify({'networks': networks})
 
 
 @app.route('/api/wifi', methods=['POST'])
 def api_wifi():
-    """Save WiFi credentials (don't connect yet - wait until setup is complete)"""
+    """Save WiFi credentials (don't connect yet)"""
     data = request.get_json()
     ssid = data.get('ssid')
     password = data.get('password')
 
     if not ssid or not password:
-        return jsonify({'success': False, 'error': 'Missing SSID or password'})
+        return jsonify({'success': False, 'error': 'missing ssid or password'})
 
-    # Save WiFi credentials to config (we'll connect after setup is complete)
-    config = load_config()
-    config['wifi_ssid'] = ssid
-    config['wifi_password'] = password
-
-    try:
-        save_config(config)
-        print(f"WiFi credentials saved: {ssid}")
-    except Exception as e:
-        print(f"Error saving WiFi config: {e}")
-        return jsonify({'success': False, 'error': 'Failed to save WiFi credentials'})
+    save_device_config({
+        'wifi_ssid': ssid,
+        'wifi_password': password,
+    })
 
     setup_state['ssid'] = ssid
-    setup_state['step'] = 'info'
+    setup_state['step'] = 'you'
+    print(f"[PORTAL] WiFi credentials saved: {ssid}")
 
-    # Success! Phone can now proceed to step 2
     return jsonify({'success': True})
 
 
 @app.route('/api/info', methods=['POST'])
 def api_info():
-    """Save user info and complete setup"""
+    """Save user name + zip code"""
     data = request.get_json()
-
     user_name = data.get('user_name', '').strip()
-    contacts_str = data.get('contacts', '')
     zip_code = data.get('zip_code', '').strip()
 
     if not user_name:
-        return jsonify({'success': False, 'error': 'Name is required'})
+        return jsonify({'success': False, 'error': 'name is required'})
 
     if not zip_code or len(zip_code) != 5 or not zip_code.isdigit():
-        return jsonify({'success': False, 'error': 'Valid 5-digit ZIP code required'})
+        return jsonify({'success': False, 'error': 'valid 5-digit zip code required'})
 
-    # Parse contacts
-    contacts = [c.strip() for c in contacts_str.split(',') if c.strip()]
-
-    # Convert ZIP to lat/lon using geocoding API (free, no key needed)
-    latitude, longitude = None, None
-    try:
-        import requests
-        # Use Nominatim (OpenStreetMap's free geocoding service)
-        url = f"https://nominatim.openstreetmap.org/search?postalcode={zip_code}&country=US&format=json&limit=1"
-        headers = {'User-Agent': 'LEELOO-Setup/1.0'}
-        resp = requests.get(url, headers=headers, timeout=5)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data:
-                latitude = float(data[0]['lat'])
-                longitude = float(data[0]['lon'])
-                print(f"Converted ZIP {zip_code} to lat/lon: {latitude}, {longitude}")
-    except Exception as e:
-        print(f"ZIP to lat/lon conversion failed: {e}")
-        # Continue without coordinates - weather won't work but setup can complete
-
-    # Save config with lat/lon for weather
-    # Note: setup_complete will be set after crew setup
-    config = load_config()
-    config.update({
+    # Save locally — geocoding happens post-WiFi in boot sequence
+    save_device_config({
         'user_name': user_name,
         'zip_code': zip_code,
-        'wifi_ssid': setup_state.get('ssid', ''),
     })
 
-    # Add lat/lon and look up timezone if we got coordinates
-    if latitude and longitude:
-        config['latitude'] = latitude
-        config['longitude'] = longitude
-
-        # Look up timezone from coordinates using Open-Meteo API
-        try:
-            tz_url = (
-                f"https://api.open-meteo.com/v1/forecast?"
-                f"latitude={latitude}&longitude={longitude}"
-                f"&current=temperature_2m&forecast_days=1"
-                f"&timezone=auto"
-            )
-            tz_resp = requests.get(tz_url, headers={'User-Agent': 'LEELOO-Setup/1.0'}, timeout=5)
-            if tz_resp.status_code == 200:
-                tz_data = tz_resp.json()
-                timezone = tz_data.get('timezone')
-                if timezone:
-                    config['timezone'] = timezone
-                    print(f"Detected timezone: {timezone}")
-        except Exception as e:
-            print(f"Timezone lookup failed: {e}")
-            # Falls back to system timezone at runtime
-
-    # Update crew members with contacts from this form
-    if contacts and config.get('crew'):
-        config['crew']['members'] = contacts
-
-    try:
-        save_config(config)
-        print(f"Config saved: {config}")
-    except Exception as e:
-        print(f"Error saving config: {e}")
-        return jsonify({'success': False, 'error': 'Failed to save config'})
+    setup_state['step'] = 'crew'
+    print(f"[PORTAL] User info saved: {user_name}, {zip_code}")
 
     return jsonify({'success': True})
 
 
-def load_config():
-    """Load config by merging device_config.json and crew_config.json"""
-    config = {}
-
-    # Load device config
-    try:
-        with open(DEVICE_CONFIG_PATH, 'r') as f:
-            config.update(json.load(f))
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
-
-    # Load crew config into 'crew' key
-    try:
-        with open(CREW_CONFIG_PATH, 'r') as f:
-            crew_data = json.load(f)
-            config['crew'] = crew_data
-            # Also populate contacts from crew members for compatibility
-            if 'members' in crew_data:
-                config['contacts'] = crew_data['members']
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
-
-    return config
-
-
-def save_device_config(data):
-    """Save device config (latitude, longitude, zip_code, user_name, wifi, setup_complete)"""
-    # Read existing to preserve fields not being updated
-    try:
-        with open(DEVICE_CONFIG_PATH, 'r') as f:
-            existing = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        existing = {}
-
-    existing.update(data)
-    with open(DEVICE_CONFIG_PATH, 'w') as f:
-        json.dump(existing, f, indent=2)
-
-
-def save_crew_config(data):
-    """Save crew config (name, invite_code, is_creator, members)"""
-    with open(CREW_CONFIG_PATH, 'w') as f:
-        json.dump(data, f, indent=2)
-
-
-def save_config(config):
-    """Save both device and crew configs from merged dict"""
-    # Extract device fields
-    device_fields = {}
-    for key in ('latitude', 'longitude', 'zip_code', 'user_name',
-                'wifi_ssid', 'wifi_password', 'setup_complete', 'timezone'):
-        if key in config:
-            device_fields[key] = config[key]
-
-    if device_fields:
-        save_device_config(device_fields)
-
-    # Extract crew fields
-    crew_data = config.get('crew')
-    if crew_data:
-        save_crew_config(crew_data)
-
-
-def generate_invite_code():
-    """Generate a random 7-character invite code"""
-    import random
-    import string
-    chars = string.ascii_uppercase + string.digits
-    return ''.join(random.choice(chars) for _ in range(7))
-
-
 @app.route('/api/crew/create', methods=['POST'])
 def api_crew_create():
-    """Create a new crew"""
+    """Create a new crew (save locally, register on relay post-WiFi)"""
     data = request.get_json()
-    crew_name = data.get('crew_name', '').strip()
+    crew_code = data.get('crew_code', device_crew_code())
 
-    if not crew_name:
-        return jsonify({'success': False, 'error': 'Crew name is required'})
-
-    if len(crew_name) > 30:
-        return jsonify({'success': False, 'error': 'Crew name too long (max 30 chars)'})
-
-    # Generate invite code
-    invite_code = generate_invite_code()
-
-    # Save to config
-    config = load_config()
-    config['crew'] = {
-        'name': crew_name,
-        'invite_code': invite_code,
+    save_crew_config({
+        'invite_code': crew_code,
         'is_creator': True,
-        'members': [config.get('user_name', 'You')]
-    }
-    config['setup_complete'] = True
-
-    try:
-        save_config(config)
-        print(f"Crew created: {crew_name} ({invite_code})")
-    except Exception as e:
-        print(f"Error saving crew config: {e}")
-        return jsonify({'success': False, 'error': 'Failed to save crew'})
-
-    setup_state['step'] = 'done'
-    update_lcd('success')
-
-    # Note: WiFi connection happens AFTER portal exits
-    # See connect_saved_wifi.py which runs after Ctrl+C
-
-    return jsonify({
-        'success': True,
-        'crew_name': crew_name,
-        'invite_code': invite_code
+        'device_crew_code': crew_code,
     })
+
+    setup_state['step'] = 'telegram'
+    print(f"[PORTAL] Crew created (local): {crew_code}")
+
+    return jsonify({'success': True, 'crew_code': crew_code})
 
 
 @app.route('/api/crew/join', methods=['POST'])
 def api_crew_join():
-    """Join an existing crew"""
+    """Join an existing crew (save locally, validate on relay post-WiFi)"""
     data = request.get_json()
     invite_code = data.get('invite_code', '').strip().upper()
 
     if not invite_code:
-        return jsonify({'success': False, 'error': 'Invite code is required'})
+        return jsonify({'success': False, 'error': 'crew code is required'})
 
-    # In a real implementation, this would validate against a backend server
-    # For now, we'll accept any code and simulate a successful join
-    # The backend would return the crew name and member list
+    # Basic format validation
+    if not invite_code.startswith('LEELOO-') or len(invite_code) != 11:
+        return jsonify({'success': False, 'error': 'code should look like LEELOO-XXXX'})
 
-    # TODO: Replace with actual backend API call
-    # response = requests.post('https://api.leeloo.app/crew/join', json={'code': invite_code})
+    own_code = device_crew_code()
 
-    # For demo purposes, simulate a successful join
-    # In production, this would validate the code against the server
-    simulated_crew_name = f"Crew {invite_code[:4]}"
-    simulated_members = ['Friend 1', 'Friend 2']
-
-    # Save to config
-    config = load_config()
-    config['crew'] = {
-        'name': simulated_crew_name,
+    save_crew_config({
         'invite_code': invite_code,
         'is_creator': False,
-        'members': simulated_members + [config.get('user_name', 'You')]
-    }
-    config['setup_complete'] = True
-
-    try:
-        save_config(config)
-        print(f"Joined crew: {simulated_crew_name}")
-    except Exception as e:
-        print(f"Error saving crew config: {e}")
-        return jsonify({'success': False, 'error': 'Failed to save crew'})
-
-    setup_state['step'] = 'done'
-    update_lcd('success')
-
-    # Note: WiFi connection happens AFTER portal exits
-    # See connect_saved_wifi.py which runs after Ctrl+C
-
-    return jsonify({
-        'success': True,
-        'crew_name': simulated_crew_name,
-        'members': simulated_members
+        'device_crew_code': own_code,
     })
+
+    setup_state['step'] = 'telegram'
+    print(f"[PORTAL] Crew join saved (local): {invite_code}")
+
+    return jsonify({'success': True, 'crew_code': invite_code})
+
+
+@app.route('/api/telegram-optin', methods=['POST'])
+def api_telegram_optin():
+    """Save Telegram opt-in preference"""
+    data = request.get_json()
+    opted = data.get('telegram_opted_in', True)
+
+    save_device_config({
+        'telegram_opted_in': opted,
+    })
+
+    print(f"[PORTAL] Telegram opt-in: {opted}")
+    return jsonify({'success': True})
 
 
 @app.route('/api/finish', methods=['POST'])
 def api_finish():
-    """Finish setup and connect to WiFi"""
-    import subprocess
+    """Mark setup complete and trigger WiFi connection"""
+    save_device_config({'setup_complete': True})
 
-    config = load_config()
+    setup_state['step'] = 'done'
+    update_lcd('success')
 
-    if not config.get('setup_complete'):
-        return jsonify({'success': False, 'error': 'Setup not complete'})
-
-    # Trigger WiFi connection in background (don't wait for it)
+    # Trigger WiFi connection in background
     try:
-        subprocess.Popen(
-            ['sudo', 'python3', '/home/pi/leeloo-ui/connect_saved_wifi.py'],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True  # Detach from parent
-        )
-        return jsonify({'success': True, 'message': 'Connecting to WiFi...'})
+        connect_script = os.path.join(LEELOO_HOME, 'connect_saved_wifi.py')
+        if os.path.exists(connect_script):
+            subprocess.Popen(
+                ['sudo', 'python3', connect_script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        print("[PORTAL] Setup complete, WiFi switch triggered")
+        return jsonify({'success': True})
     except Exception as e:
-        print(f"Failed to trigger WiFi connection: {e}")
-        return jsonify({'success': False, 'error': str(e)})
+        print(f"[PORTAL] WiFi switch error: {e}")
+        return jsonify({'success': True, 'wifi_note': 'manual reboot may be needed'})
 
 
 # ============================================
-# MAIN ENTRY POINT
+# MAIN
 # ============================================
 
 def run_captive_portal(lcd_update_callback=None, dev_mode=False):
     """
-    Run the captive portal setup flow
-    Blocks until setup is complete
-
-    Args:
-        lcd_update_callback: Function to call for LCD updates
-        dev_mode: If True, skip AP mode and run on port 8080
+    Run the captive portal setup flow.
+    Blocks until setup is complete.
     """
-    global lcd_callback
+    global lcd_callback, cached_networks
     lcd_callback = lcd_update_callback
     setup_state['dev_mode'] = dev_mode
 
     if dev_mode:
-        print("Starting setup server in DEV MODE (port 8080)...")
-        print("Open http://leeloo.local:8080 on your phone")
-        update_lcd('phone_connected')  # Show "complete setup on phone" screen
+        print("[PORTAL] DEV MODE — http://localhost:8080")
         app.run(host='0.0.0.0', port=8080, debug=False, threaded=True)
     else:
-        print("Starting captive portal in PRODUCTION MODE...")
-        # Start AP mode
+        # Pre-scan WiFi networks BEFORE starting AP mode
+        # (once hostapd owns wlan0, we can't scan anymore)
+        print("[PORTAL] Pre-scanning WiFi networks...")
+        cached_networks = scan_wifi_networks()
+        print(f"[PORTAL] Found {len(cached_networks)} networks: {cached_networks}")
+
+        print("[PORTAL] PRODUCTION MODE — starting AP...")
         ssid = start_ap_mode()
         update_lcd('ap_mode', ssid=ssid)
-
-        # Run Flask on port 80 (for captive portal auto-open)
         try:
             app.run(host='0.0.0.0', port=80, debug=False, threaded=True)
         except PermissionError:
-            print("Port 80 requires root. Trying port 8080...")
+            print("[PORTAL] Port 80 requires root, falling back to 8080")
             app.run(host='0.0.0.0', port=8080, debug=False, threaded=True)
 
 
 if __name__ == "__main__":
-    import sys
     dev_mode = '--dev' in sys.argv or '-d' in sys.argv
     run_captive_portal(dev_mode=dev_mode)

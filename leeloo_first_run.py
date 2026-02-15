@@ -44,8 +44,21 @@ def write_to_fb(img, fb_path=FB_PATH):
         fb.write(rgb565.tobytes())
 
 
-def create_first_run_screen(wifi_name="leeloo"):
+def get_ap_ssid():
+    """Get the AP SSID this device will broadcast"""
+    try:
+        from wifi_manager import get_device_id
+        device_id = get_device_id()
+        return f"LEE-{device_id}"
+    except Exception:
+        return "LEE-XXXX"
+
+
+def create_first_run_screen(wifi_name=None):
     """Create the first-run setup screen"""
+    if wifi_name is None or wifi_name == "leeloo":
+        wifi_name = get_ap_ssid()
+
     img = Image.new('RGB', (SCREEN_WIDTH, SCREEN_HEIGHT), COLORS['bg'])
     draw = ImageDraw.Draw(img)
 
@@ -150,8 +163,8 @@ def create_first_run_screen(wifi_name="leeloo"):
     draw.text((content_x, content_y), "Hi, I'm Leeloo.", font=font_large, fill=COLORS['white'])
     content_y += 30
 
-    # "Let's get me set up."
-    draw.text((content_x, content_y), "Let's get me set up.", font=font_med, fill=COLORS['lavender'])
+    # "Let's get set up."
+    draw.text((content_x, content_y), "Let's get set up.", font=font_med, fill=COLORS['lavender'])
     content_y += 40
 
     # Instructions
@@ -161,7 +174,7 @@ def create_first_run_screen(wifi_name="leeloo"):
     draw.text((content_x, content_y), "1. Go to WiFi settings", font=font_small, fill=COLORS['white'])
     content_y += 20
 
-    draw.text((content_x, content_y), "2. Look for network:", font=font_small, fill=COLORS['white'])
+    draw.text((content_x, content_y), "2. Connect to:", font=font_small, fill=COLORS['white'])
     content_y += 22
 
     # WiFi network name (highlighted)
@@ -169,10 +182,7 @@ def create_first_run_screen(wifi_name="leeloo"):
     draw.text((content_x + 10, content_y), wifi_display, font=font_large, fill=COLORS['green'])
     content_y += 32
 
-    draw.text((content_x, content_y), "3. Connect to it", font=font_small, fill=COLORS['white'])
-    content_y += 20
-
-    draw.text((content_x, content_y), "4. A setup page will open", font=font_small, fill=COLORS['white'])
+    draw.text((content_x, content_y), "3. A setup page will open", font=font_small, fill=COLORS['white'])
     content_y += 35
 
     # Waiting indicator
@@ -185,13 +195,13 @@ def create_first_run_screen(wifi_name="leeloo"):
     return img
 
 
-def show_first_run(wifi_name="leeloo"):
+def show_first_run(wifi_name=None):
     """Display the first run screen"""
     img = create_first_run_screen(wifi_name)
     write_to_fb(img)
 
 
-def animate_waiting(wifi_name="leeloo", duration=30):
+def animate_waiting(wifi_name=None, duration=30):
     """Animate the waiting dots"""
     dots = [".", "..", "...", "....", ".....", "......"]
     dot_idx = 0

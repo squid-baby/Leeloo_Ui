@@ -129,34 +129,49 @@ address=/detectportal.firefox.com/{AP_IP}
 
 def start_ap_mode():
     """
-    Start WiFi Access Point mode for setup
-    Returns the SSID being broadcast
+    Start WiFi Access Point mode for setup.
+    Expects NetworkManager to have already released wlan0
+    (via 'nmcli device set wlan0 managed no' in leeloo_boot.py).
+    Returns the SSID being broadcast.
     """
     print("Starting AP mode...")
 
-    # Stop any existing WiFi connections
-    run_command(['sudo', 'systemctl', 'stop', 'wpa_supplicant'])
+    # Stop anything that might hold wlan0
+    run_command(['sudo', 'systemctl', 'stop', 'hostapd'])
+    run_command(['sudo', 'systemctl', 'stop', 'dnsmasq'])
     run_command(['sudo', 'killall', 'wpa_supplicant'])
-    time.sleep(1)
+    time.sleep(0.5)
 
     # Write config files
     ssid = write_hostapd_config()
     write_dnsmasq_config()
 
-    # Configure wlan0 with static IP
+    # Configure wlan0 with static IP for AP
     run_command(['sudo', 'ip', 'addr', 'flush', 'dev', 'wlan0'])
     run_command(['sudo', 'ip', 'link', 'set', 'wlan0', 'down'])
     time.sleep(0.5)
     run_command(['sudo', 'ip', 'link', 'set', 'wlan0', 'up'])
     run_command(['sudo', 'ip', 'addr', 'add', f'{AP_IP}/24', 'dev', 'wlan0'])
+    time.sleep(0.5)
 
-    # Start hostapd
-    run_command(['sudo', 'systemctl', 'start', 'hostapd'])
+    # Start hostapd (creates the AP)
+    result = run_command(['sudo', 'systemctl', 'start', 'hostapd'], check=True)
+    if result and result.returncode != 0:
+        print(f"[WIFI] hostapd failed: {result.stderr}")
+        # Try running directly as fallback
+        run_command(['sudo', 'hostapd', '-B', HOSTAPD_CONF])
     time.sleep(1)
 
-    # Start dnsmasq
-    run_command(['sudo', 'systemctl', 'start', 'dnsmasq'])
+    # Start dnsmasq (DHCP + DNS redirect for captive portal)
+    result = run_command(['sudo', 'systemctl', 'start', 'dnsmasq'], check=True)
+    if result and result.returncode != 0:
+        print(f"[WIFI] dnsmasq failed: {result.stderr}")
     time.sleep(1)
+
+    # Verify AP is broadcasting
+    verify = run_command(['iwconfig', 'wlan0'])
+    if verify:
+        print(f"[WIFI] wlan0 state: {verify.stdout.strip()[:100]}")
 
     print(f"AP mode started: {ssid}")
     return ssid
@@ -179,15 +194,14 @@ def stop_ap_mode():
 
 def scan_wifi_networks():
     """
-    Scan for available WiFi networks
-    Returns list of SSIDs
+    Scan for available WiFi networks.
+    Uses iwlist scan (works even when hostapd isn't running yet).
+    Called by captive portal API before AP mode fully takes over.
+    Returns list of SSIDs.
     """
     networks = []
 
-    # Make sure wlan0 is up
-    run_command(['sudo', 'ip', 'link', 'set', 'wlan0', 'up'])
-    time.sleep(1)
-
+    # Try iwlist scan first (works when wlan0 is in managed mode)
     try:
         result = run_command(['sudo', 'iwlist', 'wlan0', 'scan'])
         if result and result.returncode == 0:
@@ -196,58 +210,79 @@ def scan_wifi_networks():
                     ssid = line.split('ESSID:')[1].strip().strip('"')
                     if ssid and ssid not in networks and not ssid.startswith('LEE-'):
                         networks.append(ssid)
+            if networks:
+                return networks[:15]
     except Exception as e:
-        print(f"Error scanning networks: {e}")
+        print(f"iwlist scan error: {e}")
 
-    return networks[:15]  # Limit to 15 networks
+    # Fallback: nmcli scan (if NM is managing wlan0)
+    try:
+        run_command(['sudo', 'nmcli', 'device', 'wifi', 'rescan'])
+        time.sleep(2)
+        result = run_command(['nmcli', '-t', '-f', 'SSID', 'device', 'wifi', 'list'])
+        if result and result.returncode == 0:
+            for line in result.stdout.strip().split('\n'):
+                ssid = line.strip()
+                if ssid and ssid not in networks and not ssid.startswith('LEE-'):
+                    networks.append(ssid)
+    except Exception as e:
+        print(f"nmcli scan error: {e}")
+
+    return networks[:15]
 
 
 def connect_to_wifi(ssid, password):
     """
-    Connect to a WiFi network
-    Returns True if successful, False otherwise
+    Connect to a WiFi network using NetworkManager (nmcli).
+    Returns True if successful, False otherwise.
     """
     print(f"Connecting to WiFi: {ssid}")
 
     # Stop AP mode if running
     stop_ap_mode()
-    time.sleep(2)
+    time.sleep(1)
 
-    # Write wpa_supplicant config
-    wpa_config = f'''ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev
-update_config=1
-country=US
+    # Restart NetworkManager (was stopped for AP mode)
+    run_command(['sudo', 'systemctl', 'start', 'NetworkManager'])
+    time.sleep(3)
 
-network={{
-    ssid="{ssid}"
-    psk="{password}"
-    key_mgmt=WPA-PSK
-}}
-'''
+    # Connect using nmcli (creates and activates connection)
+    result = run_command([
+        'sudo', 'nmcli', 'device', 'wifi', 'connect', ssid,
+        'password', password, 'ifname', 'wlan0'
+    ])
 
-    try:
-        with open('/tmp/wpa_supplicant.conf', 'w') as f:
-            f.write(wpa_config)
-        run_command(['sudo', 'cp', '/tmp/wpa_supplicant.conf', WPA_SUPPLICANT_CONF])
-    except Exception as e:
-        print(f"Error writing wpa_supplicant config: {e}")
-        return False
+    if result and result.returncode == 0:
+        print(f"Connected to {ssid}!")
+        return True
 
-    # Bring up wlan0 and start wpa_supplicant
-    run_command(['sudo', 'ip', 'link', 'set', 'wlan0', 'up'])
-    run_command(['sudo', 'systemctl', 'restart', 'wpa_supplicant'])
-    run_command(['sudo', 'wpa_cli', '-i', 'wlan0', 'reconfigure'])
+    # If that failed, try creating a connection profile first
+    print(f"[WIFI] Direct connect failed, trying connection profile...")
+    run_command(['sudo', 'nmcli', 'connection', 'delete', f'leeloo-{ssid}'])
+    result = run_command([
+        'sudo', 'nmcli', 'connection', 'add',
+        'type', 'wifi',
+        'con-name', f'leeloo-{ssid}',
+        'ifname', 'wlan0',
+        'ssid', ssid,
+        'wifi-sec.key-mgmt', 'wpa-psk',
+        'wifi-sec.psk', password
+    ])
+    if result and result.returncode == 0:
+        result = run_command([
+            'sudo', 'nmcli', 'connection', 'up', f'leeloo-{ssid}'
+        ])
+        if result and result.returncode == 0:
+            print(f"Connected to {ssid}!")
+            return True
 
-    # Request DHCP
-    run_command(['sudo', 'dhclient', 'wlan0'])
-
-    # Wait for connection (up to 30 seconds)
-    for i in range(30):
-        time.sleep(1)
+    # Wait and check
+    for i in range(15):
+        time.sleep(2)
         if is_connected(ssid):
             print(f"Connected to {ssid}!")
             return True
-        print(f"Waiting for connection... ({i+1}/30)")
+        print(f"Waiting for connection... ({i+1}/15)")
 
     print(f"Failed to connect to {ssid}")
     return False

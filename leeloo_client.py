@@ -114,17 +114,24 @@ class LeelooClient:
             return False
 
     async def create_crew(self, display_name: str = "LEELOO") -> Optional[str]:
-        """Create a new crew and return the crew code"""
+        """Create a new crew and return the crew code.
+        If we already have a crew_code (from portal setup), pass it to the server
+        so it registers with the same code instead of generating a new one."""
         if not self.websocket:
             return None
 
         self.config.display_name = display_name
 
-        await self.websocket.send(json.dumps({
+        msg = {
             'type': 'create_crew',
             'device_id': self.config.device_id or None,
             'display_name': display_name
-        }))
+        }
+        # Pass existing crew code if we have one (from captive portal setup)
+        if self.config.crew_code:
+            msg['crew_code'] = self.config.crew_code
+
+        await self.websocket.send(json.dumps(msg))
 
         # Wait for response
         response = await self.websocket.recv()
@@ -132,7 +139,7 @@ class LeelooClient:
 
         if data.get('type') == 'crew_created':
             self.config.device_id = data['device_id']
-            self.config.crew_id = data['crew_id']
+            self.config.crew_id = data.get('crew_id', data.get('crew_code', ''))
             self.config.crew_code = data['crew_code']
             self._save_config()
 
@@ -164,9 +171,9 @@ class LeelooClient:
         data = json.loads(response)
 
         if data.get('type') == 'crew_joined':
-            self.config.device_id = data['device_id']
-            self.config.crew_id = data['crew_id']
-            self.config.crew_code = data['crew_code']
+            self.config.device_id = data.get('device_id', self.config.device_id)
+            self.config.crew_id = data.get('crew_id', data.get('crew_code', self.config.crew_id))
+            self.config.crew_code = data.get('crew_code', self.config.crew_code)
             self._save_config()
 
             print(f"[CLIENT] Joined crew: {self.config.crew_code} ({data.get('crew_members', 1)} members)")
