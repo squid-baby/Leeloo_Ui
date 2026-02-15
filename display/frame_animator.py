@@ -351,6 +351,87 @@ class FrameAnimator:
         if on_complete:
             on_complete()
 
+    # =========================================================================
+    # ASYNC versions — for use with leeloo_brain.py asyncio event loop
+    # =========================================================================
+
+    async def async_expand(
+        self,
+        frame_type: FrameType,
+        content_drawer: Optional[Callable] = None,
+        on_complete: Optional[Callable] = None
+    ):
+        """Async version of expand — yields to event loop between frames"""
+        collapsed = self.frame_geometries[frame_type]
+        expanded = FrameGeometry(
+            x=self.expanded_geometry.x,
+            y=self.expanded_geometry.y,
+            width=self.expanded_geometry.width,
+            height=self.expanded_geometry.height,
+            color=collapsed.color,
+            label=collapsed.label,
+        )
+        await self._async_run_animation(collapsed, expanded, content_drawer, on_complete)
+
+    async def async_collapse(
+        self,
+        frame_type: FrameType,
+        content_drawer: Optional[Callable] = None,
+        on_complete: Optional[Callable] = None
+    ):
+        """Async version of collapse — yields to event loop between frames"""
+        collapsed = self.frame_geometries[frame_type]
+        expanded = FrameGeometry(
+            x=self.expanded_geometry.x,
+            y=self.expanded_geometry.y,
+            width=self.expanded_geometry.width,
+            height=self.expanded_geometry.height,
+            color=collapsed.color,
+            label=collapsed.label,
+        )
+        await self._async_run_animation(expanded, collapsed, content_drawer, on_complete)
+
+    async def _async_run_animation(
+        self,
+        start_geom: FrameGeometry,
+        end_geom: FrameGeometry,
+        content_drawer: Optional[Callable],
+        on_complete: Optional[Callable]
+    ):
+        """Run animation with async sleep for non-blocking playback"""
+        import asyncio
+
+        region = (7, 10, self.box_right - 7, 296)
+        region_x, region_y, region_width, region_height = region
+
+        # Pre-process all frames (CPU-bound, runs synchronously)
+        processed_frames = self._preprocess_frames(start_geom, end_geom, region, content_drawer)
+
+        # Play animation with async sleep between frames
+        frame_time = 1.0 / self.FPS
+        start_time = time.time()
+
+        for frame_idx in range(self.FRAME_COUNT):
+            frame_array = processed_frames[frame_idx]
+
+            if not self.preview_mode:
+                write_region_to_framebuffer_rowbyrow(
+                    frame_array,
+                    region_x,
+                    region_y,
+                    self.fb_path
+                )
+
+            # Maintain timing with async sleep (yields to event loop!)
+            elapsed = time.time() - start_time
+            next_frame_time = (frame_idx + 1) * frame_time
+            sleep_time = next_frame_time - elapsed
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
+
+        if on_complete:
+            on_complete()
+
 
 # For backwards compatibility
 FRAME_GEOMETRIES = get_frame_geometries(153)

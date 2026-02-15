@@ -27,6 +27,16 @@ Thumbs.db
 *.tmp
 *.log
 
+# Runtime data
+album_art/
+current_music.json
+spotify_tokens.json
+messages.json
+
+# Test output images
+*_test.png
+*_preview.png
+
 # LCD-show driver (large, can be re-downloaded)
 LCD-show/
 leeloo_server/.env

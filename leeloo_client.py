@@ -48,6 +48,9 @@ class LeelooClient:
         self.on_song_push: Optional[Callable] = None
         self.on_member_joined: Optional[Callable] = None
         self.on_member_offline: Optional[Callable] = None
+        self.on_nudge: Optional[Callable] = None
+        self.on_hang_propose: Optional[Callable] = None
+        self.on_hang_confirm: Optional[Callable] = None
         self.on_connected: Optional[Callable] = None
         self.on_disconnected: Optional[Callable] = None
         self.on_crew_joined: Optional[Callable] = None
@@ -55,13 +58,26 @@ class LeelooClient:
         self._load_config()
 
     def _load_config(self):
-        """Load saved configuration"""
+        """Load saved configuration (handles both old and new formats)"""
         try:
             if os.path.exists(self.config_path):
                 with open(self.config_path, 'r') as f:
                     data = json.load(f)
-                    self.config = CrewConfig(**data)
+
+                # Handle existing crew format: {name, invite_code, is_creator, members}
+                if 'invite_code' in data:
+                    self.config.crew_code = data.get('invite_code', '')
+                    self.config.display_name = data.get('name', 'LEELOO')
+                    self.config.device_id = data.get('device_id', '')
+                    self.config.crew_id = data.get('crew_id', '')
+                    print(f"[CLIENT] Loaded config: crew={self.config.crew_code} ({self.config.display_name})")
+                elif 'crew_code' in data:
+                    # New format
+                    self.config = CrewConfig(**{k: v for k, v in data.items()
+                                              if k in CrewConfig.__dataclass_fields__})
                     print(f"[CLIENT] Loaded config: crew={self.config.crew_code}")
+                else:
+                    print("[CLIENT] Config format not recognized")
         except Exception as e:
             print(f"[CLIENT] Could not load config: {e}")
 
@@ -206,8 +222,8 @@ class LeelooClient:
         }))
         return True
 
-    async def push_song(self, artist: str, track: str, album: str = "",
-                        spotify_uri: str = "", album_art_url: str = ""):
+    async def push_song(self, spotify_uri: str, artist: str = "", track: str = "",
+                        album: str = "", album_art_url: str = "", note: str = ""):
         """Push a song to crew"""
         if not self.websocket or not self.config.crew_id:
             return False
@@ -220,8 +236,48 @@ class LeelooClient:
                 'track': track,
                 'album': album,
                 'spotify_uri': spotify_uri,
-                'album_art_url': album_art_url
+                'album_art_url': album_art_url,
+                'note': note
             }
+        }))
+        return True
+
+    async def send_nudge(self):
+        """Send a nudge/wink to crew"""
+        if not self.websocket or not self.config.crew_id:
+            return False
+
+        await self.websocket.send(json.dumps({
+            'type': 'message',
+            'msg_type': 'nudge',
+            'payload': {}
+        }))
+        return True
+
+    async def send_hang_propose(self, datetime_str: str, description: str = ""):
+        """Propose a hangout time to crew"""
+        if not self.websocket or not self.config.crew_id:
+            return False
+
+        await self.websocket.send(json.dumps({
+            'type': 'message',
+            'msg_type': 'hang_propose',
+            'payload': {
+                'datetime': datetime_str,
+                'description': description
+            }
+        }))
+        return True
+
+    async def send_hang_confirm(self):
+        """Confirm a proposed hangout"""
+        if not self.websocket or not self.config.crew_id:
+            return False
+
+        await self.websocket.send(json.dumps({
+            'type': 'message',
+            'msg_type': 'hang_confirm',
+            'payload': {}
         }))
         return True
 
@@ -273,6 +329,21 @@ class LeelooClient:
                 print(f"[SONG] {from_name} pushed: {payload.get('artist')} - {payload.get('track')}")
                 if self.on_song_push:
                     self.on_song_push(from_name, payload)
+
+            elif inner_type == 'nudge':
+                print(f"[NUDGE] {from_name} sent a nudge!")
+                if self.on_nudge:
+                    self.on_nudge(from_name)
+
+            elif inner_type == 'hang_propose':
+                print(f"[HANG] {from_name} proposed: {payload.get('datetime')}")
+                if self.on_hang_propose:
+                    self.on_hang_propose(from_name, payload.get('datetime', ''), payload.get('description', ''))
+
+            elif inner_type == 'hang_confirm':
+                print(f"[HANG] {from_name} confirmed!")
+                if self.on_hang_confirm:
+                    self.on_hang_confirm(from_name)
 
         elif msg_type == 'member_joined':
             name = data.get('display_name', 'Someone')

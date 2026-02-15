@@ -12,16 +12,16 @@ The production Python version running on Raspberry Pi with smooth frame expansio
 
 ```bash
 # Copy files to Pi
-scp -r * pi@gadget.local:/home/pi/
+sshpass -p 'gadget' scp *.py pi@leeloo.local:/home/pi/leeloo-ui/
 
 # SSH into Pi
-ssh pi@gadget.local
+sshpass -p 'gadget' ssh pi@leeloo.local
 
-# Run the main UI
-python3 gadget_main.py
+# The brain runs as a systemd service
+sudo systemctl status leeloo.service
 
-# Or run the animation demo
-python3 demo_weather_typewriter.py
+# Or run manually
+sudo python3 leeloo_brain.py
 ```
 
 ### Display Layout (480x320px)
@@ -70,20 +70,38 @@ The frame animator uses:
 ### Architecture
 
 ```
-leeloo_ui_manager.py    # Event-driven state machine (THE PRO SOLUTION)
-├── UIState enum        # NORMAL, EXPANDING, EXPANDED, COLLAPSING
-├── LeelooUIManager     # Single owner of framebuffer
-│   ├── expand_weather()
-│   ├── expand_time()
-│   ├── expand_messages()
-│   └── expand_album()
-└── FrameAnimator       # Handles expand/collapse animations
+leeloo_brain.py         # Asyncio orchestrator — MAIN ENTRY POINT
+├── UIState enum        # NORMAL, EXPANDING, EXPANDED, COLLAPSING, LISTENING, PROCESSING
+├── LeelooBrain         # Coordinates all subsystems
+│   ├── _voice_interaction()   # tap → record → transcribe → classify → act
+│   ├── expand_frame()         # animate expand → typewriter → scroll → collapse
+│   ├── _scroll_content()      # smooth scroll for overflowed text
+│   └── _search_and_push_song() # Spotify search + album art + push to crew
+├── Subsystems:
+│   ├── TapManager       (leeloo_tap.py)     # ADXL345 accelerometer tap detection
+│   ├── VoiceManager     (leeloo_voice.py)   # INMP441 mic → Deepgram Nova-2 STT
+│   ├── IntentRouter     (leeloo_intent.py)  # Claude 3.5 Haiku intent classification
+│   ├── LEDManager       (leeloo_led.py)     # WS2812B LED animations
+│   ├── MessageManager   (leeloo_messages.py) # Message storage + unread counts
+│   └── LeelooClient     (leeloo_client.py)  # WebSocket relay for crew comms
+└── Display:
+    ├── gadget_display.py       # LeelooDisplay class (renders PIL images)
+    ├── display/frame_animator.py # Frame expand/collapse animations
+    └── leeloo_album_art.py     # Centralized album art (243x304)
+```
 
-gadget_main.py          # Main loop (updates display every second)
-gadget_display.py       # LeelooDisplay class (renders PIL images)
-display/
-├── frame_animator.py   # Frame expansion animation system
-└── fast_fb.py          # Fast framebuffer utilities (numpy)
+### Voice Interaction Pipeline
+
+```
+tap device → LED green → mic record → Deepgram STT → LED pulse →
+Claude Haiku classifies → execute action:
+  WEATHER_EXPAND  → show detailed weather
+  ALBUM_INFO      → tell me about this band
+  MESSAGE_SEND    → send a message to crew
+  MESSAGE_READOUT → what did I miss
+  SONG_PUSH       → share a song (Spotify search)
+  NUDGE           → send a nudge to all devices
+  HANG_PROPOSE    → let's hang Saturday at 3pm
 ```
 
 ### Key Technical Fixes
@@ -179,14 +197,20 @@ See `SPOTIFY_SCANCODE_TEST.md` for full testing guide.
 
 ```
 TipTop UI/
-├── gadget_main.py           # Main loop service
+├── leeloo_brain.py          # Main entry point — asyncio orchestrator
+├── leeloo_tap.py            # ADXL345 tap detection (single/double/triple)
+├── leeloo_voice.py          # INMP441 mic → Deepgram Nova-2 STT
+├── leeloo_intent.py         # Claude 3.5 Haiku intent classification
+├── leeloo_led.py            # WS2812B LED animations (3 LEDs)
+├── leeloo_messages.py       # Message storage + unread counts
+├── leeloo_client.py         # WebSocket relay client
+├── leeloo_music_manager.py  # Spotify currently playing + listeners
+├── leeloo_album_art.py      # Centralized album art (243x304)
+├── leeloo_spotify.py        # Spotify scancode generation
+├── gadget_main.py           # Legacy main loop (replaced by brain)
 ├── gadget_display.py        # LeelooDisplay renderer
-├── leeloo_ui_manager.py     # Event-driven UI state machine
-├── test_spotify_display.py  # Spotify scancode testing
-├── music_request_parser.py  # Natural language music requests
+├── gadget_weather.py        # Open-Meteo weather API
 ├── text_scroller.py         # Text truncation utilities
-├── demo_weather_typewriter.py   # Weather expansion demo
-├── demo_message_expand.py   # Reaction GIF demo
 ├── display/
 │   ├── __init__.py
 │   ├── frame_animator.py    # Expand/collapse animations
@@ -231,8 +255,11 @@ This prevents the Linux console from writing to the LCD (fb1).
 ### 3. Install as Service
 
 ```bash
-sudo systemctl enable gadget.service
-sudo systemctl start gadget.service
+sudo systemctl enable leeloo.service
+sudo systemctl start leeloo.service
+
+# View logs
+sudo journalctl -u leeloo.service -f
 ```
 
 ### 4. Troubleshooting

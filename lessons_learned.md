@@ -339,4 +339,76 @@ sshpass -p 'gadget' ssh pi@leeloo.local "ps aux | grep gadget_main"
 
 ---
 
+---
+
+# Session 3 — Voice Interaction System Build + Tuning (Feb 14, 2026 night)
+
+## Session Summary
+Built and deployed the complete voice interaction system (Phases 1-6 of the LEELOO plan): tap detection, Deepgram STT, Claude Haiku intent routing, frame expand/typewriter display, Spotify song search+push, and WebSocket integration. Then spent the latter half tuning tap sensitivity, fixing text overflow, and debugging display refresh issues.
+
+---
+
+## Key Lessons
+
+### 18. **Asyncio Event Loop Blocking Kills Tap Detection**
+**Problem:** Tap detection (polling at 40ms) intermittently stopped working. Accelerometer was fine but taps weren't registering.
+**Root Cause:** `_render_normal()` (PIL + numpy + framebuffer write) runs synchronously — takes 200-500ms on Pi Zero, starving the tap polling coroutine.
+**Solution:** Run blocking display work in a thread executor: `await loop.run_in_executor(None, self._display_tick)`
+**Lesson:** On Pi Zero, ANY synchronous work >50ms on the asyncio event loop will starve other coroutines. Always offload blocking I/O and CPU-heavy work to executors.
+
+### 19. **Accelerometer Tap Detection Needs Rebound Absorption**
+**Problem:** Single physical taps registered as double taps from mechanical rebound.
+**Solution:** Three-layer approach: (1) SETTLE_TIME 0.50s sleep after spike, (2) DEBOUNCE_TIME 0.50s between raw events, (3) SETTLE_DRAIN_READS=5 to reset prev_magnitude baseline.
+**Lesson:** The drain reads were the key insight — without them, first read after settle sees a delta from stale prev_magnitude.
+
+### 20. **TAP_THRESHOLD Must Be Tuned Empirically**
+Went from 2.5 → 1.8 → 1.2. Added near-miss logging (delta > 0.6) to make tuning data-driven. Always log near-misses when tuning thresholds.
+
+### 21. **Force-Refresh Context Before LLM Calls**
+**Problem:** "Tell me about this band" returned wrong artist — Claude had stale music context (30s cache).
+**Solution:** Force `self.last_music_fetch = 0; self._update_music()` right before calling the intent router.
+**Lesson:** When an LLM needs current state, always refresh immediately before the call, not on a timer.
+
+### 22. **Scancode URL Must Be Passed Explicitly for Shared Music**
+**Problem:** Voice-pushed songs showed album art but no Spotify scancode.
+**Solution:** Generate URL: `https://scannables.scdn.co/uri/plain/png/{bg}/{fg}/{size}/{uri}`, pass as `scancode_url` param. Clear stale cache first.
+**Lesson:** The album art cache serves stale versions without scancode unless explicitly cleared.
+
+### 23. **Text Overflow Should Scroll, Not Truncate**
+Typewriter writes visible portion, then if overflow, pre-renders ALL lines to off-screen PIL image and scrolls at 1px/frame (~14fps). Better UX than "..." truncation for variable-length content.
+
+### 24. **Spotify Client Credentials Work for Search**
+`grant_type=client_credentials` is sufficient for `/v1/search`. No user token or OAuth needed for song lookup.
+
+---
+
+## Files Created This Session
+
+| File | Purpose |
+|------|---------|
+| `leeloo_brain.py` | Asyncio orchestrator — main entry point |
+| `leeloo_tap.py` | ADXL345 tap detection (single/double/triple) |
+| `leeloo_voice.py` | INMP441 mic → Deepgram Nova-2 streaming STT |
+| `leeloo_intent.py` | Claude 3.5 Haiku intent classification |
+| `leeloo_led.py` | WS2812B LED animations (3 LEDs) |
+| `leeloo_messages.py` | Message storage + unread counts |
+
+## Tuning Values (Final)
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| TAP_THRESHOLD | 1.2 m/s² | Delta magnitude to count as tap |
+| SETTLE_TIME | 0.50s | Rebound dampening wait |
+| DEBOUNCE_TIME | 0.50s | Min time between raw events |
+| SETTLE_DRAIN_READS | 5 | Baseline reset reads after settle |
+| SILENCE_THRESHOLD | 30 RMS | Speech ~40-70, ambient ~3-5 |
+| SILENCE_DURATION | 1.5s | Silence to stop recording |
+| EXPANDED_HOLD_DURATION | 30.0s | Expanded frame display time |
+
+## Known Issues (Remaining)
+1. **LEDs not working** — GPIO 12, WS2812B, needs root for PWM. Not debugged yet.
+2. **Tap occasionally misses** — Very light taps still below 1.2 threshold.
+
+---
+
 Made with ♪ by squid-baby & Claude Opus 4.6
