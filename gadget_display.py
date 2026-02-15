@@ -337,9 +337,9 @@ class LeelooDisplay:
             self.draw.text((12, y + 24), "ultra V", font=self.font_tiny, fill=COLORS['tan'])
             self.draw_uv_slider(box_right, y + 24, uv_raw)
 
-            # Rain: 0" = 0 boxes, 6"+ = 12 boxes (24hr total)
+            # Rain: 0" = 0 boxes, 3"+ = 12 boxes (24hr total)
             rain_inches = weather_data.get('rain_24h_inches', 0)
-            rain_boxes = min(12, int(rain_inches * 12 / 6))
+            rain_boxes = min(12, int(rain_inches * 12 / 3))
             self.draw.text((12, y + 40), "rain", font=self.font_tiny, fill=COLORS['tan'])
             self.draw_weather_slider(box_right, y + 40, rain_boxes, COLORS['tan'])
 
@@ -434,8 +434,8 @@ class LeelooDisplay:
         # Render album info with text truncation for long names
         from text_scroller import truncate_text, center_text_in_box
 
-        # Fixed 210px text box constraint - all text must fit within this
-        text_box_width = 210
+        # Fixed 195px text box constraint - all text must fit within this
+        text_box_width = 195
         # Calculate left edge of text box (centered within the album frame)
         box_width = box_right - 7  # Total available width
         text_box_left = 7 + (box_width - text_box_width) // 2

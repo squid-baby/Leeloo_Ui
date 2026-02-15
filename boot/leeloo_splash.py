@@ -65,16 +65,10 @@ def create_splash_screen(message="Starting...", progress=0):
         if os.path.exists(splash_path):
             try:
                 splash_img = Image.open(splash_path).convert('RGB')
-                # Scale to fill screen height (no room needed for progress bar - it overlays)
-                # Calculate scale to fill height
-                scale = SCREEN_HEIGHT / splash_img.height
-                new_width = int(splash_img.width * scale)
-                new_height = SCREEN_HEIGHT
-                splash_img = splash_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                # Center horizontally
-                paste_x = (SCREEN_WIDTH - new_width) // 2
-                paste_y = 0
-                img.paste(splash_img, (paste_x, paste_y))
+                # Scale to fill entire screen (480x320)
+                splash_img = splash_img.resize((SCREEN_WIDTH, SCREEN_HEIGHT), Image.Resampling.LANCZOS)
+                # Paste at origin (fills entire screen)
+                img.paste(splash_img, (0, 0))
                 splash_loaded = True
                 break
             except Exception as e:

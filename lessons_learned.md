@@ -667,4 +667,110 @@ if is_raining:
 
 ---
 
-Made with ♪ by squid-baby & Claude Opus 4.6
+# Lessons Learned - Boot Splash & Music Priority (Feb 15, 2026)
+
+## Session Summary
+Fixed boot splash to hide "Welcome to Raspberry Pi Desktop", corrected music display priority logic to prioritize currently playing over shared music, and resolved layout constraint issues with album text boxes.
+
+---
+
+## Key Lessons
+
+### 44. **Plymouth Boot Splash Override**
+**Problem:** "Welcome to Raspberry Pi Desktop" splash screen was overriding custom boot image
+**Solution:**
+- Remove Plymouth completely: `sudo apt-get remove --purge plymouth plymouth-themes`
+- Update cmdline.txt with: `console=tty3 loglevel=3 logo.nologo vt.global_cursor_default=0 fbcon=map:0`
+- Create early systemd service (`leeloo-splash.service`) in `sysinit.target` with `DefaultDependencies=no`
+- Boot image now fills entire screen (480x320) during boot
+**Files:** `boot/leeloo_splash.py`, `/etc/systemd/system/leeloo-splash.service`, `/boot/firmware/cmdline.txt`
+
+### 45. **Spotify Token Expiration Handling**
+**Problem:** Access tokens expire after 1 hour, causing "currently playing" detection to fail silently
+**Reality Check:** Token refresh logic existed but music priority logic was wrong (see lesson 46)
+**Solution:**
+- Verify token refresh logic handles 401 responses correctly
+- Check `update_music_display()` actually calls `get_currently_playing()` before falling back to shared music
+**Code:** `leeloo_music_manager.py` lines 170-178
+
+### 46. **Music Display Priority Logic Was Backwards** ⭐
+**Problem:** Shared music took priority over currently playing for 30 minutes, so even when actively listening to Spotify, shared music stayed on screen
+**Wrong Logic:**
+```python
+# Check shared music first
+if existing_music and age < SHARED_MUSIC_TIMEOUT:
+    return existing_music  # Returns BEFORE checking currently playing!
+# Check currently playing (never reached if shared music exists)
+```
+**Correct Logic:**
+- Shared music should stay on screen until the **song changes**
+- When song changes, switch to "Now Playing"
+- When playback stops, revert to last shared music
+**Solution:**
+```python
+# Check currently playing first
+currently_playing = get_currently_playing()
+# If song changed from shared music → switch to currently playing
+if existing_music and currently_playing:
+    if currently_playing['spotify_uri'] != existing_music['spotify_uri']:
+        return currently_playing  # Song changed!
+    return existing_music  # Same song, keep showing shared
+# If nothing playing → show last music (shared or old currently playing)
+```
+**Files:** `leeloo_music_manager.py` function `update_music_display()`
+
+### 47. **Layout Dependencies Must Be Explained Before Changes** ⭐
+**Problem:** User asked to increase nowplaying.png width by 4px. Making this change naively would move the album frame left by 4px (shrinking left panels) without warning.
+**Critical Rule:**
+- **ALWAYS check for layout constraints/buffers before changing sizes**
+- Show the cascade effect to the user BEFORE making changes
+- Present options (change padding vs change dimensions vs cascade changes)
+
+**Example:**
+```
+User: "Increase nowplaying width by 4px"
+Bad Response: [changes album art width from 243→247, frame moves]
+Good Response: "Increasing album art by 4px will move the frame left by 4px
+               because frame_width = album_width + (padding * 2). This will
+               shrink the left info panels. Options:
+               A) Change album width (frame moves)
+               B) Reduce padding by 2px (frame stays, content closer to edges)
+               C) Keep everything the same
+               Which do you prefer?"
+```
+
+**Layout Dependencies to Check:**
+- Album art width → frame width → frame position → left panel width
+- Frame padding → content positioning → available space
+- Text box width → must fit within available `box_right`
+- Screen is fixed 480x320, so all changes cascade
+
+**Reference:** Created `memory/layout-constraints.md` with full dependency map
+
+### 48. **Rain Slider Sensitivity Adjustment**
+**Problem:** Rain slider maxed out at 6+ inches, making it less useful for typical rainfall
+**Solution:** Cut sensitivity in half so 3+ inches = full slider
+**Change:** `rain_boxes = min(12, int(rain_inches * 12 / 3))` (was `/6`)
+**Files:** `gadget_display.py` line 342
+
+### 49. **Text Box Width Constraints After Frame Changes**
+**Problem:** After reverting frame changes, text_box_width was still 210px but needed to be 195px to prevent text cutoff
+**Lesson:** When reverting git changes, track which fixes need to be re-applied
+**Solution:** Set `text_box_width = 195` for centered text (artist, album, track names)
+**Files:** `gadget_display.py` line 438
+
+---
+
+## Files Modified This Session
+
+| File | Changes |
+|------|---------|
+| `boot/leeloo_splash.py` | Scale boot image to fill entire screen (480x320) instead of aspect-fit |
+| `/etc/systemd/system/leeloo-splash.service` | New early boot service for splash screen |
+| `/boot/firmware/cmdline.txt` | Added boot suppression params, `fbcon=map:0` (was missing!) |
+| `leeloo_music_manager.py` | Fixed music priority logic - currently playing detects song changes, falls back to shared |
+| `gadget_display.py` | Rain slider sensitivity halved (3" = full), text_box_width = 195px |
+
+---
+
+Made with ♪ by squid-baby & Claude Sonnet 4.5
