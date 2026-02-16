@@ -48,7 +48,26 @@ Retro-Music-Panel/
 # Binary assets (large files)
 *.heic
 *.mp4
+*.mov
 *.tar.gz
 
 # Historical archives
 archive/
+
+# Screenshots and recordings
+Screenshot*.png
+Screen Recording*.mov
+
+# Working copies and temp development files
+*copy.py
+working*.py
+
+# Demo/reference images
+*_mockup.png
+reference_*.png
+*_ui.png
+
+# Media/asset directories
+Gadget Images/
+assets/reference/
+assets/test-output/
