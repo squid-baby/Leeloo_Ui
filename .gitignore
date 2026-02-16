@@ -41,3 +41,14 @@ messages.json
 LCD-show/
 leeloo_server/.env
 Retro-Music-Panel/
+
+# Personal dev preferences
+.claude.local.md
+
+# Binary assets (large files)
+*.heic
+*.mp4
+*.tar.gz
+
+# Historical archives
+archive/
