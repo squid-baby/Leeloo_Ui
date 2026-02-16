@@ -53,7 +53,7 @@ SCREEN_HEIGHT = 320
 
 # Timing
 WEATHER_REFRESH_INTERVAL = 600  # 10 minutes
-MUSIC_REFRESH_INTERVAL = 30     # 30 seconds
+MUSIC_REFRESH_INTERVAL = 20     # 20 seconds (4,320 API calls/day)
 DISPLAY_REFRESH_INTERVAL = 1.0  # 1 second
 EXPANDED_HOLD_DURATION = 20.0   # How long expanded frames stay open
 RELAY_URL = "wss://leeloobot.xyz/ws"
@@ -450,13 +450,26 @@ class LeelooBrain:
                 print(f"[BRAIN] Weather fetch failed: {e}")
 
     def _update_music(self):
-        """Refresh music data — uses Spotify OAuth if tokens exist, else reads cache file."""
+        """Refresh music data — uses Spotify OAuth if tokens exist, else reads cache file.
+        Uses tiered polling: faster when actively playing, slower when idle."""
         # Don't overwrite album art while welcome QR is being displayed
         if self._welcome_qr_active:
             return
 
         now = time.time()
-        if now - self.last_music_fetch > MUSIC_REFRESH_INTERVAL:
+
+        # Tiered polling intervals based on playback state
+        is_playing = self.music_data and self.music_data.get('is_playing', True)  # Assume playing if unknown
+        has_recent_music = self.music_data and (now - self.music_data.get('last_updated', 0)) < 300  # 5 min
+
+        if is_playing:
+            interval = MUSIC_REFRESH_INTERVAL  # 20s - actively listening
+        elif has_recent_music:
+            interval = 60  # 1 min - recently played, might resume
+        else:
+            interval = 120  # 2 min - idle, check occasionally
+
+        if now - self.last_music_fetch > interval:
             # Check if user has Spotify OAuth tokens for "currently playing"
             spotify_tokens_path = os.path.join(LEELOO_HOME, "spotify_tokens.json")
             if os.path.exists(spotify_tokens_path):
@@ -472,6 +485,8 @@ class LeelooBrain:
                             'listeners': result.get('listeners'),
                             'pushed_by': result.get('pushed_by'),
                             'spotify_uri': result.get('spotify_uri'),
+                            'is_playing': result.get('is_playing', True),
+                            'last_updated': now,
                         }
                         self.album_art_path = get_album_art_path(result)
                         self.last_music_fetch = now
@@ -491,6 +506,8 @@ class LeelooBrain:
                     'listeners': music.get('listeners'),
                     'pushed_by': music.get('pushed_by'),
                     'spotify_uri': music.get('spotify_uri'),
+                    'is_playing': music.get('is_playing', False),
+                    'last_updated': music.get('timestamp', now),
                 }
                 self.album_art_path = get_album_art_path(music)
             else:
@@ -569,8 +586,8 @@ class LeelooBrain:
             # Hold (with scrolling if content overflows)
             if overflow:
                 print(f"[BRAIN] Content overflows — scrolling ({overflow['total_height']}px > {overflow['visible_height']}px)")
-                await asyncio.sleep(2.0)  # Pause before scroll starts
-                await self._scroll_content(overflow, duration - 2.0)
+                # Start scrolling immediately after typewriter finishes
+                await self._scroll_content(overflow, duration)
             else:
                 print(f"[BRAIN] Holding for {duration}s...")
                 await asyncio.sleep(duration)
@@ -1054,6 +1071,17 @@ class LeelooBrain:
                     duration=EXPANDED_HOLD_DURATION
                 )
             )
+        elif action == "TIME_QUERY":
+            # Generate Tolkien-style cosmic time description
+            print("[BRAIN] Time query — generating cosmic description")
+            time_text = await self._generate_cosmic_time()
+            self._expand_task = asyncio.create_task(
+                self.expand_frame(
+                    FrameType.TIME,
+                    self._format_display_text(time_text, COLORS['purple']),
+                    duration=EXPANDED_HOLD_DURATION
+                )
+            )
         elif action == "UNKNOWN":
             # Show the response text if any
             if intent.response_text:
@@ -1273,6 +1301,56 @@ Examples:
             traceback.print_exc()
 
         return None
+
+    async def _generate_cosmic_time(self):
+        """Generate a Tolkien-style cosmic time description using Claude Haiku"""
+        try:
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+
+            # Get current date/time in user's timezone
+            tz_name = self.device_config.get('timezone', 'America/New_York')
+            now = datetime.now(ZoneInfo(tz_name))
+
+            # Get location for plant/animal specificity
+            lat = self.latitude or 35.91
+            lon = self.longitude or -79.08
+            zip_code = self.device_config.get('zip_code', '27510')
+
+            # Build prompt for Haiku
+            prompt = f"""Write a 65-word, Tolkien-style paragraph describing the current date as a day in its present season, naming the Sun's zodiac sign and the current Moon phase, and setting it between the fading Age of Pisces and the coming Age of Aquarius. Include one vivid, locally accurate example of animal behavior and one of plant life (bud, flower, or root) that are actively changing at this place and time, with a hint of scientific wit.
+
+Current date: {now.strftime('%B %d, %Y')}
+Current time: {now.strftime('%I:%M %p')}
+Day of week: {now.strftime('%A')}
+Location: ZIP {zip_code} (lat {lat:.2f}, lon {lon:.2f})
+
+Write ONLY the 65-word paragraph, no preamble or explanation."""
+
+            # Call Claude Haiku
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: self.intent_router.client.messages.create(
+                    model="claude-3-haiku-20240307",
+                    max_tokens=200,
+                    messages=[
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+            )
+
+            result = response.content[0].text.strip()
+            print(f"[BRAIN] Cosmic time: {result[:80]}...")
+            return result
+
+        except Exception as e:
+            print(f"[BRAIN] Cosmic time error: {e}")
+            import traceback
+            traceback.print_exc()
+            # Fallback to simple time
+            now = datetime.now(ZoneInfo(tz_name))
+            return f"it is {now.strftime('%I:%M %p')} on {now.strftime('%A, %B %d')}"
 
     async def _search_and_push_song(self, query):
         """Search Spotify for a song, update display, and push to crew.

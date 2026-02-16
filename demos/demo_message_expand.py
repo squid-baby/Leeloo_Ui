@@ -9,9 +9,9 @@ Shows:
 
 import sys
 import time
-sys.path.insert(0, '/home/pi')
+sys.path.insert(0, '/home/pi/leeloo-ui')
 
-from gadget_display import LEELOODisplay
+from gadget_display import LeelooDisplay as LEELOODisplay
 from PIL import Image, ImageDraw
 import os
 from datetime import datetime
