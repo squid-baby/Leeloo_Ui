@@ -11,6 +11,8 @@ LED behaviors:
 - nudge:            cyan breathe on/off for 30 seconds
 - error:            red flash
 - off:              all off
+- set_ambient:      persistent background breathe (blue=idle, purple=playing)
+                    automatically resumes after any transient animation
 """
 
 import asyncio
@@ -32,7 +34,12 @@ GREEN = (0, 255, 0)
 PURPLE = (180, 0, 255)
 CYAN = (0, 255, 255)
 RED = (255, 0, 0)
+BLUE = (0, 0, 255)
 OFF = (0, 0, 0)
+
+# Ambient breathe settings
+AMBIENT_PEAK = 0.5       # max brightness (50%)
+AMBIENT_CYCLE_S = 8.0    # full breathe in+out cycle (seconds)
 
 
 class LEDManager:
@@ -42,10 +49,14 @@ class LEDManager:
         self.num_leds = num_leds
         self.brightness = brightness
 
-        # Animation state
-        self._current_animation = None  # name of current animation
-        self._animation_task = None     # asyncio task for current animation
+        # Transient animation state
+        self._current_animation = None  # name of current transient animation
+        self._animation_task = None     # asyncio task for current transient animation
         self._running = False
+
+        # Ambient background state (persists across transient animations)
+        self._ambient_state = None      # "idle" | "playing" | None
+        self._ambient_task = None       # asyncio task for ambient breathe
 
         # Hardware
         if HARDWARE_AVAILABLE:
@@ -92,7 +103,9 @@ class LEDManager:
         self._current_animation = None
 
     async def _run_animation(self, name, coro):
-        """Run an animation, cancelling any existing one"""
+        """Run a transient animation, cancelling any existing one.
+        Ambient breathe is suspended during the animation and resumes after."""
+        await self._cancel_ambient()
         await self._cancel_current()
         self._current_animation = name
         self._animation_task = asyncio.create_task(coro)
@@ -104,22 +117,92 @@ class LEDManager:
             if self._current_animation == name:
                 self._set_color(OFF)
                 self._current_animation = None
+            # Resume ambient breathe if one was active
+            if self._ambient_state:
+                self._start_ambient_task()
+
+    async def _cancel_ambient(self):
+        """Cancel ambient breathe task without clearing ambient state"""
+        if self._ambient_task and not self._ambient_task.done():
+            self._ambient_task.cancel()
+            try:
+                await self._ambient_task
+            except asyncio.CancelledError:
+                pass
+        self._ambient_task = None
+
+    def _start_ambient_task(self):
+        """Spawn the ambient breathe coroutine as a background task.
+        Reads _ambient_state dynamically each tick so color changes don't
+        require a cancel/restart (avoids the OFF-flash flicker)."""
+
+        async def _breathe():
+            start = time.time()
+            while True:
+                # Read state each tick — allows seamless color transitions
+                color = BLUE if self._ambient_state == "idle" else PURPLE
+                elapsed = time.time() - start
+                # Sine wave: 0→peak→0 over AMBIENT_CYCLE_S seconds
+                phase = (elapsed % AMBIENT_CYCLE_S) / AMBIENT_CYCLE_S  # 0.0–1.0
+                brightness = AMBIENT_PEAK * math.sin(phase * math.pi)
+                self._set_brightness_color(color, brightness)
+                await asyncio.sleep(0.1)  # 10fps — smooth enough for 8s cycle, easy on Pi Zero
+
+        self._ambient_task = asyncio.create_task(_breathe())
 
     # =========================================================================
     # PUBLIC API — Animation methods
     # =========================================================================
 
+    async def set_ambient(self, state):
+        """Set persistent background breathe state.
+        state: 'idle'    → slow blue breathe (0–50%, 8s cycle)
+               'playing' → slow purple breathe (same timing)
+               None      → turn off ambient
+        If the ambient task is already running, just updates the color in-place
+        (no cancel/restart) to avoid the OFF-flash flicker."""
+        if state not in ("idle", "playing", None):
+            raise ValueError(f"Unknown ambient state: {state!r}")
+
+        ambient_already_running = (
+            self._ambient_task and not self._ambient_task.done()
+        )
+
+        if state and ambient_already_running:
+            # Just update color — running _breathe() picks it up next tick
+            if state != self._ambient_state:
+                print(f"[LED] ambient → {state}")
+                self._ambient_state = state
+            return
+
+        # Starting fresh or turning off — cancel everything cleanly
+        await self._cancel_current()
+        await self._cancel_ambient()
+        self._set_color(OFF)
+
+        self._ambient_state = state
+        if state:
+            print(f"[LED] ambient → {state}")
+            self._start_ambient_task()
+        else:
+            print("[LED] ambient off")
+
     async def ack(self):
         """Quick green flash — tap acknowledgment (100ms)"""
         print("[LED] ack (green flash)")
+        await self._cancel_ambient()
         await self._cancel_current()
         self._set_color(GREEN)
         await asyncio.sleep(0.1)
         self._set_color(OFF)
+        # Resume ambient after the flash
+        if self._ambient_state:
+            self._start_ambient_task()
 
     async def listening(self):
-        """Solid green — mic is recording"""
+        """Solid green — mic is recording (suspends ambient until off() is called)"""
         print("[LED] listening (solid green)")
+        await self._cancel_ambient()
         await self._cancel_current()
         self._current_animation = "listening"
         self._set_color(GREEN)
@@ -198,12 +281,26 @@ class LEDManager:
         await self._run_animation("error", _flash())
 
     async def off(self):
-        """Turn off all LEDs"""
+        """Turn off all LEDs and cancel any transient animation.
+        Ambient breathe resumes if active."""
+        await self._cancel_current()
+        self._set_color(OFF)
+        if self._ambient_state:
+            self._start_ambient_task()
+
+    async def off_all(self):
+        """Turn off everything including ambient (e.g. for shutdown)"""
+        self._ambient_state = None
+        await self._cancel_ambient()
         await self._cancel_current()
         self._set_color(OFF)
 
     def off_sync(self):
-        """Synchronous off — for cleanup"""
+        """Synchronous off — for cleanup/shutdown (kills ambient too)"""
+        self._ambient_state = None
+        if self._ambient_task and not self._ambient_task.done():
+            self._ambient_task.cancel()
+        self._ambient_task = None
         self._set_color(OFF)
 
     @property

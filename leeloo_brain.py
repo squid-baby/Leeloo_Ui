@@ -141,6 +141,7 @@ class LeelooBrain:
         # Subsystems
         self.led = LEDManager(num_leds=3)
         self.tap = TapManager(callback=self._on_tap)
+        self._led_ambient_state = "idle"  # tracks current ambient to avoid redundant set_ambient calls
 
         # Load API keys from .env
         self._load_env()
@@ -515,6 +516,25 @@ class LeelooBrain:
                 self.album_art_path = None
             self.last_music_fetch = now
 
+        # Update ambient LED state based on current playback
+        self._sync_ambient_led()
+
+    def _sync_ambient_led(self):
+        """Switch ambient LED breathe to match current playback state.
+        Only trust is_playing if Spotify OAuth is connected — the JSON cache
+        reflects stale state from whenever the file was last written."""
+        spotify_tokens_path = os.path.join(LEELOO_HOME, "spotify_tokens.json")
+        has_live_spotify = os.path.exists(spotify_tokens_path)
+        is_playing = bool(
+            has_live_spotify and
+            self.music_data and
+            self.music_data.get('is_playing', False)
+        )
+        new_state = "playing" if is_playing else "idle"
+        if new_state != self._led_ambient_state:
+            self._led_ambient_state = new_state
+            asyncio.ensure_future(self.led.set_ambient(new_state))
+
     # =========================================================================
     # DISPLAY RENDERING
     # =========================================================================
@@ -662,16 +682,16 @@ class LeelooBrain:
                     line_font = self.font
 
                 current_text = ""
+                line_is_visible = y_pos + line_height <= max_y
                 for char in line_text:
                     current_text += char
 
-                    # Create line image
-                    line_img = Image.new('RGB', (text_region_width, line_height), COLORS['bg'])
-                    line_draw = ImageDraw.Draw(line_img)
-                    line_draw.text((0, 2), current_text, font=line_font, fill=line_color)
+                    if line_is_visible:
+                        # Create line image and write to framebuffer
+                        line_img = Image.new('RGB', (text_region_width, line_height), COLORS['bg'])
+                        line_draw = ImageDraw.Draw(line_img)
+                        line_draw.text((0, 2), current_text, font=line_font, fill=line_color)
 
-                    # Only write to framebuffer if within visible area
-                    if y_pos + line_height <= max_y:
                         rgb565 = rgb_to_rgb565_fast(line_img)
                         height, width = rgb565.shape
                         for row in range(height):
@@ -680,7 +700,8 @@ class LeelooBrain:
                                 fb.seek(offset)
                                 fb.write(rgb565[row, :].tobytes())
 
-                    await asyncio.sleep(char_delay)
+                        await asyncio.sleep(char_delay)
+                    # Off-screen lines: no delay, just accumulate text for the content image
 
                 # Also render this line into the full content image
                 render_y = y_pos - content_y  # Position in content image
@@ -688,7 +709,10 @@ class LeelooBrain:
                     full_draw.text((0, render_y + 2), line_text, font=line_font, fill=line_color)
 
                 y_pos += line_height
-                await asyncio.sleep(line_delay)
+                if line_is_visible:
+                    await asyncio.sleep(line_delay)
+                else:
+                    await asyncio.sleep(0)  # yield to event loop without visible delay
         finally:
             fb.close()
 
@@ -860,6 +884,10 @@ class LeelooBrain:
     async def _voice_interaction(self):
         """Full voice interaction: listen → transcribe → route → act"""
         try:
+            # Ensure ambient LED is fully off before any audio — WS2812B DMA and
+            # INMP441 I2S DMA conflict on Pi Zero if both run simultaneously.
+            await self.led._cancel_ambient()
+
             # Listen
             self.ui_state = UIState.LISTENING
             await self.led.listening()
@@ -1832,6 +1860,16 @@ Write ONLY the 65-word paragraph, no preamble or explanation."""
         self._update_weather()
         self._update_music()
         self._render_normal()
+
+        # Start ambient LED breathe (uses same logic as _sync_ambient_led)
+        spotify_tokens_path = os.path.join(LEELOO_HOME, "spotify_tokens.json")
+        initial_playing = (
+            os.path.exists(spotify_tokens_path) and
+            bool(self.music_data and self.music_data.get('is_playing', False))
+        )
+        initial_ambient = "playing" if initial_playing else "idle"
+        self._led_ambient_state = initial_ambient
+        await self.led.set_ambient(initial_ambient)
 
         # Send welcome message on first boot after setup
         is_first_boot = self._send_first_boot_welcome()

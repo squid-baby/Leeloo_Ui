@@ -223,6 +223,34 @@ state = self.ws_client.config.device_id
 # NOT a new UUID or random string!
 ```
 
+### 11. **WS2812B ↔ INMP441 DMA Conflict**
+WS2812B (GPIO 12 PWM DMA) and INMP441 (I2S DMA) share the Pi Zero DMA controller. Any LED activity during arecord causes "Interrupted system call" / 0 audio chunks.
+```python
+# ✅ Always cancel ambient before voice recording
+await self.led._cancel_ambient()
+# ❌ Never run a continuous LED loop while arecord is active
+```
+
+### 12. **`current_music.json` `is_playing` is Stale**
+The JSON cache reflects playback state at write time — never trust it as live. Only treat `is_playing=True` as real if `spotify_tokens.json` exists (live OAuth connection).
+```python
+has_live_spotify = os.path.exists(spotify_tokens_path)
+is_playing = has_live_spotify and self.music_data.get('is_playing', False)
+```
+
+### 13. **Asyncio Tight Loops Block Audio on Pi Zero**
+Any loop without `await` (even CPU-only work like off-screen PIL draws) blocks the event loop. On Pi Zero single core this starves arecord's stdout read → 0 chunks / Read timeout.
+```python
+# ✅ Always yield at least once per loop iteration
+await asyncio.sleep(0)  # costs nothing, keeps event loop alive
+```
+
+### 14. **Boot Splash Image**
+File is `LeeLoo_boot.png` in `/home/pi/leeloo-ui/` — scaled to fill 480x320 at boot. Replace by scp-ing new PNG as that exact filename. No code change needed.
+```bash
+sshpass -p 'gadget' scp new_image.png pi@leeloo.local:/home/pi/leeloo-ui/LeeLoo_boot.png
+```
+
 ## Testing
 
 ### Without Hardware
@@ -283,6 +311,9 @@ SPOTIFY_CLIENT_SECRET=...      # Client credentials flow
 - ❌ Create album art at different sizes per script
 - ❌ Use `systemd.mask=` without reboot (persists!)
 - ❌ Trust "smoke and intolerance" searches 😅
+- ❌ Run continuous LED animations (ambient breathe) while voice recording — DMA conflict kills audio
+- ❌ Trust `is_playing` from `current_music.json` without checking `spotify_tokens.json` exists
+- ❌ Write off-screen content in a tight loop without `await asyncio.sleep(0)` — blocks I2S reads
 
 ## Tuning Values
 
@@ -295,6 +326,9 @@ SPOTIFY_CLIENT_SECRET=...      # Client credentials flow
 | Typewriter delay | 25ms/char | Character animation |
 | Expanded hold | 20s | Info frame display |
 | Shared music timeout | 30min | Priority over now-playing |
+| Ambient LED peak brightness | 50% | `AMBIENT_PEAK` in `leeloo_led.py` |
+| Ambient LED cycle | 8s | `AMBIENT_CYCLE_S` in `leeloo_led.py` |
+| Ambient LED framerate | 10fps (0.1s sleep) | Safe on Pi Zero, visually smooth |
 
 ## File Structure
 
