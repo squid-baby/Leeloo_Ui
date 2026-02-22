@@ -333,18 +333,29 @@ class LeelooBrain:
         # TODO: play reaction animation (love/fire ASCII art)
 
     def _on_ws_song_push(self, sender, payload):
-        """Handle incoming song push"""
+        """Handle incoming song push — download album art + scancode"""
         artist = payload.get('artist', '')
         track = payload.get('track', '')
         note = payload.get('note', '')
+        spotify_uri = payload.get('spotify_uri', '')
         print(f"[BRAIN] Song from {sender}: {artist} - {track}")
 
         # LED notification
         asyncio.ensure_future(self.led.music_received())
 
-        # Update music display data
-        # The music will be updated on next refresh cycle
-        # If there's a note, show it after a delay
+        # Download album art + scancode in background, then refresh display
+        async def _fetch_and_display():
+            # Use spotify_uri for direct lookup, fall back to text search
+            query = spotify_uri if spotify_uri else f"{artist} {track}"
+            result = await self._search_spotify_display_only(query, pushed_by=sender)
+            if result:
+                print(f"[BRAIN] Shared song art updated: {result['artist']} - {result['track']}")
+                self.last_music_fetch = 0
+                self._update_music()
+
+        asyncio.ensure_future(_fetch_and_display())
+
+        # Show note or album info overlay
         if note:
             async def _show_note():
                 await asyncio.sleep(3)
@@ -358,7 +369,6 @@ class LeelooBrain:
                 )
             asyncio.ensure_future(_show_note())
         else:
-            # Show album info
             lines = [
                 (f"{sender.lower()} shared", "large", COLORS['green']),
                 ("", None, None),
@@ -1263,7 +1273,7 @@ Examples:
                     # Text search
                     search_resp = requests.get(
                         f"{SPOTIFY_API_BASE}/search",
-                        params={"q": query, "type": "track", "limit": 1},
+                        params={"q": query, "type": "track", "limit": 5},
                         headers=headers,
                         timeout=5
                     )
@@ -1275,7 +1285,39 @@ Examples:
                     if not tracks:
                         print(f"[BRAIN] No tracks found for: {query}")
                         return None
-                    track = tracks[0]
+
+                    # Bigram validation (same as _search_and_push_song)
+                    import re as _re
+                    _ignore = {'the', 'a', 'an', 'by', 'and', 'or', 'with', 'to', 'from'}
+                    _qwords = [w for w in query.lower().split() if w not in _ignore and len(w) > 2]
+
+                    best_track = None
+                    best_score = (0, 0)
+                    for t in tracks:
+                        a = t['artists'][0]['name'].lower() if t.get('artists') else ''
+                        n = t['name'].lower()
+                        combined = f"{a} {n}"
+                        rwords = set(_re.findall(r'\w+', combined))
+                        whits = sum(1 for w in _qwords if w in rwords)
+                        bhits = 0
+                        if len(_qwords) >= 2:
+                            for i in range(len(_qwords) - 1):
+                                if f"{_qwords[i]} {_qwords[i+1]}" in combined:
+                                    bhits += 1
+                        s = (bhits, whits)
+                        if s > best_score:
+                            best_score = s
+                            best_track = t
+
+                    if _qwords:
+                        if len(_qwords) >= 2 and best_score[0] == 0:
+                            print(f"[BRAIN] Poor match for '{query}': no bigram match in top 5")
+                            return None
+                        elif len(_qwords) == 1 and best_score[1] == 0:
+                            print(f"[BRAIN] Poor match for '{query}': word not found in top 5")
+                            return None
+
+                    track = best_track
 
                 artist = track['artists'][0]['name'] if track.get('artists') else 'Unknown'
                 track_name = track['name']
@@ -1429,7 +1471,7 @@ Write ONLY the 65-word paragraph, no preamble or explanation."""
                 # Search for track
                 search_resp = requests.get(
                     f"{SPOTIFY_API_BASE}/search",
-                    params={"q": query, "type": "track", "limit": 1},
+                    params={"q": query, "type": "track", "limit": 5},
                     headers=headers,
                     timeout=5
                 )
@@ -1443,35 +1485,64 @@ Write ONLY the 65-word paragraph, no preamble or explanation."""
                     print(f"[BRAIN] No tracks found for: {query}")
                     return None
 
-                track = tracks[0]
+                # Validate results — require contiguous word pairs (bigrams)
+                # from the query to appear in artist+track. This prevents
+                # "bed michael jackson" matching "Michael Perry...Long Beds...Jackson"
+                import re
+                ignore_words = {'the', 'a', 'an', 'by', 'and', 'or', 'with', 'to', 'from'}
+                query_words = [w for w in query.lower().split() if w not in ignore_words and len(w) > 2]
+
+                def _score_result(t):
+                    """Score a Spotify result against query words.
+                    Returns (bigram_matches, word_matches) tuple."""
+                    a = t['artists'][0]['name'].lower() if t.get('artists') else ''
+                    n = t['name'].lower()
+                    combined = f"{a} {n}"
+                    result_words = set(re.findall(r'\w+', combined))
+
+                    # Count whole-word matches
+                    word_hits = sum(1 for w in query_words if w in result_words)
+
+                    # Count bigram (contiguous pair) matches
+                    bigram_hits = 0
+                    if len(query_words) >= 2:
+                        for i in range(len(query_words) - 1):
+                            bigram = f"{query_words[i]} {query_words[i+1]}"
+                            if bigram in combined:
+                                bigram_hits += 1
+
+                    return (bigram_hits, word_hits)
+
+                # Score all results and pick the best
+                best_track = None
+                best_score = (0, 0)
+                for t in tracks:
+                    score = _score_result(t)
+                    if score > best_score:
+                        best_score = score
+                        best_track = t
+
+                # Validation: for 2+ word queries, require at least one bigram match.
+                # For single-word queries, require the word to match.
+                if query_words:
+                    if len(query_words) >= 2 and best_score[0] == 0:
+                        a = best_track['artists'][0]['name'] if best_track.get('artists') else '?'
+                        n = best_track['name']
+                        print(f"[BRAIN] Poor match for '{query}': got '{a} - {n}'")
+                        print(f"[BRAIN] No contiguous word pairs matched (bigram check failed)")
+                        return None
+                    elif len(query_words) == 1 and best_score[1] == 0:
+                        a = best_track['artists'][0]['name'] if best_track.get('artists') else '?'
+                        n = best_track['name']
+                        print(f"[BRAIN] Poor match for '{query}': got '{a} - {n}'")
+                        return None
+
+                track = best_track
                 artist = track['artists'][0]['name'] if track.get('artists') else 'Unknown'
                 track_name = track['name']
                 album = track.get('album', {}).get('name', '')
                 spotify_uri = track['uri']
                 album_art_url = track.get('album', {}).get('images', [{}])[0].get('url', '')
-
-                # Validate relevance: check if query terms appear in artist/track name
-                query_lower = query.lower()
-                artist_lower = artist.lower()
-                track_lower = track_name.lower()
-
-                # Extract words from query (ignore common words)
-                ignore_words = {'the', 'a', 'an', 'by', 'and', 'or', 'with', 'to', 'from'}
-                query_words = [w for w in query_lower.split() if w not in ignore_words and len(w) > 2]
-
-                # Check if at least one significant word from query appears in result
-                has_match = False
-                if query_words:
-                    for word in query_words:
-                        if word in artist_lower or word in track_lower:
-                            has_match = True
-                            break
-
-                # If no words match, this is likely a bad result
-                if not has_match and query_words:
-                    print(f"[BRAIN] Poor match for '{query}': got '{artist} - {track_name}'")
-                    print(f"[BRAIN] Query words {query_words} not found in result")
-                    return None
 
                 print(f"[BRAIN] Found: {artist} - {track_name} ({album})")
 
