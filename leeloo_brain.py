@@ -808,6 +808,12 @@ class LeelooBrain:
                 self._expand_task.cancel()
             return
 
+        # Ignore taps while already listening or processing — concurrent
+        # voice sessions spawn competing arecord processes that corrupt
+        # the I2S state and kill all subsequent recordings until restart.
+        if self.ui_state in (UIState.LISTENING, UIState.PROCESSING):
+            return
+
         # LED acknowledgment
         await self.led.ack()
 
