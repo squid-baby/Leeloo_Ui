@@ -82,12 +82,21 @@ ok "System packages installed"
 # =============================================================================
 log "[2/7] Installing Python packages..."
 
-pip3 install --break-system-packages -r "$LEELOO_DIR/requirements.txt" \
-    2>&1 | grep -v "^WARNING\|already satisfied" || true
+# Install each package individually so one failure doesn't block the rest
+while IFS= read -r line; do
+    # Skip comments and blank lines
+    [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
+    # Strip inline comments
+    pkg=$(echo "$line" | sed 's/#.*//' | tr -d ' ')
+    [ -z "$pkg" ] && continue
+    echo "  Installing: $pkg"
+    pip3 install --break-system-packages "$pkg" --quiet 2>&1 | grep -v "already satisfied" || \
+        warn "  Could not install $pkg — continuing"
+done < "$LEELOO_DIR/requirements.txt"
 
 # Verify critical imports
-python3 -c "import PIL; import numpy; import websockets; print('Core imports OK')" \
-    || fail "Core Python package import failed. Check pip output above."
+python3 -c "import PIL; import numpy; import websockets; print('[OK] Core imports verified')" \
+    || fail "Core Python package import failed (PIL/numpy/websockets). Run pip3 install manually."
 
 ok "Python packages installed"
 
@@ -254,19 +263,39 @@ ok "Permissions set"
 # =============================================================================
 # DONE
 # =============================================================================
+# =============================================================================
+# VERIFY: Print key config settings so we can confirm they're correct
+# =============================================================================
 echo ""
+echo "=================================================="
+echo "  CONFIG VERIFICATION"
+echo "=================================================="
+echo ""
+echo "--- Key lines from /boot/firmware/config.txt ---"
+grep -E "hdmi_force_hotplug|waveshare|vc4-kms|disable_fw_kms|audio=|spi=|i2c_arm|max_framebuffers|googlevoicehat" /boot/firmware/config.txt || true
+echo ""
+echo "--- /boot/firmware/cmdline.txt ---"
+cat /boot/firmware/cmdline.txt
+echo ""
+echo "--- waveshare35a.dtbo ---"
+ls -la /boot/firmware/overlays/waveshare35a.dtbo
+md5sum /boot/firmware/overlays/waveshare35a.dtbo
+echo ""
+echo "  Expected MD5: d46683bf262ffa1b532851590a96907c"
+echo ""
+
 echo "=================================================="
 echo -e "  ${GREEN}LEELOO Setup Complete!${NC}"
 echo "=================================================="
 echo ""
 echo "NEXT STEP: Deploy the .env file with API keys:"
 echo ""
-echo "  From your Mac:"
-echo "  scp .env pi@$(hostname -I | awk '{print $1}'):/home/pi/leeloo-ui/.env"
+echo "  From your Mac (in the Leeloo_UI project dir):"
+MY_IP=$(hostname -I | awk '{print $1}')
+echo "  sshpass -p gadget scp .env pi@${MY_IP}:/home/pi/leeloo-ui/.env"
 echo ""
 echo "Then reboot:"
 echo "  sudo reboot"
 echo ""
-echo "After reboot, Leeloo will broadcast a WiFi AP for first-run setup."
-echo "Look for: LEELOO-SETUP"
+echo "After reboot, Leeloo will broadcast a WiFi AP: LEELOO-SETUP"
 echo ""

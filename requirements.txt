@@ -15,7 +15,7 @@ qrcode[pil]>=7.4.0                      # QR code generation (WiFi setup, Spotif
 
 # AI & voice
 anthropic>=0.79.0                       # Claude Haiku intent router
-deepgram-sdk>=4.0.0                     # Deepgram Nova-2 STT (voice recognition)
+# deepgram-sdk: NOT needed — leeloo_voice.py uses websockets directly to Deepgram API
 
 # Raspberry Pi hardware (NeoPixel LEDs + ADXL345 accelerometer)
 adafruit-circuitpython-neopixel>=6.3.0  # WS2812B LED control (GPIO 12 / PWM0)
