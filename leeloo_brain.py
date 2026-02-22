@@ -139,7 +139,8 @@ class LeelooBrain:
         self.box_right = 153  # Will be recalculated after first album art load
 
         # Subsystems
-        self.led = LEDManager(num_leds=3)
+        _device_cfg = load_json(DEVICE_CONFIG_PATH)
+        self.led = LEDManager(num_leds=_device_cfg.get('num_leds', 3))
         self.tap = TapManager(callback=self._on_tap)
         self._led_ambient_state = "idle"  # tracks current ambient to avoid redundant set_ambient calls
 
