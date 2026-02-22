@@ -89,7 +89,7 @@ while IFS= read -r line; do
     pkg=$(echo "$line" | sed 's/#.*//' | tr -d ' ')
     [ -z "$pkg" ] && continue
     echo "  Installing: $pkg"
-    if ! pip3 install --break-system-packages "$pkg" --quiet 2>&1; then
+    if ! pip3 install --break-system-packages --ignore-installed typing_extensions "$pkg" --quiet 2>&1; then
         warn "  Could not install $pkg — continuing"
     fi
 done < "$LEELOO_DIR/requirements.txt"
@@ -251,6 +251,14 @@ systemctl enable leeloo-splash.service
 
 # Disable conflicting services
 systemctl disable bluetooth.service 2>/dev/null || true
+
+# Kill the Raspberry Pi desktop — it takes over the display after boot
+# Covers both Wayland (labwc) and X11 (lightdm) desktop environments
+systemctl disable lightdm.service 2>/dev/null || true
+systemctl disable labwc.service 2>/dev/null || true
+systemctl disable wayfire.service 2>/dev/null || true
+# Set boot target to multi-user (CLI) instead of graphical (desktop)
+systemctl set-default multi-user.target 2>/dev/null || true
 
 ok "Services installed and enabled"
 
