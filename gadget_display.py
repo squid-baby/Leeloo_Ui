@@ -282,7 +282,7 @@ class LeelooDisplay:
             self.draw.text((box_x, y), char, font=self.font_slider, fill=box_color)
             box_x += char_width
 
-    def draw_left_column(self, weather_data, time_data, contacts, album_data, right_edge=158):
+    def draw_left_column(self, weather_data, time_data, contacts, album_data, right_edge=158, unread_counts=None):
         """
         Draw the left column with all info panels - MATCHES REACT UI EXACTLY
 
@@ -408,10 +408,20 @@ class LeelooDisplay:
         else:
             # Show contact names with unread count badges in front of each name
             # Layout: "○Amy  ②Ben" - white circle for 0, circled numbers for counts
+            counts = unread_counts or {}
             x_pos = 12
             for i, contact in enumerate(contacts[:4]):  # Max 4 contacts shown
-                # TODO: Get actual unread counts from message state
-                self.draw.text((x_pos, y + 7), "○", font=self.font_symbol, fill=COLORS['lavender'])
+                n = counts.get(contact, 0)
+                if n == 0:
+                    badge = "○"
+                    badge_color = COLORS['lavender']
+                elif n <= 9:
+                    badge = chr(0x2460 + n - 1)  # ①–⑨
+                    badge_color = COLORS['purple']
+                else:
+                    badge = "⑩"
+                    badge_color = COLORS['purple']
+                self.draw.text((x_pos, y + 7), badge, font=self.font_symbol, fill=badge_color)
                 x_pos += 13
                 self.draw.text((x_pos, y + 8), contact, font=self.font_tiny, fill=COLORS['white'])
                 try:
@@ -613,7 +623,7 @@ class LeelooDisplay:
                 fill=(color_val, 80, 255 - color_val)
             )
     
-    def render(self, weather_data, time_data, contacts, album_data, album_art_path=None):
+    def render(self, weather_data, time_data, contacts, album_data, album_art_path=None, unread_counts=None):
         """
         Render the complete display - MATCHES REACT UI EXACTLY
 
@@ -623,6 +633,7 @@ class LeelooDisplay:
             contacts: list of contact name strings (e.g., ['Amy', 'Ben'])
             album_data: dict with 'artist', 'track', 'bpm', 'listeners', 'pushed_by'
             album_art_path: Path to album artwork image (optional)
+            unread_counts: dict mapping sender name to unread count (e.g., {'Amy': 2})
         """
         # Clear previous image
         self.image = Image.new('RGB', (self.width, self.height), color=COLORS['bg'])
@@ -633,7 +644,7 @@ class LeelooDisplay:
 
         # Draw left column panels, extending to meet album art (with small gap)
         info_panel_right = album_x - 5
-        self.draw_left_column(weather_data, time_data, contacts, album_data, right_edge=info_panel_right)
+        self.draw_left_column(weather_data, time_data, contacts, album_data, right_edge=info_panel_right, unread_counts=unread_counts)
 
         return self.image
     

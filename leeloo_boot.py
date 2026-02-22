@@ -43,7 +43,12 @@ def save_json(path, data):
 
 
 def is_first_run():
-    return not os.path.exists(FIRST_RUN_COMPLETE)
+    if not os.path.exists(FIRST_RUN_COMPLETE):
+        return True
+    # Also treat as first run if setup was never completed (catches partial clean slates
+    # that deleted device_config.json but left .first_run_complete behind)
+    config = load_json(DEVICE_CONFIG_PATH)
+    return not config.get('setup_complete', False)
 
 
 def mark_first_run_complete():

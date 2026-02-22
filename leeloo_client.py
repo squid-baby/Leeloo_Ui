@@ -179,6 +179,11 @@ class LeelooClient:
 
             print(f"[CLIENT] Joined crew: {self.config.crew_code} ({data.get('crew_members', 1)} members)")
 
+            # Populate contacts with members already online
+            for name in data.get('member_names', []):
+                if self.on_member_joined:
+                    self.on_member_joined(name)
+
             if self.on_crew_joined:
                 self.on_crew_joined(self.config.crew_code)
 

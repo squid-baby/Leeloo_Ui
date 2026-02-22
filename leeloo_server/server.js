@@ -398,17 +398,22 @@ wss.on('connection', (ws, req) => {
             connected_at: Date.now()
           });
 
-          // Count crew members
+          // Count crew members and collect existing member names (excluding self)
           let memberCount = 0;
-          devices.forEach((d) => {
-            if (d.crew_code === joinCode) memberCount++;
+          let memberNames = [];
+          devices.forEach((d, id) => {
+            if (d.crew_code === joinCode) {
+              memberCount++;
+              if (id !== deviceId) memberNames.push(d.device_name);
+            }
           });
 
           ws.send(JSON.stringify({
             type: 'crew_joined',
             device_id: deviceId,
             crew_code: joinCode,
-            crew_members: memberCount
+            crew_members: memberCount,
+            member_names: memberNames
           }));
 
           // Deliver any pending Spotify tokens

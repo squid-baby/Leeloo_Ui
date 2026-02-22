@@ -183,6 +183,11 @@ class LeelooBrain:
         # Data caches
         self.device_config = load_json(DEVICE_CONFIG_PATH)
         self.crew_config = load_json(CREW_CONFIG_PATH)
+
+        # Ensure ws_client uses the user's chosen name, not the stale crew config default
+        user_name = self.device_config.get('user_name', '')
+        if user_name:
+            self.ws_client.config.display_name = user_name
         self.weather_data = None
         self.music_data = None
         self.album_art_path = None
@@ -280,8 +285,8 @@ class LeelooBrain:
         self.ws_client.on_nudge = self._on_ws_nudge
         self.ws_client.on_hang_propose = self._on_ws_hang_propose
         self.ws_client.on_hang_confirm = self._on_ws_hang_confirm
-        self.ws_client.on_member_joined = lambda name: print(f"[BRAIN] {name} came online")
-        self.ws_client.on_member_offline = lambda name: print(f"[BRAIN] {name} went offline")
+        self.ws_client.on_member_joined = self._on_member_joined
+        self.ws_client.on_member_offline = self._on_member_offline
         self.ws_client.on_spotify_auth = self._on_spotify_auth
 
     def _on_ws_message(self, sender, text):
@@ -408,6 +413,16 @@ class LeelooBrain:
         self._expand_task = asyncio.ensure_future(
             self.expand_frame(FrameType.MESSAGES, lines, duration=10.0)
         )
+
+    def _on_member_joined(self, name: str):
+        print(f"[BRAIN] {name} came online")
+        if name and name not in self.contacts:
+            self.contacts.append(name)
+
+    def _on_member_offline(self, name: str):
+        print(f"[BRAIN] {name} went offline")
+        if name in self.contacts:
+            self.contacts.remove(name)
 
     def _on_spotify_auth(self, tokens):
         """Handle Spotify OAuth tokens received via WebSocket"""
@@ -559,7 +574,8 @@ class LeelooBrain:
             self.time_data,
             self.contacts,
             self.music_data,
-            album_art_path=self.album_art_path
+            album_art_path=self.album_art_path,
+            unread_counts=self.message_mgr.get_unread_counts() if self.message_mgr else {}
         )
 
         # Calculate box_right from album art position
@@ -2008,8 +2024,8 @@ Write ONLY the 65-word paragraph, no preamble or explanation."""
                 if await self.ws_client.connect():
                     # Try to join crew — if it doesn't exist yet, create it
                     joined = await self.ws_client.rejoin_crew()
-                    if not joined and self.crew_config.get('is_creator', False):
-                        # We created this crew locally but it doesn't exist on server yet
+                    if not joined:
+                        # Crew doesn't exist on server (e.g. after server restart) — recreate it
                         display_name = self.device_config.get('user_name', 'LEELOO')
                         print(f"[BRAIN] Crew not found, creating on server...")
                         crew_code = await self.ws_client.create_crew(display_name)
