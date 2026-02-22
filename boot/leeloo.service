@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 Type=simple
-User=pi
+User=root
 WorkingDirectory=/home/pi/leeloo-ui
 ExecStart=/usr/bin/python3 /home/pi/leeloo-ui/leeloo_boot.py
 Restart=on-failure
