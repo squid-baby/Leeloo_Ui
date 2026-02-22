@@ -1,20 +1,26 @@
 # LEELOO Device Requirements
-# Install with: pip install -r requirements.txt
+# Install with: sudo pip3 install --break-system-packages -r requirements.txt
+# NOTE: Must use system pip (not venv). See docs/FRESH_BUILD.md.
 
-# Core dependencies
-Pillow>=10.0.0          # Image processing
-numpy>=1.24.0           # Fast array operations for framebuffer
-requests>=2.28.0        # HTTP requests for weather, Spotify
+# Core display & rendering
+Pillow>=10.0.0                          # PIL image processing (display rendering)
+numpy>=1.24.0                           # Fast array ops for RGB565 framebuffer writes
 
-# Network/Communication
-websockets>=12.0        # WebSocket client for relay server
+# Network & communication
+requests>=2.28.0                        # HTTP (Spotify, weather, geocode)
+websockets>=12.0                        # WebSocket client (relay server)
 
-# Setup/Configuration
-qrcode[pil]>=7.4.0      # QR code generation for setup screens
+# Setup & configuration
+qrcode[pil]>=7.4.0                      # QR code generation (WiFi setup, Spotify OAuth)
 
-# Raspberry Pi hardware (auto-detected on Pi)
-# spidev>=3.5
-# RPi.GPIO>=0.7.1
+# AI & voice
+anthropic>=0.79.0                       # Claude Haiku intent router
+deepgram-sdk>=4.0.0                     # Deepgram Nova-2 STT (voice recognition)
 
-# Server dependencies (only needed for relay server)
-# python-telegram-bot>=21.0
+# Raspberry Pi hardware (NeoPixel LEDs + ADXL345 accelerometer)
+adafruit-circuitpython-neopixel>=6.3.0  # WS2812B LED control (GPIO 12 / PWM0)
+adafruit-circuitpython-adxl34x>=1.12.0  # ADXL345 accelerometer (I2C, tap detection)
+adafruit-blinka>=8.0.0                  # CircuitPython hardware abstraction layer
+
+# I2C (ADXL345 accelerometer)
+smbus2>=0.4.0                           # I2C communication library
