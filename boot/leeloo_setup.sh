@@ -72,8 +72,7 @@ apt-get install -y \
     libjpeg-dev \
     libfreetype6-dev \
     i2c-tools \
-    alsa-utils \
-    2>/dev/null
+    alsa-utils
 
 ok "System packages installed"
 
@@ -90,8 +89,9 @@ while IFS= read -r line; do
     pkg=$(echo "$line" | sed 's/#.*//' | tr -d ' ')
     [ -z "$pkg" ] && continue
     echo "  Installing: $pkg"
-    pip3 install --break-system-packages "$pkg" --quiet 2>&1 | grep -v "already satisfied" || \
+    if ! pip3 install --break-system-packages "$pkg" --quiet 2>&1; then
         warn "  Could not install $pkg — continuing"
+    fi
 done < "$LEELOO_DIR/requirements.txt"
 
 # Verify critical imports
@@ -128,19 +128,28 @@ ok "Backed up config.txt"
 patch_config() {
     local key="$1"
     local value="$2"
-    local section="$3"  # optional: "[all]" etc.
 
     if grep -q "^${key}=" "$CONFIG"; then
+        # Key exists uncommented — update value
         sed -i "s|^${key}=.*|${key}=${value}|" "$CONFIG"
-    elif grep -q "^#${key}=" "$CONFIG"; then
-        sed -i "s|^#${key}=.*|${key}=${value}|" "$CONFIG"
+    elif grep -q "^#\s*${key}=" "$CONFIG"; then
+        # Key exists commented (with or without space after #) — uncomment and set
+        sed -i "s|^#\s*${key}=.*|${key}=${value}|" "$CONFIG"
     else
-        echo "${key}=${value}" >> "$CONFIG"
+        # Key not present — append inside [all] section
+        # Ensure [all] exists at end of file
+        if ! grep -q "^\[all\]" "$CONFIG"; then
+            echo "" >> "$CONFIG"
+            echo "[all]" >> "$CONFIG"
+        fi
+        # Insert before the last [all] marker to guarantee correct section
+        sed -i "/^\[all\]/a ${key}=${value}" "$CONFIG"
     fi
 }
 
 # Disable KMS (required — KMS takes over fb0 and breaks waveshare on fb1)
-sed -i 's|^dtoverlay=vc4-kms-v3d|#dtoverlay=vc4-kms-v3d|' "$CONFIG" || true
+# Handles both full KMS (vc4-kms-v3d, Bookworm+) and fake KMS (vc4-fkms-v3d, Bullseye)
+sed -i 's|^dtoverlay=vc4-f\?kms-v3d|#&|' "$CONFIG" || true
 
 # Prevent firmware from injecting video= into cmdline (breaks framebuffer)
 patch_config "disable_fw_kms_setup" "1"
@@ -261,10 +270,7 @@ chown pi:pi "$LEELOO_DIR/album_art"
 ok "Permissions set"
 
 # =============================================================================
-# DONE
-# =============================================================================
-# =============================================================================
-# VERIFY: Print key config settings so we can confirm they're correct
+# VERIFY + DONE
 # =============================================================================
 echo ""
 echo "=================================================="
