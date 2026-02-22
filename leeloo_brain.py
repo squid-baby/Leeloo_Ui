@@ -497,7 +497,7 @@ class LeelooBrain:
                             'listeners': result.get('listeners'),
                             'pushed_by': result.get('pushed_by'),
                             'spotify_uri': result.get('spotify_uri'),
-                            'is_playing': result.get('is_playing', True),
+                            'is_playing': result.get('is_playing', False),
                             'last_updated': now,
                         }
                         self.album_art_path = get_album_art_path(result)
@@ -1779,7 +1779,8 @@ Write ONLY the 65-word paragraph, no preamble or explanation."""
             f"response_type=code&"
             f"redirect_uri={quote(redirect_uri)}&"
             f"scope={quote(scopes)}&"
-            f"state={device_id}"
+            f"state={device_id}&"
+            f"show_dialog=true"
         )
 
     def _generate_qr_image(self, qr_url, label_text, sublabel_text, label_color, hint_text=None):
@@ -1920,8 +1921,15 @@ Write ONLY the 65-word paragraph, no preamble or explanation."""
             raise
         finally:
             self._welcome_qr_active = False
-            # Restore original album art
-            self.album_art_path = original_art_path
+            # Restore original album art — fall back to leeloo_for_sharing.png
+            # when no music is loaded yet (avoids the gradient placeholder)
+            sharing_img = os.path.join(LEELOO_HOME, 'leeloo_for_sharing.png')
+            if original_art_path and os.path.exists(original_art_path):
+                self.album_art_path = original_art_path
+            elif os.path.exists(sharing_img):
+                self.album_art_path = sharing_img
+            else:
+                self.album_art_path = original_art_path
             # Clean up temp QR file
             qr_path = os.path.join(LEELOO_HOME, '.welcome_qr.png')
             try:

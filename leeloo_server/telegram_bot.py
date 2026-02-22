@@ -143,7 +143,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def create_crew(query, user_id: int):
     """Create a new crew via relay API"""
     data = await relay_post('/api/telegram/crew/create', {
-        'telegram_user_id': user_id
+        'telegram_user_id': user_id,
+        'display_name': query.from_user.first_name
     })
 
     if 'error' in data:
@@ -166,14 +167,12 @@ async def create_crew(query, user_id: int):
         "1. Power on your LEELOO device\n"
         "2. When it shows \"Join Crew\", enter this code\n"
         "3. Share this code with friends so they can join too!\n\n"
-        "Each crew member will need:\n"
-        "- Their own LEELOO device\n"
-        "- This crew code to connect"
+        "Once paired, just type any message here and it'll show on all devices.\n"
+        "You can also share music — type a song or artist name and LEELOO will push it to the crew."
     )
 
     keyboard = [
         [InlineKeyboardButton("Pair My Device", callback_data='pair_device')],
-        [InlineKeyboardButton("Send Message to Crew", callback_data='send_message')],
         [InlineKeyboardButton("Crew Status", callback_data='crew_status')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -195,7 +194,10 @@ async def prompt_join_crew(query, user_id: int, context: ContextTypes.DEFAULT_TY
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text messages from user"""
+    """Handle text messages from user.
+    If the user is in a crew, any plain text is sent directly to the crew —
+    no button tap or prompt required.
+    """
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
@@ -204,13 +206,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await join_crew(update, user_id, text.upper())
         return
 
-    if context.user_data.get('awaiting_message'):
+    # Drop the awaiting_message gate — send directly if in a crew
+    state = user_state.get(user_id, {})
+    if state.get('crew_code'):
         context.user_data['awaiting_message'] = False
         await send_crew_message(update, user_id, text)
         return
 
     await update.message.reply_text(
-        "Use /start to see options, or /help for more info."
+        "Join a crew first so your messages have somewhere to go!\n\nUse /start to get set up."
     )
 
 
@@ -224,7 +228,8 @@ async def join_crew(update: Update, user_id: int, crew_code: str):
 
     data = await relay_post('/api/telegram/crew/join', {
         'telegram_user_id': user_id,
-        'crew_code': crew_code
+        'crew_code': crew_code,
+        'display_name': update.effective_user.first_name
     })
 
     if 'error' in data:
@@ -251,12 +256,15 @@ async def join_crew(update: Update, user_id: int, crew_code: str):
         "**You've joined the crew!**\n\n"
         f"Crew Code: `{crew_code}`\n"
         f"Devices online: {devices_online}\n\n"
-        "Messages you send here will appear on all crew devices!"
+        "Just type anything here and it'll show up on all LEELOO devices in your crew.\n\n"
+        "You can also share music — just type a song or artist name (e.g. _Tame Impala - Feels Like We Only Go Backwards_) "
+        "and LEELOO will push it to the crew.\n\n"
+        "Use the buttons below to check crew status or pair a device."
     )
 
     keyboard = [
-        [InlineKeyboardButton("Send Message to Crew", callback_data='send_message')],
         [InlineKeyboardButton("Crew Status", callback_data='crew_status')],
+        [InlineKeyboardButton("Pair My Device", callback_data='pair_device')],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -303,18 +311,17 @@ async def show_crew_status(query, user_id: int):
 
     devices_online = data.get('devices_online', 0)
     device_names = data.get('device_names', [])
-    telegram_users = data.get('telegram_users', 0)
+    telegram_user_names = data.get('telegram_user_names', [])
 
-    if device_names:
-        device_list = '\n'.join(f"  - {name}" for name in device_names)
-    else:
-        device_list = "  No devices connected"
+    device_list = '\n'.join(f"  📟 {name}" for name in device_names) if device_names else "  No devices connected"
+    user_list = '\n'.join(f"  👤 {name}" for name in telegram_user_names) if telegram_user_names else "  No users connected"
 
     text = (
         f"**Crew Status: `{crew_code}`**\n\n"
         f"Devices online: {devices_online}\n"
         f"{device_list}\n\n"
-        f"Telegram users: {telegram_users}"
+        f"Telegram users: {len(telegram_user_names)}\n"
+        f"{user_list}"
     )
 
     keyboard = [
@@ -414,7 +421,6 @@ async def send_crew_message(update: Update, user_id: int, message_text: str):
     )
 
     keyboard = [
-        [InlineKeyboardButton("Send Another", callback_data='send_message')],
         [InlineKeyboardButton("Crew Status", callback_data='crew_status')],
         [InlineKeyboardButton("Back to Crew", callback_data='my_crew')],
     ]
@@ -432,17 +438,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "**Commands:**\n"
         "/start - Main menu\n"
         "/help - This help message\n\n"
+        "**Sending messages:**\n"
+        "Once you're in a crew, just *type and send* — no commands needed. "
+        "Your message pops up on every LEELOO device in the crew.\n\n"
+        "**Sharing music:**\n"
+        "Type a song or artist name (e.g. _The Strokes - Last Nite_) and "
+        "LEELOO will search Spotify and push it to the crew.\n\n"
+        "**Crew status:**\n"
+        "Use /start → Crew Status to see who's online.\n\n"
         "**What is a Crew?**\n"
-        "A crew is a group of friends with LEELOO devices. "
-        "When someone in your crew pushes a song, it shows up "
-        "on everyone's device!\n\n"
-        "**How to Set Up:**\n"
-        "1. Create a crew (or get a code from a friend)\n"
-        "2. Connect your LEELOO device to your crew\n"
-        "3. Start sharing music!\n\n"
-        "**Send messages from your phone:**\n"
-        "Once in a crew, tap \"Send Message\" and your message "
-        "will appear on all LEELOO devices in your crew."
+        "A crew is your group of friends with LEELOO devices. "
+        "When someone pushes a song, it shows on everyone's device!"
     )
     await update.message.reply_text(text, parse_mode='Markdown')
 

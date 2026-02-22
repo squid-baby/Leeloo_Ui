@@ -753,15 +753,22 @@ def setup_crew_join():
 
         <h1>join a crew<span class="cursor">\u258a</span></h1>
 
-        <p class="prompt">enter the crew code your friend shared</p>
+        <p class="prompt">enter the 4-letter code your friend shared</p>
 
         <form id="joinForm">
             <label>CREW CODE</label>
-            <input type="text" name="invite_code" id="inviteCode"
-                   placeholder="LEELOO-XXXX" required maxlength="11"
-                   style="text-transform: uppercase; text-align: center;
-                          font-size: 20px; letter-spacing: 2px;"
-                   autocomplete="off" autocorrect="off" autocapitalize="characters">
+            <div style="display: flex; align-items: center; justify-content: center; gap: 0;">
+                <span style="font-size: 20px; letter-spacing: 2px; color: #7beec0;
+                             background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.15);
+                             border-right: none; border-radius: 8px 0 0 8px;
+                             padding: 14px 10px 14px 14px; user-select: none; white-space: nowrap;">LEELOO-</span>
+                <input type="text" name="invite_suffix" id="inviteSuffix"
+                       placeholder="XXXX" required maxlength="4"
+                       style="text-transform: uppercase; text-align: center; width: 90px;
+                              font-size: 20px; letter-spacing: 4px; border-radius: 0 8px 8px 0;
+                              border-left: none;"
+                       autocomplete="off" autocorrect="off" autocapitalize="characters">
+            </div>
 
             <button type="submit" class="btn" id="joinBtn">JOIN CREW</button>
         </form>
@@ -781,15 +788,11 @@ def setup_crew_join():
     </div>
 
     <script>
-        const input = document.getElementById('inviteCode');
+        const input = document.getElementById('inviteSuffix');
 
-        // Auto-prepend LEELOO- prefix
+        // Only allow alphanumeric characters, max 4
         input.addEventListener('input', function() {{
-            let val = this.value.toUpperCase().replace(/[^A-Z0-9-]/g, '');
-            if (val.length > 0 && !val.startsWith('LEELOO-') && !val.startsWith('L')) {{
-                val = 'LEELOO-' + val;
-            }}
-            this.value = val;
+            this.value = this.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4);
         }});
 
         document.getElementById('joinForm').addEventListener('submit', async (e) => {{
@@ -798,11 +801,8 @@ def setup_crew_join():
             btn.disabled = true;
             btn.textContent = 'SAVING...';
 
-            let code = document.getElementById('inviteCode').value.trim().toUpperCase();
-            // Normalize: if they just typed the 4-char suffix, prepend LEELOO-
-            if (code.length === 4 && !code.startsWith('L')) {{
-                code = 'LEELOO-' + code;
-            }}
+            let suffix = document.getElementById('inviteSuffix').value.trim().toUpperCase();
+            let code = 'LEELOO-' + suffix;
 
             try {{
                 const result = await fetchJSON('/api/crew/join', {{

@@ -24,8 +24,7 @@ SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_CLIENT_ID = "f8c3c0120e694af283d7d7f7c2f67d4c"
 SPOTIFY_CLIENT_SECRET = "9d6018d89a254d668dc18c8844e2a2d8"
 
-# Shared music stays visible for 30 minutes
-SHARED_MUSIC_TIMEOUT = 1800
+# (Shared music no longer has a fixed timeout — now-playing always overrides it)
 
 # Cache for monthly listeners (artist_id -> (listeners_str, timestamp))
 _listeners_cache = {}
@@ -272,55 +271,46 @@ def load_current_music():
 
 def update_music_display():
     """Update music display with priority logic:
-    - Shared music stays on screen until currently playing song changes
-    - Once song changes, switch to showing currently playing
+    - Now playing on Spotify ALWAYS takes the display (real-time wins)
+    - When Spotify stops, fall back to the most recently shared song
+    - current_music.json is ONLY written by shared/pushed songs, not by now-playing,
+      so it always holds the last shared track for fallback
     """
-    existing_music = load_current_music()
+    shared_music = load_current_music()   # shared/pushed song written by voice or Telegram
     currently_playing = get_currently_playing()
 
-    # Priority 1: Fresh shared music (< 30 min old) - stays until song changes
-    if existing_music and existing_music.get('source') == 'shared':
-        age = time.time() - existing_music.get('timestamp', 0)
-        if age < SHARED_MUSIC_TIMEOUT:
-            # Check if currently playing song is DIFFERENT from what's displayed
-            if currently_playing:
-                # If song changed, switch to currently playing
-                if currently_playing['spotify_uri'] != existing_music.get('spotify_uri'):
-                    with open(CURRENT_MUSIC_FILE, 'w') as f:
-                        json.dump(currently_playing, f, indent=2)
-                    status = "▶️" if currently_playing.get('is_playing') else "⏸️"
-                    listeners_info = f" ({currently_playing.get('listeners')} listeners)" if currently_playing.get('listeners') else ""
-                    print(f"{status} Song changed → Now Playing: {currently_playing['artist']} - {currently_playing['track']}{listeners_info}")
-                    return currently_playing
-
-            # Song hasn't changed - keep showing shared music
-            # If shared music doesn't have listeners yet, try to fetch them
-            if not existing_music.get('listeners'):
-                artist = existing_music.get('artist')
-                if artist:
-                    listeners = get_listeners_for_artist_name(artist)
-                    if listeners:
-                        existing_music['listeners'] = listeners
-                        with open(CURRENT_MUSIC_FILE, 'w') as f:
-                            json.dump(existing_music, f, indent=2)
-                        print(f"   📤 Updated shared music listeners: {listeners}")
-            print(f"📤 Shared music still showing ({int(age/60)} min old)")
-            return existing_music
-
-    # Priority 2: Currently playing (if no shared music, or shared expired)
-    if currently_playing:
-        with open(CURRENT_MUSIC_FILE, 'w') as f:
-            json.dump(currently_playing, f, indent=2)
-
-        status = "▶️" if currently_playing.get('is_playing') else "⏸️"
+    # Priority 1: Spotify is actively playing → always show it, don't overwrite shared music
+    if currently_playing and currently_playing.get('is_playing'):
         listeners_info = f" ({currently_playing.get('listeners')} listeners)" if currently_playing.get('listeners') else ""
-        print(f"{status} Currently playing: {currently_playing['artist']} - {currently_playing['track']}{listeners_info}")
+        print(f"▶️ Now playing: {currently_playing['artist']} - {currently_playing['track']}{listeners_info}")
         return currently_playing
 
-    # Priority 3: Fallback to ANY existing music (shared or old currently playing) when playback stops
-    if existing_music:
-        print(f"🔇 Nothing playing → showing last music: {existing_music.get('artist')} - {existing_music.get('track')}")
-        return existing_music
+    # Priority 2: Spotify paused/stopped → show most recently shared song
+    if shared_music and shared_music.get('source') == 'shared':
+        # Fetch listeners if not yet populated
+        if not shared_music.get('listeners'):
+            artist = shared_music.get('artist')
+            if artist:
+                listeners = get_listeners_for_artist_name(artist)
+                if listeners:
+                    shared_music['listeners'] = listeners
+                    with open(CURRENT_MUSIC_FILE, 'w') as f:
+                        json.dump(shared_music, f, indent=2)
+                    print(f"   📤 Updated shared music listeners: {listeners}")
+        age = time.time() - shared_music.get('timestamp', 0)
+        print(f"📤 Nothing playing → showing shared: {shared_music.get('artist')} - {shared_music.get('track')} ({int(age/60)} min old)")
+        return shared_music
+
+    # Priority 3: Spotify paused, nothing shared yet — show paused track
+    if currently_playing:
+        listeners_info = f" ({currently_playing.get('listeners')} listeners)" if currently_playing.get('listeners') else ""
+        print(f"⏸️ Paused: {currently_playing['artist']} - {currently_playing['track']}{listeners_info}")
+        return currently_playing
+
+    # Priority 4: Fallback to whatever was last stored (old shared or old now-playing)
+    if shared_music:
+        print(f"🔇 Nothing playing → showing last known: {shared_music.get('artist')} - {shared_music.get('track')}")
+        return shared_music
 
     print("🔇 Nothing currently playing, no shared music")
     return None

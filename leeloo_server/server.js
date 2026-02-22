@@ -18,7 +18,7 @@ const TELEGRAM_API_SECRET = process.env.TELEGRAM_API_SECRET || '';
 
 // In-memory storage
 const devices = new Map(); // device_id -> { ws, crew_code, device_name, connected_at }
-const crews = new Map();   // crew_code -> { created_at, telegram_users: Set<int> }
+const crews = new Map();   // crew_code -> { created_at, telegram_users: Map<int, string> }
 const pendingSpotifyTokens = new Map(); // device_id -> { tokens, timestamp }
 
 // Serve static landing page
@@ -44,7 +44,7 @@ function getOrCreateCrew(crewCode) {
   if (!crews.has(crewCode)) {
     crews.set(crewCode, {
       created_at: Date.now(),
-      telegram_users: new Set()
+      telegram_users: new Map()  // user_id -> display_name
     });
   }
   return crews.get(crewCode);
@@ -92,7 +92,7 @@ app.get('/health', (req, res) => {
 // --- Telegram API endpoints ---
 
 app.post('/api/telegram/crew/create', telegramAuth, (req, res) => {
-  const { telegram_user_id } = req.body;
+  const { telegram_user_id, display_name } = req.body;
 
   if (!telegram_user_id) {
     return res.status(400).json({ error: 'telegram_user_id required' });
@@ -105,14 +105,14 @@ app.post('/api/telegram/crew/create', telegramAuth, (req, res) => {
   }
 
   const crew = getOrCreateCrew(crewCode);
-  crew.telegram_users.add(telegram_user_id);
+  crew.telegram_users.set(telegram_user_id, display_name || 'Unknown');
 
   console.log(`[TELEGRAM] User ${telegram_user_id} created crew ${crewCode}`);
   res.json({ crew_code: crewCode });
 });
 
 app.post('/api/telegram/crew/join', telegramAuth, (req, res) => {
-  const { telegram_user_id, crew_code } = req.body;
+  const { telegram_user_id, crew_code, display_name } = req.body;
 
   if (!telegram_user_id || !crew_code) {
     return res.status(400).json({ error: 'telegram_user_id and crew_code required' });
@@ -133,7 +133,7 @@ app.post('/api/telegram/crew/join', telegramAuth, (req, res) => {
   }
 
   const crew = getOrCreateCrew(code);
-  crew.telegram_users.add(telegram_user_id);
+  crew.telegram_users.set(telegram_user_id, display_name || 'Unknown');
 
   // Count connected devices in this crew
   let deviceCount = 0;
@@ -157,6 +157,11 @@ app.post('/api/telegram/message', telegramAuth, (req, res) => {
 
   if (!crew || !crew.telegram_users.has(telegram_user_id)) {
     return res.status(403).json({ error: 'not_in_crew', message: 'You are not a member of this crew' });
+  }
+
+  // Keep display name fresh (user may have changed their Telegram name)
+  if (sender_name) {
+    crew.telegram_users.set(telegram_user_id, sender_name);
   }
 
   // Build the message in the format devices expect (matches leeloo_client.py)
@@ -192,12 +197,16 @@ app.get('/api/telegram/crew/status', telegramAuth, (req, res) => {
   });
 
   const crew = crews.get(code);
+  const telegramUserNames = crew
+    ? Array.from(crew.telegram_users.values())
+    : [];
   res.json({
     crew_code: code,
     exists: !!(crew || deviceCount > 0),
     devices_online: deviceCount,
     device_names: deviceNames,
-    telegram_users: crew ? crew.telegram_users.size : 0
+    telegram_users: telegramUserNames.length,
+    telegram_user_names: telegramUserNames
   });
 });
 

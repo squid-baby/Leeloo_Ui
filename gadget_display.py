@@ -561,10 +561,13 @@ class LeelooDisplay:
                            outline=COLORS['green'], width=2)
 
         # Try to load and center the scancode placeholder inside the frame
+        # Falls back to leeloo_for_sharing.png if the dedicated scancode image doesn't exist
         scancode_paths = [
             '/home/pi/leeloo-ui/leeloo_empty_scancode.png',
             os.path.join(os.path.dirname(__file__), 'leeloo_empty_scancode.png'),
-            'leeloo_empty_scancode.png'
+            'leeloo_empty_scancode.png',
+            '/home/pi/leeloo-ui/leeloo_for_sharing.png',
+            os.path.join(os.path.dirname(__file__), 'leeloo_for_sharing.png'),
         ]
 
         for scancode_path in scancode_paths:

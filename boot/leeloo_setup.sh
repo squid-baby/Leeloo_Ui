@@ -212,6 +212,9 @@ if ! echo "$CURRENT" | grep -q "loglevel="; then
     CURRENT="$CURRENT loglevel=3"
 fi
 
+# Remove 'splash' — triggers Plymouth boot animation (Raspberry Pi logo screen)
+CURRENT=$(echo "$CURRENT" | sed 's/\bsplash\b//g')
+
 # Hide Plymouth/boot logos
 for param in "quiet" "plymouth.ignore-serial-consoles" "logo.nologo"; do
     if ! echo "$CURRENT" | grep -q "$param"; then
@@ -259,6 +262,15 @@ systemctl disable labwc.service 2>/dev/null || true
 systemctl disable wayfire.service 2>/dev/null || true
 # Set boot target to multi-user (CLI) instead of graphical (desktop)
 systemctl set-default multi-user.target 2>/dev/null || true
+
+# Remove piwiz (Raspberry Pi first-run wizard) — shows an unwanted welcome screen
+# on first boot before Leeloo gets control of the display
+apt-get remove -y piwiz 2>/dev/null || true
+
+# Remove Plymouth boot animation packages — the 'pix' theme shows the Raspberry Pi
+# logo splash screen. We already strip 'splash' from cmdline.txt, but removing the
+# packages ensures it can never fire even if cmdline is regenerated.
+apt-get remove -y plymouth plymouth-label plymouth-themes 2>/dev/null || true
 
 ok "Services installed and enabled"
 
