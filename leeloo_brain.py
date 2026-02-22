@@ -1522,6 +1522,11 @@ Write ONLY the 65-word paragraph, no preamble or explanation."""
                         best_score = score
                         best_track = t
 
+                # Guard: no tracks returned at all
+                if best_track is None:
+                    print(f"[BRAIN] No tracks found for '{query}'")
+                    return None
+
                 # Validation: for 2+ word queries, require at least one bigram match.
                 # For single-word queries, require the word to match.
                 if query_words:

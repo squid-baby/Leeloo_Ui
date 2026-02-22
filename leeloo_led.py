@@ -283,9 +283,16 @@ class LEDManager:
     async def off(self):
         """Turn off all LEDs and cancel any transient animation.
         Ambient breathe resumes if active."""
+        # If a _run_animation task is active, its finally block will restart
+        # ambient after cancellation — don't also restart here or we get two
+        # concurrent ambient tasks and the orphaned one can't be cancelled,
+        # leaving DMA active and killing I2S audio on the next tap.
+        has_run_animation_task = bool(
+            self._animation_task and not self._animation_task.done()
+        )
         await self._cancel_current()
         self._set_color(OFF)
-        if self._ambient_state:
+        if self._ambient_state and not has_run_animation_task:
             self._start_ambient_task()
 
     async def off_all(self):
