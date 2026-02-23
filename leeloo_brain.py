@@ -197,6 +197,24 @@ class LeelooBrain:
         # Timing
         self.last_weather_fetch = 0
         self.last_music_fetch = 0
+        self.last_music_active = time.time()  # tracks last known active playback or shared music
+
+        # Local show discovery
+        self.local_shows = []
+        self.show_index = 0
+        self.last_show_fetch = 0
+        self.last_show_rotate = 0
+
+        # Load cached shows on startup
+        try:
+            from leeloo_shows import load_cached_shows
+            cached = load_cached_shows()
+            if cached:
+                self.local_shows = cached
+                self.last_show_fetch = time.time()  # cache is fresh, don't refetch immediately
+                print(f"[BRAIN] Loaded {len(cached)} cached shows")
+        except Exception as e:
+            print(f"[BRAIN] Could not load cached shows: {e}")
 
         # Timezone
         tz_name = self.device_config.get('timezone')
@@ -345,6 +363,9 @@ class LeelooBrain:
         spotify_uri = payload.get('spotify_uri', '')
         print(f"[BRAIN] Song from {sender}: {artist} - {track}")
 
+        # Shared music counts as activity — resets idle show discovery timer
+        self.last_music_active = time.time()
+
         # LED notification
         asyncio.ensure_future(self.led.music_received())
 
@@ -389,14 +410,31 @@ class LeelooBrain:
         asyncio.ensure_future(self.led.nudge(duration=30))
 
     def _on_ws_hang_propose(self, sender, datetime_str, description):
-        """Handle incoming hang proposal"""
+        """Handle incoming hang proposal — save datetime so countdown shows across crew"""
         print(f"[BRAIN] Hang proposal from {sender}: {datetime_str}")
+
+        # Save hang so countdown renders on this device
+        if datetime_str:
+            try:
+                hang_dt = datetime.fromisoformat(datetime_str)
+                set_next_hang(hang_dt, sender)
+                date_display = hang_dt.strftime('%a %b %-d at %-I:%M %p')
+            except Exception as e:
+                print(f"[BRAIN] Hang datetime parse error: {e}")
+                date_display = datetime_str
+        else:
+            date_display = description or "time tbd"
+
         lines = [
             (f"{sender.lower()} wants to", "large", COLORS['lavender']),
             ("hang!", "large", COLORS['lavender']),
             ("", None, None),
-            *self._format_display_text(f"{datetime_str} {description}".strip(), COLORS['white']),
+            *self._format_display_text(date_display, COLORS['white']),
         ]
+        if description:
+            lines += [("", None, None), *self._format_display_text(description, COLORS['tan'])]
+        lines += [("", None, None), ("tap + say 'i'm in'", "small", COLORS['tan'])]
+
         self._expand_task = asyncio.ensure_future(
             self.expand_frame(FrameType.MESSAGES, lines, duration=EXPANDED_HOLD_DURATION)
         )
@@ -542,6 +580,10 @@ class LeelooBrain:
                 self.album_art_path = None
             self.last_music_fetch = now
 
+        # Track last active playback time for idle show discovery
+        if self.music_data and self.music_data.get('is_playing'):
+            self.last_music_active = time.time()
+
         # Update ambient LED state based on current playback
         self._sync_ambient_led()
 
@@ -569,18 +611,158 @@ class LeelooBrain:
         """Render the normal UI to framebuffer"""
         self._update_time()
 
+        # Use local show card in album art area when music has been idle 2+ hours
+        art_path = self.album_art_path
+        if self._is_music_idle() and self.local_shows:
+            show_card = self._get_show_card_path()
+            if show_card:
+                art_path = show_card
+
         img = self.display.render(
             self.weather_data,
             self.time_data,
             self.contacts,
             self.music_data,
-            album_art_path=self.album_art_path,
+            album_art_path=art_path,
             unread_counts=self.message_mgr.get_unread_counts() if self.message_mgr else {}
         )
 
         # Calculate box_right from album art position
         # (The display.render already computed this internally)
         write_to_framebuffer(img)
+
+    def _is_music_idle(self):
+        """True if no music has been active for 2+ hours and nothing is playing now"""
+        if not self.location_configured:
+            return False
+        not_playing = not (
+            self.music_data and
+            self.music_data.get('is_playing') and
+            os.path.exists(os.path.join(LEELOO_HOME, "spotify_tokens.json"))
+        )
+        idle_long_enough = (time.time() - self.last_music_active) > 7200  # 2 hours
+        return not_playing and idle_long_enough
+
+    def _update_local_shows(self):
+        """Refresh local show cache from Ticketmaster (sync, once per 24h)"""
+        if not self.location_configured:
+            return
+        if (time.time() - self.last_show_fetch) < 86400:  # 24 hours
+            return
+
+        api_key = os.environ.get("TICKETMASTER_API_KEY", "")
+        if not api_key:
+            return
+
+        try:
+            from leeloo_shows import fetch_local_shows, save_shows
+            shows = fetch_local_shows(self.latitude, self.longitude, api_key)
+            if shows:
+                self.local_shows = shows
+                self.show_index = 0
+                save_shows(shows)
+                print(f"[BRAIN] Show discovery: {len(shows)} shows near you")
+            self.last_show_fetch = time.time()
+        except Exception as e:
+            print(f"[BRAIN] Show fetch error: {e}")
+            self.last_show_fetch = time.time()  # back off even on failure
+
+    def _get_show_card_path(self):
+        """Get path to show card image, rotating through local_shows every 30s"""
+        if not self.local_shows:
+            return None
+        now = time.time()
+        if (now - self.last_show_rotate) > 30:
+            self.show_index = (self.show_index + 1) % len(self.local_shows)
+            self.last_show_rotate = now
+        return self._generate_show_card(self.local_shows[self.show_index])
+
+    def _generate_show_card(self, show):
+        """Generate a 243x304 show card image and return its path (cached in /tmp)"""
+        import hashlib
+        key = f"{show.get('artist', '')}_{show.get('date', '')}_{show.get('venue', '')}"
+        card_path = f"/tmp/leeloo_show_{hashlib.md5(key.encode()).hexdigest()[:8]}.png"
+        if os.path.exists(card_path):
+            return card_path
+
+        try:
+            import qrcode
+            W, H = 243, 304
+            img = Image.new('RGB', (W, H), COLORS['bg'])
+            draw = ImageDraw.Draw(img)
+
+            # Header label
+            draw.text((W // 2, 8), "shows near you", font=self.font_small,
+                      fill=COLORS['purple'], anchor='mt')
+
+            # Divider
+            draw.line([(10, 25), (W - 10, 25)], fill=COLORS['purple'], width=1)
+
+            # Artist name (may need to truncate)
+            artist = show.get('artist', 'Unknown')[:20]
+            draw.text((W // 2, 32), artist, font=self.font_large,
+                      fill=COLORS['green'], anchor='mt')
+
+            # Venue
+            venue = show.get('venue', '')[:24]
+            draw.text((W // 2, 54), venue, font=self.font_small,
+                      fill=COLORS['white'], anchor='mt')
+
+            # Date + time
+            date_str = show.get('date', '')
+            time_str = show.get('time', '')
+            date_display = date_str
+            try:
+                dt = datetime.strptime(date_str, '%Y-%m-%d')
+                date_display = dt.strftime('%a %b %-d')
+            except Exception:
+                pass
+            if time_str:
+                try:
+                    from datetime import datetime as _dt
+                    t = _dt.strptime(time_str, '%H:%M:%S')
+                    date_display += f"  {t.strftime('%-I:%M %p')}"
+                except Exception:
+                    pass
+            draw.text((W // 2, 72), date_display, font=self.font_small,
+                      fill=COLORS['tan'], anchor='mt')
+
+            # Distance
+            dist = show.get('distance_miles', 0)
+            draw.text((W // 2, 90), f"{dist} mi away", font=self.font_small,
+                      fill=COLORS['lavender'], anchor='mt')
+
+            # Divider
+            draw.line([(10, 106), (W - 10, 106)], fill=COLORS['purple'], width=1)
+
+            # QR code for tickets
+            url = show.get('url', '')
+            if url:
+                qr = qrcode.QRCode(
+                    version=1,
+                    error_correction=qrcode.constants.ERROR_CORRECT_L,
+                    box_size=7,
+                    border=2,
+                )
+                qr.add_data(url)
+                qr.make(fit=True)
+                qr_img = qr.make_image(fill_color='white', back_color=COLORS['bg']).convert('RGB')
+                qr_size = 160
+                qr_img = qr_img.resize((qr_size, qr_size), Image.Resampling.NEAREST)
+                qr_x = (W - qr_size) // 2
+                img.paste(qr_img, (qr_x, 112))
+                draw.text((W // 2, 280), "scan for tickets", font=self.font_small,
+                          fill=COLORS['white'], anchor='mt')
+            else:
+                draw.text((W // 2, 160), "no ticket link", font=self.font_small,
+                          fill=COLORS['white'], anchor='mt')
+
+            img.save(card_path)
+            return card_path
+
+        except Exception as e:
+            print(f"[BRAIN] Show card generation error: {e}")
+            return None
 
     def _calculate_box_right(self):
         """Calculate box_right from album art position"""
@@ -1083,23 +1265,48 @@ class LeelooBrain:
             dt_str = intent.params.get('datetime', '')
             desc = intent.params.get('description', '')
             print(f"[BRAIN] Hang propose: {dt_str} {desc}")
-            # Phase 5: send via WebSocket
-            if self.ws_client and dt_str:
-                pass  # await self.ws_client.send_hang_propose(dt_str)
+
+            # Save hang locally so countdown shows on this device
+            if dt_str:
+                try:
+                    hang_dt = datetime.fromisoformat(dt_str)
+                    set_next_hang(hang_dt, "voice")
+                    print(f"[BRAIN] Hang saved: {hang_dt}")
+                except Exception as e:
+                    print(f"[BRAIN] Hang datetime parse error: {e}")
+
+            # Send to crew via WebSocket
+            if self.ws_client and self.ws_client.connected and dt_str:
+                await self.ws_client.send_hang_propose(dt_str, desc)
+
+            # Format date for display
+            date_display = dt_str
+            if dt_str:
+                try:
+                    hang_dt = datetime.fromisoformat(dt_str)
+                    date_display = hang_dt.strftime('%a %b %-d at %-I:%M %p')
+                except Exception:
+                    pass
+
+            display_lines = [
+                ("hang proposed!", "large", COLORS['lavender']),
+                ("", None, None),
+                *self._format_display_text(date_display, COLORS['white']),
+            ]
+            if desc:
+                display_lines += [("", None, None), *self._format_display_text(desc, COLORS['tan'])]
+
             self._expand_task = asyncio.create_task(
-                self.expand_frame(
-                    FrameType.MESSAGES,
-                    [
-                        ("hang proposed", "large", COLORS['lavender']),
-                        ("", None, None),
-                        *self._format_display_text(intent.response_text, COLORS['white']),
-                    ],
-                    duration=EXPANDED_HOLD_DURATION
-                )
+                self.expand_frame(FrameType.MESSAGES, display_lines, duration=EXPANDED_HOLD_DURATION)
             )
         elif action == "HANG_CONFIRM":
             print("[BRAIN] Hang confirmed")
             await self.led.ack()
+
+            # Send confirmation to crew
+            if self.ws_client and self.ws_client.connected:
+                await self.ws_client.send_hang_confirm()
+
             self._expand_task = asyncio.create_task(
                 self.expand_frame(
                     FrameType.MESSAGES,
@@ -1727,6 +1934,7 @@ Write ONLY the 65-word paragraph, no preamble or explanation."""
             return  # Don't overwrite QR during welcome screen
         self._update_weather()
         self._update_music()
+        self._update_local_shows()  # No-op unless 24h have elapsed
         self._render_normal()
 
     # =========================================================================

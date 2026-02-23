@@ -20,6 +20,18 @@ const TELEGRAM_API_SECRET = process.env.TELEGRAM_API_SECRET || '';
 const devices = new Map(); // device_id -> { ws, crew_code, device_name, connected_at }
 const crews = new Map();   // crew_code -> { created_at, telegram_users: Map<int, string> }
 const pendingSpotifyTokens = new Map(); // device_id -> { tokens, timestamp }
+const pendingHangs = new Map(); // crew_code -> { datetime, proposer, proposed_at }
+
+// Detect affirmative responses ("yes", "yeah", "i'm in", "👍", etc.)
+const AFFIRMATIVE_PATTERNS = [
+  /\b(yes|yeah|yep|yup|sure|ok|okay|sounds good|im in|i'm in|count me in|for sure|absolutely|def|definitely|100|hell yeah)\b/i,
+  /^(👍|✅|🙌|💯|🤙|🎉|👌|🔥|🙋|🙋‍♂️|🙋‍♀️)\s*$/u,
+];
+
+function isAffirmative(text) {
+  if (!text || typeof text !== 'string') return false;
+  return AFFIRMATIVE_PATTERNS.some(p => p.test(text.trim()));
+}
 
 // Serve static landing page
 app.use(express.static('public'));
@@ -173,6 +185,25 @@ app.post('/api/telegram/message', telegramAuth, (req, res) => {
     payload: payload || {},
     timestamp: Date.now()
   };
+
+  // Auto-confirm hang if Telegram message is affirmative
+  const telegramMsgType = msg_type || 'text';
+  if (telegramMsgType === 'text') {
+    const text = (payload || {}).text || '';
+    const pending = pendingHangs.get(code);
+    if (pending && isAffirmative(text) && (Date.now() - pending.proposed_at) < 86400000) {
+      console.log(`[HANG] Crew ${code}: Telegram auto-confirm — "${text}" from ${sender_name}`);
+      pendingHangs.delete(code);
+      broadcastToCrew(code, {
+        type: 'message',
+        from_device: 'telegram',
+        from_name: sender_name || 'Phone',
+        msg_type: 'hang_confirm',
+        payload: {},
+        timestamp: Date.now()
+      });
+    }
+  }
 
   const sentCount = broadcastToCrew(code, message);
 
@@ -445,17 +476,58 @@ wss.on('connection', (ws, req) => {
           const msgSender = devices.get(deviceId);
           if (!msgSender || !msgSender.crew_code) break;
 
+          const crewCode = msgSender.crew_code;
+          const msgType = data.msg_type || 'text';
+
+          // Track hang proposals per crew so affirmative texts can auto-confirm
+          if (msgType === 'hang_propose') {
+            const payload = data.payload || {};
+            pendingHangs.set(crewCode, {
+              datetime: payload.datetime || '',
+              description: payload.description || '',
+              proposer: msgSender.device_name,
+              proposed_at: Date.now()
+            });
+            console.log(`[HANG] Crew ${crewCode}: hang proposed by ${msgSender.device_name} for ${payload.datetime}`);
+          }
+
+          // Auto-confirm hang if a text message is affirmative and a hang is pending
+          if (msgType === 'text') {
+            const text = (data.payload || {}).text || '';
+            const pending = pendingHangs.get(crewCode);
+            // Only auto-confirm if hang was proposed within the last 24 hours
+            if (pending && isAffirmative(text) && (Date.now() - pending.proposed_at) < 86400000) {
+              console.log(`[HANG] Crew ${crewCode}: auto-confirming hang — "${text}" from ${msgSender.device_name}`);
+              pendingHangs.delete(crewCode);
+              // Broadcast hang_confirm to ALL devices in the crew (including sender)
+              broadcastToCrew(crewCode, {
+                type: 'message',
+                from_device: deviceId,
+                from_name: msgSender.device_name,
+                msg_type: 'hang_confirm',
+                payload: {},
+                timestamp: Date.now()
+              });
+            }
+          }
+
+          // Also clear pending hang when an explicit hang_confirm arrives
+          if (msgType === 'hang_confirm') {
+            pendingHangs.delete(crewCode);
+            console.log(`[HANG] Crew ${crewCode}: hang explicitly confirmed by ${msgSender.device_name}`);
+          }
+
           const relayMsg = {
             type: 'message',
             from_device: deviceId,
             from_name: msgSender.device_name,
-            msg_type: data.msg_type || 'text',
+            msg_type: msgType,
             payload: data.payload || {},
             timestamp: Date.now()
           };
 
-          const count = broadcastToCrew(msgSender.crew_code, relayMsg, deviceId);
-          console.log(`[MSG] ${msgSender.device_name} sent ${data.msg_type || 'text'} to ${count} devices`);
+          const count = broadcastToCrew(crewCode, relayMsg, deviceId);
+          console.log(`[MSG] ${msgSender.device_name} sent ${msgType} to ${count} devices`);
           break;
         }
 
