@@ -1083,14 +1083,13 @@ class LeelooBrain:
             dt_str = intent.params.get('datetime', '')
             desc = intent.params.get('description', '')
             print(f"[BRAIN] Hang propose: {dt_str} {desc}")
-            # Phase 5: send via WebSocket
-            if self.ws_client and dt_str:
-                pass  # await self.ws_client.send_hang_propose(dt_str)
+            if self.ws_client and self.ws_client.connected and dt_str:
+                await self.ws_client.send_hang_propose(dt_str, desc)
             self._expand_task = asyncio.create_task(
                 self.expand_frame(
                     FrameType.MESSAGES,
                     [
-                        ("hang proposed", "large", COLORS['lavender']),
+                        ("hang proposed!", "large", COLORS['lavender']),
                         ("", None, None),
                         *self._format_display_text(intent.response_text, COLORS['white']),
                     ],
@@ -1100,6 +1099,8 @@ class LeelooBrain:
         elif action == "HANG_CONFIRM":
             print("[BRAIN] Hang confirmed")
             await self.led.ack()
+            if self.ws_client and self.ws_client.connected:
+                await self.ws_client.send_hang_confirm()
             self._expand_task = asyncio.create_task(
                 self.expand_frame(
                     FrameType.MESSAGES,

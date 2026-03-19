@@ -104,12 +104,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Welcome to LEELOO, {user.first_name}!\n\n"
         "LEELOO is a music sharing device that lets you and your "
         "friends push songs to each other.\n\n"
-        "**What would you like to do?**"
+        "**Got a crew code? Tap below to join.**\n"
+        "_(If you just set up a device, scan the QR code on its screen instead.)_"
     )
 
     keyboard = [
-        [InlineKeyboardButton("Create New Crew", callback_data='create_crew')],
-        [InlineKeyboardButton("Join Existing Crew", callback_data='join_crew')],
+        [InlineKeyboardButton("Have a crew code? Join here →", callback_data='join_crew')],
+        [InlineKeyboardButton("Start a new crew", callback_data='create_crew')],
     ]
 
     if user_id in user_state and user_state[user_id].get('crew_code'):
