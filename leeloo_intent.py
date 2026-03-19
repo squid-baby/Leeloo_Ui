@@ -21,6 +21,7 @@ Actions:
 import json
 import asyncio
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Dict, Any, Optional, Callable
 
 try:
@@ -49,7 +50,7 @@ Action details:
 - MESSAGE_READOUT: User asks "what did I miss" or "any messages" or "read messages". Set params.readout=true.
 - ALBUM_INFO: User asks about current song/artist. display_text = 2-3 fun sentences about the artist/track using the music data provided. Be conversational and interesting.
 - SONG_PUSH: User wants to share/send a specific song. Extract params.query (search terms for Spotify). If they say "send this song" with no specifics, set params.current=true.
-- HANG_PROPOSE: User wants to schedule hanging out. Extract params.datetime (ISO format) and params.description. If vague like "this weekend", make reasonable assumptions. display_text = short confirmation of what was proposed, from the proposer's POV, e.g. "saturday 8pm – your place?" — NOT "let me know if that works".
+- HANG_PROPOSE: User wants to schedule hanging out. Extract params.datetime (ISO format, always use the current year from context unless the user specifies otherwise — never default to a past year) and params.description. If vague like "this weekend", make reasonable assumptions. display_text = short confirmation of what was proposed, from the proposer's POV, e.g. "saturday 8pm – your place?" — NOT "let me know if that works".
 - HANG_CONFIRM: User confirms/agrees to a hang ("I'm in", "yes", "sounds good", "confirmed", etc.). Set params.confirm=true. display_text = short enthusiastic confirmation, e.g. "you're in!" or "locked in."
 - NUDGE: User wants to nudge/wink/poke friends. Set params.nudge=true.
 - TELEGRAM_SETUP: User asks about Telegram setup, how to message from phone, or how to connect Telegram. Set params.telegram=true.
@@ -174,6 +175,9 @@ def build_context(weather_data=None, music_data=None, contacts=None, messages=No
     This is called by LeelooBrain to provide current device state.
     """
     parts = []
+
+    # Current date (so Haiku can resolve relative dates like "March 27" to the correct year)
+    parts.append(f"Today: {datetime.now().strftime('%Y-%m-%d %A')}")
 
     # Weather
     if weather_data:

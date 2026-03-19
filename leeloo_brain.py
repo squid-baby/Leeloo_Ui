@@ -214,6 +214,9 @@ class LeelooBrain:
         self._expand_task = None  # Current expand/hold/collapse task
         self._welcome_qr_active = False  # Prevents display loop from overwriting QR
 
+        # Hang scheduling
+        self._pending_hang_dt = None  # ISO datetime string of proposed hang (set on propose, cleared on confirm)
+
         # Fonts for typewriter
         try:
             self.font = ImageFont.truetype(
@@ -389,22 +392,40 @@ class LeelooBrain:
         asyncio.ensure_future(self.led.nudge(duration=30))
 
     def _on_ws_hang_propose(self, sender, datetime_str, description):
-        """Handle incoming hang proposal"""
+        """Handle incoming hang proposal — save datetime so confirmer can write it"""
         print(f"[BRAIN] Hang proposal from {sender}: {datetime_str}")
+        if datetime_str:
+            self._pending_hang_dt = datetime_str
+        # Format datetime for display: "fri mar 27 · 7:00pm"
+        display_dt = datetime_str
+        try:
+            dt = datetime.fromisoformat(datetime_str)
+            display_dt = dt.strftime("%a %b %-d · %-I:%M%p").lower()
+        except Exception:
+            pass
+        display_line = f"{display_dt} {description}".strip()
         lines = [
             (f"{sender.lower()} wants to", "large", COLORS['lavender']),
             ("hang!", "large", COLORS['lavender']),
             ("", None, None),
-            *self._format_display_text(f"{datetime_str} {description}".strip(), COLORS['white']),
+            *self._format_display_text(display_line, COLORS['white']),
         ]
         self._expand_task = asyncio.ensure_future(
             self.expand_frame(FrameType.MESSAGES, lines, duration=EXPANDED_HOLD_DURATION)
         )
 
     def _on_ws_hang_confirm(self, sender):
-        """Handle incoming hang confirmation"""
+        """Handle incoming hang confirmation — proposer side: lock in the hang time"""
         print(f"[BRAIN] Hang confirmed by {sender}!")
         asyncio.ensure_future(self.led.ack())
+        if self._pending_hang_dt:
+            try:
+                hang_dt = datetime.fromisoformat(self._pending_hang_dt)
+                set_next_hang(hang_dt, set_by="voice")
+                print(f"[BRAIN] Next hang saved: {self._pending_hang_dt}")
+            except Exception as e:
+                print(f"[BRAIN] Failed to save hang time: {e}")
+            self._pending_hang_dt = None
         lines = [
             ("hang confirmed!", "large", COLORS['lavender']),
             ("", None, None),
@@ -1082,7 +1103,20 @@ class LeelooBrain:
         elif action == "HANG_PROPOSE":
             dt_str = intent.params.get('datetime', '')
             desc = intent.params.get('description', '')
+            # Haiku can't reason past its training cutoff — if the date is in the past,
+            # advance it year-by-year until it's in the future
+            if dt_str:
+                try:
+                    hang_dt = datetime.fromisoformat(dt_str)
+                    now = datetime.now()
+                    while hang_dt < now:
+                        hang_dt = hang_dt.replace(year=hang_dt.year + 1)
+                    dt_str = hang_dt.isoformat()
+                except Exception:
+                    pass
             print(f"[BRAIN] Hang propose: {dt_str} {desc}")
+            if dt_str:
+                self._pending_hang_dt = dt_str
             if self.ws_client and self.ws_client.connected and dt_str:
                 await self.ws_client.send_hang_propose(dt_str, desc)
             self._expand_task = asyncio.create_task(
@@ -1099,6 +1133,14 @@ class LeelooBrain:
         elif action == "HANG_CONFIRM":
             print("[BRAIN] Hang confirmed")
             await self.led.ack()
+            if self._pending_hang_dt:
+                try:
+                    hang_dt = datetime.fromisoformat(self._pending_hang_dt)
+                    set_next_hang(hang_dt, set_by="voice")
+                    print(f"[BRAIN] Next hang saved: {self._pending_hang_dt}")
+                except Exception as e:
+                    print(f"[BRAIN] Failed to save hang time: {e}")
+                self._pending_hang_dt = None
             if self.ws_client and self.ws_client.connected:
                 await self.ws_client.send_hang_confirm()
             self._expand_task = asyncio.create_task(
