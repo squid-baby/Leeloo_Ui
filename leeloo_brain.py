@@ -316,8 +316,18 @@ class LeelooBrain:
         self.ws_client.on_member_offline = self._on_member_offline
         self.ws_client.on_spotify_auth = self._on_spotify_auth
 
+    @staticmethod
+    def _ws_str(value, default=""):
+        """WebSocket callback args are relay data: return value if it is a
+        non-blank string, else default (None/empty/non-str are replaced)."""
+        if isinstance(value, str) and value.strip():
+            return value
+        return default
+
     def _on_ws_message(self, sender, text):
         """Handle incoming crew message — detect music mentions and show album art"""
+        sender = self._ws_str(sender, "someone")
+        text = self._ws_str(text)
         print(f"[BRAIN] Message from {sender}: {text}")
         self.message_mgr.add_message(sender, text)
 
@@ -361,16 +371,24 @@ class LeelooBrain:
 
     def _on_ws_reaction(self, sender, reaction_type):
         """Handle incoming reaction"""
+        sender = self._ws_str(sender, "someone")
+        reaction_type = self._ws_str(reaction_type, "love")
         print(f"[BRAIN] Reaction from {sender}: {reaction_type}")
         asyncio.ensure_future(self.led.ack())
         # TODO: play reaction animation (love/fire ASCII art)
 
     def _on_ws_song_push(self, sender, payload):
         """Handle incoming song push — download album art + scancode"""
-        artist = payload.get('artist', '')
-        track = payload.get('track', '')
-        note = payload.get('note', '')
-        spotify_uri = payload.get('spotify_uri', '')
+        sender = self._ws_str(sender, "someone")
+        if not isinstance(payload, dict):
+            payload = {}
+        artist = self._ws_str(payload.get('artist'))
+        track = self._ws_str(payload.get('track'))
+        note = self._ws_str(payload.get('note'))
+        spotify_uri = self._ws_str(payload.get('spotify_uri'))
+        if not (spotify_uri or artist or track):
+            print(f"[BRAIN] Ignoring empty song push from {sender}")
+            return
         print(f"[BRAIN] Song from {sender}: {artist} - {track}")
 
         # LED notification
@@ -409,11 +427,15 @@ class LeelooBrain:
 
     def _on_ws_nudge(self, sender):
         """Handle incoming nudge"""
+        sender = self._ws_str(sender, "someone")
         print(f"[BRAIN] Nudge from {sender}!")
         asyncio.ensure_future(self.led.nudge(duration=30))
 
     def _on_ws_hang_propose(self, sender, datetime_str, description):
         """Handle incoming hang proposal — save datetime so confirmer can write it"""
+        sender = self._ws_str(sender, "someone")
+        datetime_str = self._ws_str(datetime_str)
+        description = self._ws_str(description)
         print(f"[BRAIN] Hang proposal from {sender}: {datetime_str}")
         if datetime_str:
             self._pending_hang_dt = datetime_str
@@ -435,6 +457,7 @@ class LeelooBrain:
 
     def _on_ws_hang_confirm(self, sender):
         """Handle incoming hang confirmation — proposer side: lock in the hang time"""
+        sender = self._ws_str(sender, "someone")
         print(f"[BRAIN] Hang confirmed by {sender}!")
         asyncio.ensure_future(self.led.ack())
         if self._pending_hang_dt:
@@ -1513,6 +1536,87 @@ Examples:
             print(f"[BRAIN] Music detection classify error: {e}")
             return None
 
+    @staticmethod
+    def _pick_spotify_track(query, tracks):
+        """Pick the best *validated* Spotify search result for query, or None.
+
+        Spotify returns fuzzy matches for anything, so a result is only
+        accepted when it really matches the query:
+        - 2+ significant words (>2 chars): at least one contiguous word pair
+          (bigram) must appear in "artist track". This prevents
+          "bed michael jackson" matching "Michael Perry...Long Beds...Jackson"
+        - 1 significant word: that word must appear as a whole word
+        - only short words (e.g. "U2"): the query (minus filler words) must
+          appear as a whole word/phrase in the artist or track name; the
+          first such result in Spotify's order is used
+        """
+        import re
+        ignore_words = {'the', 'a', 'an', 'by', 'and', 'or', 'with', 'to', 'from'}
+        words = query.lower().split()
+        query_words = [w for w in words if w not in ignore_words and len(w) > 2]
+
+        def _names(t):
+            artists = t.get('artists') or [{}]
+            a = (artists[0].get('name') or '').lower()
+            n = (t.get('name') or '').lower()
+            return a, n
+
+        if not query_words:
+            core = " ".join(w for w in words if w not in ignore_words)
+            if not re.search(r'\w', core):
+                print(f"[BRAIN] Query too vague to validate: '{query}'")
+                return None
+            pattern = re.compile(r'(?<!\w)' + re.escape(core) + r'(?!\w)')
+            for t in tracks:
+                a, n = _names(t)
+                if pattern.search(a) or pattern.search(n):
+                    return t
+            print(f"[BRAIN] Poor match for '{query}': not found in artist/track names of top results")
+            return None
+
+        def _score_result(t):
+            """Returns (bigram_matches, word_matches) tuple."""
+            a, n = _names(t)
+            combined = f"{a} {n}"
+            result_words = set(re.findall(r'\w+', combined))
+
+            # Count whole-word matches
+            word_hits = sum(1 for w in query_words if w in result_words)
+
+            # Count bigram (contiguous pair) matches
+            bigram_hits = 0
+            if len(query_words) >= 2:
+                for i in range(len(query_words) - 1):
+                    bigram = f"{query_words[i]} {query_words[i+1]}"
+                    if bigram in combined:
+                        bigram_hits += 1
+
+            return (bigram_hits, word_hits)
+
+        # Score all results and pick the best
+        best_track = None
+        best_score = (0, 0)
+        for t in tracks:
+            score = _score_result(t)
+            if score > best_score:
+                best_score = score
+                best_track = t
+
+        # Guard: no result contains any query word (single-word queries
+        # need exactly that, so they are fully validated here)
+        if best_track is None:
+            print(f"[BRAIN] Poor match for '{query}': no query word found in top results")
+            return None
+
+        # 2+ word queries: require at least one bigram match
+        if len(query_words) >= 2 and best_score[0] == 0:
+            a, n = _names(best_track)
+            print(f"[BRAIN] Poor match for '{query}': got '{a} - {n}'")
+            print("[BRAIN] No contiguous word pairs matched (bigram check failed)")
+            return None
+
+        return best_track
+
     async def _search_spotify_display_only(self, query, pushed_by=None):
         """Search Spotify and update album art display WITHOUT pushing to crew.
         Used for incoming messages that mention music.
@@ -1532,6 +1636,7 @@ Examples:
                 ALBUM_ART_DIR, CURRENT_MUSIC_FILE
             )
             from leeloo_album_art import download_and_create_album_art
+            from leeloo_fileutil import atomic_write_json
 
             loop = asyncio.get_event_loop()
             is_uri = query.startswith('spotify:track:')
@@ -1585,38 +1690,10 @@ Examples:
                         print(f"[BRAIN] No tracks found for: {query}")
                         return None
 
-                    # Bigram validation (same as _search_and_push_song)
-                    import re as _re
-                    _ignore = {'the', 'a', 'an', 'by', 'and', 'or', 'with', 'to', 'from'}
-                    _qwords = [w for w in query.lower().split() if w not in _ignore and len(w) > 2]
-
-                    best_track = None
-                    best_score = (0, 0)
-                    for t in tracks:
-                        a = t['artists'][0]['name'].lower() if t.get('artists') else ''
-                        n = t['name'].lower()
-                        combined = f"{a} {n}"
-                        rwords = set(_re.findall(r'\w+', combined))
-                        whits = sum(1 for w in _qwords if w in rwords)
-                        bhits = 0
-                        if len(_qwords) >= 2:
-                            for i in range(len(_qwords) - 1):
-                                if f"{_qwords[i]} {_qwords[i+1]}" in combined:
-                                    bhits += 1
-                        s = (bhits, whits)
-                        if s > best_score:
-                            best_score = s
-                            best_track = t
-
-                    if _qwords:
-                        if len(_qwords) >= 2 and best_score[0] == 0:
-                            print(f"[BRAIN] Poor match for '{query}': no bigram match in top 5")
-                            return None
-                        elif len(_qwords) == 1 and best_score[1] == 0:
-                            print(f"[BRAIN] Poor match for '{query}': word not found in top 5")
-                            return None
-
-                    track = best_track
+                    # Validate (same rules as _search_and_push_song)
+                    track = self._pick_spotify_track(query, tracks)
+                    if track is None:
+                        return None
 
                 artist = track['artists'][0]['name'] if track.get('artists') else 'Unknown'
                 track_name = track['name']
@@ -1660,8 +1737,11 @@ Examples:
                     'timestamp': _time.time(),
                 }
 
-                with open(CURRENT_MUSIC_FILE, 'w') as f:
-                    json.dump(result, f, indent=2)
+                # Atomic, and under the refresh path's lock (update_music_display
+                # read-modify-writes this file). Executor thread: never already
+                # holding the lock, and no await while holding it.
+                with self._music_lock:
+                    atomic_write_json(CURRENT_MUSIC_FILE, result, indent=2)
 
                 return result
 
@@ -1768,6 +1848,7 @@ Write ONLY the 65-word paragraph, no preamble or explanation."""
                 ALBUM_ART_DIR, CURRENT_MUSIC_FILE
             )
             from leeloo_album_art import download_and_create_album_art
+            from leeloo_fileutil import atomic_write_json
 
             # Get client credentials token
             loop = asyncio.get_event_loop()
@@ -1809,64 +1890,10 @@ Write ONLY the 65-word paragraph, no preamble or explanation."""
                     print(f"[BRAIN] No tracks found for: {query}")
                     return None
 
-                # Validate results — require contiguous word pairs (bigrams)
-                # from the query to appear in artist+track. This prevents
-                # "bed michael jackson" matching "Michael Perry...Long Beds...Jackson"
-                import re
-                ignore_words = {'the', 'a', 'an', 'by', 'and', 'or', 'with', 'to', 'from'}
-                query_words = [w for w in query.lower().split() if w not in ignore_words and len(w) > 2]
-
-                def _score_result(t):
-                    """Score a Spotify result against query words.
-                    Returns (bigram_matches, word_matches) tuple."""
-                    a = t['artists'][0]['name'].lower() if t.get('artists') else ''
-                    n = t['name'].lower()
-                    combined = f"{a} {n}"
-                    result_words = set(re.findall(r'\w+', combined))
-
-                    # Count whole-word matches
-                    word_hits = sum(1 for w in query_words if w in result_words)
-
-                    # Count bigram (contiguous pair) matches
-                    bigram_hits = 0
-                    if len(query_words) >= 2:
-                        for i in range(len(query_words) - 1):
-                            bigram = f"{query_words[i]} {query_words[i+1]}"
-                            if bigram in combined:
-                                bigram_hits += 1
-
-                    return (bigram_hits, word_hits)
-
-                # Score all results and pick the best
-                best_track = None
-                best_score = (0, 0)
-                for t in tracks:
-                    score = _score_result(t)
-                    if score > best_score:
-                        best_score = score
-                        best_track = t
-
-                # Guard: no tracks returned at all
-                if best_track is None:
-                    print(f"[BRAIN] No tracks found for '{query}'")
+                # Validate results (bigram / whole-word / short-query rules)
+                track = self._pick_spotify_track(query, tracks)
+                if track is None:
                     return None
-
-                # Validation: for 2+ word queries, require at least one bigram match.
-                # For single-word queries, require the word to match.
-                if query_words:
-                    if len(query_words) >= 2 and best_score[0] == 0:
-                        a = best_track['artists'][0]['name'] if best_track.get('artists') else '?'
-                        n = best_track['name']
-                        print(f"[BRAIN] Poor match for '{query}': got '{a} - {n}'")
-                        print(f"[BRAIN] No contiguous word pairs matched (bigram check failed)")
-                        return None
-                    elif len(query_words) == 1 and best_score[1] == 0:
-                        a = best_track['artists'][0]['name'] if best_track.get('artists') else '?'
-                        n = best_track['name']
-                        print(f"[BRAIN] Poor match for '{query}': got '{a} - {n}'")
-                        return None
-
-                track = best_track
                 artist = track['artists'][0]['name'] if track.get('artists') else 'Unknown'
                 track_name = track['name']
                 album = track.get('album', {}).get('name', '')
@@ -1910,8 +1937,10 @@ Write ONLY the 65-word paragraph, no preamble or explanation."""
                     'timestamp': _time.time(),
                 }
 
-                with open(CURRENT_MUSIC_FILE, 'w') as f:
-                    json.dump(result, f, indent=2)
+                # Atomic, and under the refresh path's lock (see
+                # _search_spotify_display_only). Executor thread, no await.
+                with self._music_lock:
+                    atomic_write_json(CURRENT_MUSIC_FILE, result, indent=2)
 
                 return result
 
@@ -2101,12 +2130,24 @@ Write ONLY the 65-word paragraph, no preamble or explanation."""
         if not device_id:
             print("[BRAIN] WARNING: No device_id yet for Spotify OAuth URL")
             device_id = 'leeloo_unknown'
-        client_id = "f8c3c0120e694af283d7d7f7c2f67d4c"
+        # Same app as token refresh (leeloo_music_manager loads it from .env);
+        # a mismatch makes every refresh fail with invalid_client
+        client_id = ""
+        try:
+            import leeloo_music_manager
+            client_id = leeloo_music_manager.SPOTIFY_CLIENT_ID or ""
+        except Exception as e:
+            print(f"[BRAIN] Could not read SPOTIFY_CLIENT_ID from music manager: {e}")
+        if client_id:
+            print("[BRAIN] Spotify OAuth client ID: from SPOTIFY_CLIENT_ID (.env/environment)")
+        else:
+            client_id = "f8c3c0120e694af283d7d7f7c2f67d4c"
+            print("[BRAIN] Spotify OAuth client ID: SPOTIFY_CLIENT_ID not set, using built-in default")
         redirect_uri = "https://leeloobot.xyz/spotify/callback"
         scopes = "user-read-currently-playing user-read-playback-state"
         return (
             f"https://accounts.spotify.com/authorize?"
-            f"client_id={client_id}&"
+            f"client_id={quote(client_id)}&"
             f"response_type=code&"
             f"redirect_uri={quote(redirect_uri)}&"
             f"scope={quote(scopes)}&"
@@ -2390,6 +2431,14 @@ Write ONLY the 65-word paragraph, no preamble or explanation."""
 
             except Exception as e:
                 print(f"[BRAIN] WebSocket error: {e}")
+
+            # Close the old socket before reconnecting — otherwise it stays
+            # open and the relay keeps a ghost connection for this device
+            if self.ws_client.websocket is not None:
+                try:
+                    await self.ws_client.disconnect()
+                except Exception as e:
+                    print(f"[BRAIN] WebSocket close error: {e}")
 
             # Exponential backoff
             print(f"[BRAIN] Reconnecting in {retry_delay}s...")
