@@ -10,19 +10,59 @@ import re
 import time
 import requests
 import base64
-from pathlib import Path
 
 # Import centralized album art utility
 from leeloo_album_art import download_and_create_album_art
 
-LEELOO_HOME = "/home/pi/leeloo-ui"
+LEELOO_HOME = os.environ.get("LEELOO_HOME", "/home/pi/leeloo-ui")  # same override as leeloo_brain
 TOKENS_FILE = os.path.join(LEELOO_HOME, "spotify_tokens.json")
 CURRENT_MUSIC_FILE = os.path.join(LEELOO_HOME, "current_music.json")
 ALBUM_ART_DIR = os.path.join(LEELOO_HOME, "album_art")
 SPOTIFY_API_BASE = "https://api.spotify.com/v1"
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
-SPOTIFY_CLIENT_ID = "f8c3c0120e694af283d7d7f7c2f67d4c"
-SPOTIFY_CLIENT_SECRET = "9d6018d89a254d668dc18c8844e2a2d8"
+ENV_FILE = os.path.join(LEELOO_HOME, ".env")
+
+
+def load_env_defaults(env_path=ENV_FILE):
+    """Load KEY=VALUE pairs from .env into os.environ, never overriding a key
+    that is already set, even to an empty string (an operator can export
+    KEY= to disable it). Same format/quote stripping as LeelooBrain._load_env.
+
+    This module can be imported before leeloo_brain loads .env, or run
+    standalone, so it reads the file itself. Returns the keys it set.
+    """
+    loaded = []
+    try:
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if key and value and key not in os.environ:
+                        os.environ[key] = value
+                        loaded.append(key)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[MUSIC] Error reading {env_path}: {e}")
+    return loaded
+
+
+# Spotify app credentials come ONLY from the environment / .env (never hardcode them)
+load_env_defaults()
+SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "")
+SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
+if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+    print(f"[MUSIC] WARNING: SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET not set (add them to {ENV_FILE}). "
+          "Token refresh and artist lookups are disabled.")
+
+
+def _have_spotify_credentials():
+    """True when both Spotify app credentials are configured"""
+    return bool(SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET)
+
 
 # (Shared music no longer has a fixed timeout — now-playing always overrides it)
 
@@ -51,6 +91,9 @@ def refresh_access_token():
     tokens = load_tokens()
     if not tokens or 'refresh_token' not in tokens:
         return None
+    if not _have_spotify_credentials():
+        print("   ⚠️  Can't refresh token: Spotify client credentials missing from .env")
+        return None
 
     try:
         auth_str = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}"
@@ -59,7 +102,8 @@ def refresh_access_token():
         response = requests.post(
             SPOTIFY_TOKEN_URL,
             data={'grant_type': 'refresh_token', 'refresh_token': tokens['refresh_token']},
-            headers={'Authorization': f'Basic {auth_b64}', 'Content-Type': 'application/x-www-form-urlencoded'}
+            headers={'Authorization': f'Basic {auth_b64}', 'Content-Type': 'application/x-www-form-urlencoded'},
+            timeout=10
         )
 
         if response.status_code == 200:
@@ -161,7 +205,6 @@ def get_currently_playing():
         return None
 
     headers = {"Authorization": f"Bearer {tokens.get('access_token')}"}
-    access_token = tokens.get('access_token')
 
     try:
         response = requests.get(f"{SPOTIFY_API_BASE}/me/player/currently-playing", headers=headers, timeout=5)
@@ -171,7 +214,6 @@ def get_currently_playing():
             print("   Access token expired, refreshing...")
             new_token = refresh_access_token()
             if new_token:
-                access_token = new_token
                 headers = {"Authorization": f"Bearer {new_token}"}
                 response = requests.get(f"{SPOTIFY_API_BASE}/me/player/currently-playing", headers=headers, timeout=5)
 
@@ -222,6 +264,9 @@ def get_listeners_for_artist_name(artist_name):
     Look up monthly listeners for an artist by name (for shared music).
     Searches Spotify, gets artist ID, then scrapes.
     """
+    if not _have_spotify_credentials():
+        return None
+
     try:
         # Use client credentials to search (no user token needed)
         auth_str = f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}"
