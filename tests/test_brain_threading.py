@@ -161,9 +161,8 @@ async def test_update_music_in_thread_switches_ambient(env, monkeypatch):
     result = {"artist": "a", "track": "t", "is_playing": True}
     monkeypatch.setattr(leeloo_music_manager, "update_music_display",
                         lambda: result, raising=False)
-    # Two ticks: the Spotify branch returns right after fetching; the next
-    # tick (inside the poll interval) syncs the ambient LED
-    await brain._loop.run_in_executor(None, brain._update_music)
+    # One tick is enough: the ambient LED is synced after every refresh,
+    # including the Spotify branch
     await brain._loop.run_in_executor(None, brain._update_music)
     assert brain._led_ambient_state == "playing"
     await wait_for(lambda: brain.led._ambient_state == "playing")
@@ -788,3 +787,118 @@ async def test_frame_animator_missing_framebuffer_does_not_crash(tmp_path):
     animator = FrameAnimator(display=None, box_right=230, fb_path=str(tmp_path / "missing"))
     await animator.async_expand(FrameType.WEATHER)
     assert not os.path.exists(tmp_path / "missing")
+
+
+# -----------------------------------------------------------------------------
+# _update_music is serialised across executor threads
+# -----------------------------------------------------------------------------
+
+class _FakeSpotify:
+    """update_music_display stand-in: counts calls and overlap, and can block
+    until released so tests control when a fetch finishes."""
+
+    def __init__(self, block=False):
+        self.calls = 0
+        self.active = 0
+        self.max_active = 0
+        self.started = threading.Event()
+        self.release = threading.Event()
+        if not block:
+            self.release.set()
+        self._guard = threading.Lock()
+        self.track = "t1"
+
+    def __call__(self):
+        with self._guard:
+            self.calls += 1
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            track = self.track  # data as of when the request was made
+        self.started.set()
+        try:
+            assert self.release.wait(5.0)
+            time.sleep(0.02)  # widen the overlap window if there is one
+            return {"artist": "a", "track": track, "is_playing": True}
+        finally:
+            with self._guard:
+                self.active -= 1
+
+
+@pytest.fixture
+def spotify(env, monkeypatch):
+    brain = env
+    (brain.tmp_path / "spotify_tokens.json").write_text("{}")
+    import leeloo_music_manager
+    fake = _FakeSpotify(block=True)
+    monkeypatch.setattr(leeloo_music_manager, "update_music_display", fake, raising=False)
+    monkeypatch.setattr(leeloo_brain, "get_album_art_path", lambda result: None)
+    return fake
+
+
+async def test_update_music_never_runs_concurrently(env, spotify):
+    """Collapse refresh + display tick at once: one Spotify call, not two
+    overlapping ones (both could refresh/rewrite spotify_tokens.json)."""
+    brain = env
+    loop = asyncio.get_running_loop()
+    brain._loop = loop
+    brain.last_music_fetch = 0
+    first = loop.run_in_executor(None, brain._update_music)
+    assert await loop.run_in_executor(None, spotify.started.wait, 2.0)
+    # The tick arrives while the first fetch is still on the network
+    # (last_music_fetch is not "fresh" yet)
+    second = loop.run_in_executor(None, brain._update_music)
+    await asyncio.sleep(0.05)
+    assert spotify.calls == 1  # second caller waits on the lock
+    spotify.release.set()
+    await asyncio.wait_for(asyncio.gather(first, second), timeout=3.0)
+    assert spotify.max_active == 1
+    # The waiter re-checked the poll interval and skipped the duplicate call
+    assert spotify.calls == 1
+    assert brain.music_data["track"] == "t1"
+    assert brain.last_music_fetch > 0
+
+
+async def test_forced_refresh_during_inflight_fetch_is_not_lost(env, spotify):
+    """A forced refresh (last_music_fetch = 0) that arrives while another
+    fetch is on the network must fetch again afterwards — not be skipped
+    because the in-flight fetch stamped last_music_fetch = now."""
+    brain = env
+    loop = asyncio.get_running_loop()
+    brain._loop = loop
+    brain.last_music_fetch = 0
+    tick = loop.run_in_executor(None, brain._update_music)
+    assert await loop.run_in_executor(None, spotify.started.wait, 2.0)
+
+    # e.g. a pushed song: new data is available, force a refresh
+    spotify.track = "t2"
+    brain.last_music_fetch = 0
+    forced = loop.run_in_executor(None, brain._update_music)
+    await asyncio.sleep(0.05)
+    spotify.release.set()
+    await asyncio.wait_for(asyncio.gather(tick, forced), timeout=3.0)
+
+    assert spotify.calls == 2
+    assert spotify.max_active == 1
+    assert brain.music_data["track"] == "t2"
+    assert brain.last_music_fetch > 0
+
+
+async def test_update_music_respects_interval_after_fetch(env, spotify):
+    brain = env
+    loop = asyncio.get_running_loop()
+    brain._loop = loop
+    spotify.release.set()
+    brain.last_music_fetch = 0
+    await loop.run_in_executor(None, brain._update_music)
+    await loop.run_in_executor(None, brain._update_music)
+    assert spotify.calls == 1
+
+
+async def test_update_music_lock_is_not_the_display_lock(env):
+    """A slow Spotify call must never stall rendering."""
+    brain = env
+    assert brain._music_lock is not brain._display_lock
+    with brain._music_lock:
+        # Rendering still possible while a refresh holds the music lock
+        assert brain._display_lock.acquire(timeout=0.5)
+        brain._display_lock.release()

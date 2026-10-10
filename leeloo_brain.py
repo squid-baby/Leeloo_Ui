@@ -215,6 +215,7 @@ class LeelooBrain:
         # Animation
         self._expand_task = None  # Most recently started expansion task (see _start_expand_task)
         self._expand_tasks = set()  # All live expansion tasks (running or queued)
+        self._expand_cancel_sent = set()  # Live tasks already cancelled (see _cancel_expansions)
         self._expand_lock = None  # asyncio.Lock, created lazily on the loop (py3.9 binds at creation)
         self._welcome_qr_active = False  # Prevents display loop from overwriting QR
 
@@ -223,6 +224,11 @@ class LeelooBrain:
         # synchronous code (never across an await). RLock: _display_tick holds
         # it while calling _render_normal, which takes it too.
         self._display_lock = threading.RLock()
+
+        # Serialises _update_music (network + spotify_tokens.json) across
+        # executor threads. Separate from _display_lock so a slow Spotify call
+        # never stalls rendering. Never held across an await.
+        self._music_lock = threading.Lock()
 
         # Event loop (set in run()) — lets executor threads schedule coroutines
         self._loop = None
@@ -506,11 +512,27 @@ class LeelooBrain:
 
     def _update_music(self):
         """Refresh music data — uses Spotify OAuth if tokens exist, else reads cache file.
-        Uses tiered polling: faster when actively playing, slower when idle."""
+        Uses tiered polling: faster when actively playing, slower when idle.
+        Thread-safe: called from several executor threads (display tick,
+        expansion collapse, voice, message/song refreshes)."""
         # Don't overwrite album art while welcome QR is being displayed
         if self._welcome_qr_active:
             return
 
+        # One refresh at a time. Without this, e.g. a collapse's forced refresh
+        # and the next display tick (last_music_fetch is still 0 until the
+        # network call returns) both hit Spotify at once, and both may refresh
+        # the OAuth token — rewriting spotify_tokens.json non-atomically while
+        # the other thread reads it. A caller that waited re-checks the poll
+        # interval inside the lock, so it normally skips the duplicate call.
+        with self._music_lock:
+            self._refresh_music_data()
+
+        # Update ambient LED state based on current playback
+        self._sync_ambient_led()
+
+    def _refresh_music_data(self):
+        """Body of _update_music — caller holds self._music_lock."""
         now = time.time()
 
         # Tiered polling intervals based on playback state
@@ -525,6 +547,14 @@ class LeelooBrain:
             interval = 120  # 2 min - idle, check occasionally
 
         if now - self.last_music_fetch > interval:
+            # Claim this fetch with a unique non-zero marker (negative, so it
+            # still reads as "stale"). If someone forces a refresh (sets
+            # last_music_fetch = 0) while we are on the network, the marker is
+            # gone when we finish: we then leave 0 in place so the forced
+            # caller, waiting on the lock, fetches again instead of skipping
+            # with our possibly older data.
+            claim = -now
+            self.last_music_fetch = claim
             # Check if user has Spotify OAuth tokens for "currently playing"
             spotify_tokens_path = os.path.join(LEELOO_HOME, "spotify_tokens.json")
             if os.path.exists(spotify_tokens_path):
@@ -544,7 +574,7 @@ class LeelooBrain:
                             'last_updated': now,
                         }
                         self.album_art_path = get_album_art_path(result)
-                        self.last_music_fetch = now
+                        self._finish_music_fetch(claim, now)
                         return
                 except Exception as e:
                     print(f"[BRAIN] Spotify currently-playing error: {e}")
@@ -568,10 +598,12 @@ class LeelooBrain:
             else:
                 self.music_data = None
                 self.album_art_path = None
-            self.last_music_fetch = now
+            self._finish_music_fetch(claim, now)
 
-        # Update ambient LED state based on current playback
-        self._sync_ambient_led()
+    def _finish_music_fetch(self, claim, now):
+        """Record a completed fetch unless a forced refresh arrived meanwhile"""
+        if self.last_music_fetch == claim:
+            self.last_music_fetch = now
 
     def _sync_ambient_led(self):
         """Switch ambient LED breathe to match current playback state.
@@ -702,6 +734,7 @@ class LeelooBrain:
     def _on_expand_task_done(self, task):
         """Forget a finished expansion task and log unexpected errors"""
         self._expand_tasks.discard(task)
+        self._expand_cancel_sent.discard(task)
         if task.cancelled():
             return
         exc = task.exception()
@@ -711,10 +744,21 @@ class LeelooBrain:
     def _cancel_expansions(self):
         """Cancel all running and queued expansions (synchronous).
         Their finally blocks run on the next loop iterations; a new expansion
-        waits for them via the expansion lock."""
+        waits for them via the expansion lock.
+
+        Each task is cancelled only once: a second cancel would land inside
+        its finally (e.g. a second tap while the collapse refresh is still
+        running) and abort the music refresh and re-render, leaving the old
+        expanded frame on screen until the next display tick."""
         for task in list(self._expand_tasks):
-            if not task.done():
+            if not task.done() and task not in self._expand_cancel_sent:
+                self._expand_cancel_sent.add(task)
                 task.cancel()
+
+    def _has_live_expansion(self):
+        """True while any expansion task (running, queued, or still in its
+        finally) has not finished"""
+        return any(not task.done() for task in self._expand_tasks)
 
     async def expand_frame(self, frame_type: FrameType, content_lines, duration=EXPANDED_HOLD_DURATION):
         """
@@ -952,10 +996,17 @@ class LeelooBrain:
 
     async def _handle_single_tap(self):
         """Single tap — activate voice (or cancel current expansion)"""
-        if self.ui_state in (UIState.EXPANDED, UIState.EXPANDING, UIState.COLLAPSING):
+        if (self.ui_state in (UIState.EXPANDED, UIState.EXPANDING, UIState.COLLAPSING)
+                or self._has_live_expansion()):
             # Cancel current (and any queued) expansion — tap to dismiss.
             # COLLAPSING too: starting voice mid-collapse would let the
             # collapse's finally reset ui_state to NORMAL during recording.
+            # Any live expansion task counts, whatever ui_state says: a
+            # cancelled one's finally sets NORMAL before its (slow) music
+            # refresh and re-render, a newer one may be queued on the lock
+            # behind it, and the welcome flow is NORMAL while it builds a QR.
+            # Starting voice there would let the queued expansion take over
+            # the screen (and ui_state) mid-recording.
             self._cancel_expansions()
             return
 

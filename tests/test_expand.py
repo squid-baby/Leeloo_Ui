@@ -9,6 +9,7 @@ FrameAnimator, the typewriter, box_right and framebuffer writes are stubbed;
 LeelooBrain itself is real (hardware falls back to mock mode).
 """
 import asyncio
+import time
 
 import pytest
 from PIL import Image
@@ -157,7 +158,9 @@ async def test_two_crew_messages_regression(env, monkeypatch):
     assert ("collapse", FrameType.MESSAGES) not in tracker.events[:tracker.events.index(("end", "from amy"))]
 
     await wait_for(lambda: tracker.active == 0 and brain.ui_state == UIState.NORMAL, timeout=3.0)
-    assert brain._expand_tasks == set()
+    # The set is emptied by the task's done callback, which asyncio runs one
+    # loop iteration after the task finishes — wait for it, don't race it
+    await wait_for(lambda: brain._expand_tasks == set())
 
 
 async def test_same_iteration_requests_only_last_runs(env):
@@ -347,3 +350,163 @@ async def test_all_call_sites_use_helper():
     import re
     src = inspect.getsource(leeloo_brain)
     assert not re.search(r"(create_task|ensure_future)\(\s*self\.expand_frame", src)
+
+
+# -----------------------------------------------------------------------------
+# Single tap while an expansion is still alive but ui_state is already NORMAL
+# -----------------------------------------------------------------------------
+
+def _arm_voice(brain):
+    """Give the brain a 'voice' so an undismissed tap would start a session;
+    record such sessions instead of recording audio."""
+    sessions = []
+
+    async def fake_voice_interaction():
+        sessions.append(brain.ui_state)
+        brain.ui_state = UIState.LISTENING
+        try:
+            await asyncio.sleep(0.3)
+        finally:
+            brain.ui_state = UIState.NORMAL
+
+    brain.voice = object()
+    brain.intent_router = object()
+    brain._voice_interaction = fake_voice_interaction
+    return sessions
+
+
+def _slow_refresh_and_record_renders(brain, tracker, delay=0.4):
+    def slow_update_music():
+        time.sleep(delay)  # Spotify call in the executor (last_music_fetch = 0)
+    brain._update_music = slow_update_music
+
+    def recording_render():
+        tracker.events.append(("render", brain.ui_state))
+    brain._render_normal = recording_render
+
+
+async def test_tap_during_old_finally_with_queued_expansion_dismisses(env):
+    """Review finding: A is showing, B arrives (A cancelled, its finally runs
+    a slow refresh with ui_state already NORMAL, B queued on the lock). A tap
+    now must dismiss — cancel B — not start a voice session that B would
+    then draw over."""
+    brain, tracker = env
+    sessions = _arm_voice(brain)
+    _slow_refresh_and_record_renders(brain, tracker)
+
+    a = brain._start_expansion(FrameType.MESSAGES, lines("A"), duration=5.0)
+    await wait_for(lambda: brain.ui_state == UIState.EXPANDED)
+    b = brain._start_expansion(FrameType.ALBUM, lines("B"), duration=5.0)
+    await wait_for(lambda: ("end", "A") in tracker.events or brain.ui_state == UIState.NORMAL)
+    await asyncio.sleep(0.05)
+    # The window the finding describes: NORMAL, A still finishing, B queued
+    assert brain.ui_state == UIState.NORMAL
+    assert not a.done() and not b.done()
+
+    await brain._handle_single_tap()
+
+    await asyncio.wait_for(asyncio.gather(a, b, return_exceptions=True), timeout=3.0)
+    assert sessions == []  # no voice session
+    assert a.cancelled() and b.cancelled()
+    assert ("start", "B") not in tracker.events  # B never drew
+    assert brain.ui_state == UIState.NORMAL
+    # A's finally was not interrupted: its re-render still ran
+    assert ("render", UIState.NORMAL) in tracker.events
+
+
+async def test_second_tap_while_dismissed_expansion_finishes(env):
+    """A second tap during the dismissed expansion's slow refresh neither
+    starts voice nor aborts that expansion's re-render (cancel only once)."""
+    brain, tracker = env
+    sessions = _arm_voice(brain)
+    _slow_refresh_and_record_renders(brain, tracker)
+
+    a = brain._start_expansion(FrameType.MESSAGES, lines("A"), duration=5.0)
+    await wait_for(lambda: brain.ui_state == UIState.EXPANDED)
+    await brain._handle_single_tap()  # dismiss
+    await wait_for(lambda: brain.ui_state == UIState.NORMAL)
+    await asyncio.sleep(0.05)
+    assert not a.done()  # still in its finally (slow refresh)
+
+    await brain._handle_single_tap()  # second tap
+    assert sessions == []
+
+    await asyncio.wait_for(asyncio.gather(a, return_exceptions=True), timeout=3.0)
+    assert a.cancelled()
+    assert ("render", UIState.NORMAL) in tracker.events
+    assert sessions == []
+
+    # Once nothing is alive any more, a tap starts voice as usual
+    await wait_for(lambda: brain._expand_tasks == set())
+    await brain._handle_single_tap()
+    assert sessions == [UIState.NORMAL]
+
+
+async def test_tap_while_welcome_builds_qr_dismisses(env):
+    """The welcome flow is NORMAL while it builds its QR in the executor; a
+    tap then dismisses it instead of starting voice."""
+    brain, tracker = env
+    sessions = _arm_voice(brain)
+    _configure_welcome(brain)
+
+    def slow_qr(**kwargs):
+        time.sleep(0.3)
+        return None
+    brain._generate_qr_image = slow_qr
+
+    welcome = brain._launch_welcome_screen()
+    await asyncio.sleep(0.05)
+    assert brain.ui_state == UIState.NORMAL and not welcome.done()
+
+    await brain._handle_single_tap()
+    await asyncio.wait_for(asyncio.gather(welcome, return_exceptions=True), timeout=3.0)
+    assert welcome.cancelled()
+    assert sessions == []
+    assert ("start", "welcome nat!") not in tracker.events
+    assert brain._welcome_qr_active is False
+
+
+async def test_tap_with_no_live_expansion_starts_voice(env):
+    brain, tracker = env
+    sessions = _arm_voice(brain)
+    done = brain._start_expansion(FrameType.MESSAGES, lines("A"), duration=0.01)
+    await asyncio.wait_for(done, timeout=2.0)
+    await brain._handle_single_tap()
+    assert sessions == [UIState.NORMAL]
+    assert brain.ui_state == UIState.NORMAL
+
+
+async def test_cancel_expansions_cancels_each_task_once(env):
+    brain, tracker = env
+    a = brain._start_expansion(FrameType.MESSAGES, lines("A"), duration=5.0)
+    await wait_for(lambda: brain.ui_state == UIState.EXPANDED)
+    calls = []
+    real_cancel = a.cancel
+
+    def counting_cancel(*args):
+        calls.append(1)
+        return real_cancel(*args)
+    brain._expand_tasks = {_CancelSpy(a, counting_cancel)}
+    brain._cancel_expansions()
+    brain._cancel_expansions()
+    brain._cancel_expansions()
+    assert len(calls) == 1
+    await asyncio.wait_for(asyncio.gather(a, return_exceptions=True), timeout=2.0)
+    assert a.cancelled()
+
+
+class _CancelSpy:
+    """Wraps a task to count cancel() calls (C tasks don't allow patching)"""
+
+    def __init__(self, task, cancel):
+        self._task = task
+        self.cancel = cancel
+
+    def done(self):
+        return self._task.done()
+
+    def __hash__(self):
+        return hash(self._task)
+
+    def __eq__(self, other):
+        return self is other
