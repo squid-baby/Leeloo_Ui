@@ -87,14 +87,13 @@ class LeelooClient:
     def _save_config(self):
         """Save configuration"""
         try:
-            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
-            with open(self.config_path, 'w') as f:
-                json.dump({
-                    'device_id': self.config.device_id,
-                    'crew_id': self.config.crew_id,
-                    'crew_code': self.config.crew_code,
-                    'display_name': self.config.display_name
-                }, f)
+            # Power-safe: a torn crew_config.json would drop the device out of its crew
+            atomic_write_json(self.config_path, {
+                'device_id': self.config.device_id,
+                'crew_id': self.config.crew_id,
+                'crew_code': self.config.crew_code,
+                'display_name': self.config.display_name
+            })
             print(f"[CLIENT] Saved config")
         except Exception as e:
             print(f"[CLIENT] Could not save config: {e}")

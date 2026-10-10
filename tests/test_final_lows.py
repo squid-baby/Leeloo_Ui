@@ -86,3 +86,30 @@ def test_message_manager_saves_without_fsync(tmp_path, monkeypatch):
     mgr.add_message("amy", "hi")
     assert calls == []
     assert json.loads((tmp_path / "messages.json").read_text())
+
+
+def test_client_config_saved_atomically(tmp_path, monkeypatch):
+    import leeloo_client
+    calls = []
+    real = leeloo_client.atomic_write_json
+    monkeypatch.setattr(leeloo_client, "atomic_write_json",
+                        lambda path, data, **kw: (calls.append(path), real(path, data, **kw)))
+    path = tmp_path / "sub" / "crew_config.json"
+    client = LeelooClient(relay_url="ws://unused", config_path=str(path))
+    client.config.crew_code = "LEELOO-AB12"
+    client._save_config()
+    assert calls == [str(path)]
+    assert json.loads(path.read_text())["crew_code"] == "LEELOO-AB12"
+
+
+def test_geocode_writes_device_config_atomically():
+    import ast
+    import inspect
+    import geocode_zip
+    src = inspect.getsource(geocode_zip)
+    tree = ast.parse(src)
+    writes = [n for n in ast.walk(tree)
+              if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "open"
+              and len(n.args) > 1 and getattr(n.args[1], "value", "") == "w"]
+    assert writes == [], "geocode_zip must not write device_config.json in place"
+    assert "atomic_write_json(DEVICE_CONFIG_PATH" in src
