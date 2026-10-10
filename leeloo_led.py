@@ -101,14 +101,25 @@ class LEDManager:
         )
         self._set_color(dimmed)
 
+    @staticmethod
+    async def _cancel_and_wait(task):
+        """Cancel task and wait until it has really finished.
+
+        Waits via asyncio.wait() instead of `await task` + `except
+        CancelledError: pass`: that pattern can't tell the task's own
+        (expected) cancellation from a cancellation of the CALLER and would
+        swallow the latter (Python 3.9 has no Task.cancelling()). Here only
+        a cancel of the caller raises CancelledError, and it propagates."""
+        task.cancel()
+        await asyncio.wait([task])
+        if not task.cancelled() and task.exception() is not None:
+            print(f"[LED] task failed: {task.exception()!r}")
+
     async def _cancel_current(self):
-        """Cancel any running animation"""
-        if self._animation_task and not self._animation_task.done():
-            self._animation_task.cancel()
-            try:
-                await self._animation_task
-            except asyncio.CancelledError:
-                pass
+        """Cancel any running animation (a cancel of the caller propagates)"""
+        task = self._animation_task
+        if task and not task.done():
+            await self._cancel_and_wait(task)
         self._current_animation = None
 
     async def _run_animation(self, name, coro):
@@ -127,11 +138,27 @@ class LEDManager:
             coro.close()
             return
         self._current_animation = name
-        self._animation_task = asyncio.create_task(coro)
+        task = asyncio.create_task(coro)
+        self._animation_task = task
         try:
-            await self._animation_task
-        except asyncio.CancelledError:
-            pass
+            try:
+                # asyncio.wait, not `await task`: a CancelledError here can
+                # only mean OUR caller was cancelled (e.g. _voice_interaction
+                # cancelled during `await led.error()`) — never swallow that
+                await asyncio.wait([task])
+            except asyncio.CancelledError:
+                # Stop the animation too, wait for it so the finally below
+                # can restart ambient, then propagate the caller's cancel
+                task.cancel()
+                try:
+                    await asyncio.wait([task])
+                except asyncio.CancelledError:
+                    pass  # re-raised just below anyway
+                raise
+            if not task.cancelled():
+                task.result()  # propagate an animation error, as before
+            # else: superseded via _cancel_current (new animation, off(),
+            # recording guard) — a normal way for an animation to end
         finally:
             if self._current_animation == name:
                 self._set_color(OFF)
@@ -149,13 +176,17 @@ class LEDManager:
         while self._ambient_task is not None:
             task = self._ambient_task
             if not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+                # A cancel of the caller propagates (see _cancel_and_wait)
+                await self._cancel_and_wait(task)
             if self._ambient_task is task:
                 self._ambient_task = None
+
+    def _animation_alive(self):
+        """True while a transient animation owns the LEDs"""
+        return bool(
+            (self._animation_task and not self._animation_task.done())
+            or self._current_animation
+        )
 
     def _start_ambient_task(self):
         """Spawn the ambient breathe coroutine as a background task.
@@ -205,6 +236,18 @@ class LEDManager:
             # Only remember it — recording_finished() starts the breathe
             if state != self._ambient_state:
                 print(f"[LED] ambient → {state} (deferred until recording ends)")
+            self._ambient_state = state
+            return
+
+        if self._animation_alive():
+            # A transient animation (nudge, processing, listening, ...) owns
+            # the LEDs. Never cancel it for an ambient change (playback state
+            # changes arrive any time from the music updater) — only remember
+            # the state; the animation's end (_run_animation's finally, or
+            # off() after listening) restarts ambient with it, or not at all
+            # for None.
+            if state != self._ambient_state:
+                print(f"[LED] ambient → {state} (deferred until {self._current_animation or 'animation'} ends)")
             self._ambient_state = state
             return
 
