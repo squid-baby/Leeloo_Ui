@@ -197,7 +197,8 @@ recovery mode**:
   saved WiFi is retried (LCD: *"retrying wifi"*). This repeats until one of
   them works, so a temporary router outage doesn't strand the device.
 
-The portal web server only listens on the AP address (`192.168.4.1`) and is
+The portal web server only listens on the AP address (`192.168.4.1`; if that
+address isn't up after ~10s of retries it falls back to all interfaces) and is
 shut down as soon as setup succeeds; once `setup_complete` is true, its
 config-changing endpoints refuse requests (except WiFi re-entry in recovery
 mode).

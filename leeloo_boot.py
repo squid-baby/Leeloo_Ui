@@ -41,6 +41,7 @@ BOOT_WIFI_WAIT_S = 180           # Saved WiFi must come up within this at boot
 AUTOCONNECT_GRACE_S = 45         # Let NetworkManager autoconnect before we step in
 RECOVERY_PORTAL_WINDOW_S = 600   # Recovery portal waits this long for new WiFi details
 INTERNET_WAIT_S = 30             # After WiFi joins, wait this long for internet
+MIN_CONNECT_S = 30               # An active connect attempt always gets at least this long
 WIFI_POLL_S = 5
 
 
@@ -275,14 +276,16 @@ def boot_wifi_check(is_connected, connect_saved, sleep=time.sleep, clock=time.mo
     """
     True if WiFi is up within timeout_s. First give NetworkManager's own
     autoconnect a chance, then actively connect the saved network, then
-    wait out the rest of the time.
+    wait out the rest of the time. connect_saved(budget_s) gets the time
+    left (at least MIN_CONNECT_S) so a slow nmcli can't stretch the window.
     """
     start = clock()
     if wait_for_wifi(is_connected, min(grace_s, timeout_s), sleep, clock, poll_s):
         return True
     print("[BOOT] WiFi not up yet, connecting saved network...")
+    budget_s = max(timeout_s - (clock() - start), MIN_CONNECT_S)
     try:
-        if connect_saved():
+        if connect_saved(budget_s):
             return True
     except Exception as e:
         print(f"[BOOT] Saved WiFi connect error: {e}")
@@ -329,9 +332,9 @@ def ensure_wifi_or_recover():
     ssid = config.get('wifi_ssid')
     password = config.get('wifi_password')
 
-    def connect_saved():
+    def connect_saved(budget_s=None):
         from connect_saved_wifi import switch_to_wifi
-        return switch_to_wifi(ssid, password)
+        return switch_to_wifi(ssid, password, timeout_s=budget_s)
 
     show_splash(f"Connecting to {ssid or 'WiFi'}...", 35)
     if boot_wifi_check(is_wifi_up, connect_saved):

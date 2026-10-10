@@ -53,7 +53,7 @@ def test_wait_for_wifi_returns_when_connected():
 def test_boot_check_already_connected_does_nothing():
     fc = FakeClock()
     calls = []
-    assert boot.boot_wifi_check(lambda: True, lambda: calls.append(1),
+    assert boot.boot_wifi_check(lambda: True, lambda budget_s: calls.append(1),
                                 fc.sleep, fc.clock)
     assert calls == [] and fc.now == 0
 
@@ -61,7 +61,7 @@ def test_boot_check_already_connected_does_nothing():
 def test_boot_check_autoconnect_within_grace():
     fc = FakeClock()
     calls = []
-    assert boot.boot_wifi_check(lambda: fc.now >= 30, lambda: calls.append(1) or False,
+    assert boot.boot_wifi_check(lambda: fc.now >= 30, lambda budget_s: calls.append(1) or False,
                                 fc.sleep, fc.clock, timeout_s=180, grace_s=45)
     assert calls == []
 
@@ -70,7 +70,7 @@ def test_boot_check_connects_saved_after_grace():
     fc = FakeClock()
     state = {'up': False}
 
-    def connect_saved():
+    def connect_saved(budget_s):
         state['up'] = True
         return True
 
@@ -83,21 +83,69 @@ def test_boot_check_gives_up_after_about_three_minutes():
     fc = FakeClock()
     calls = []
 
-    def connect_saved():
-        calls.append(fc.now)
+    def connect_saved(budget_s):
+        calls.append((fc.now, budget_s))
         fc.now += 35  # A real attempt takes a while
         return False
 
     assert not boot.boot_wifi_check(lambda: False, connect_saved, fc.sleep, fc.clock,
                                     timeout_s=180, grace_s=45)
-    assert calls == [pytest.approx(45)]
+    assert calls == [(pytest.approx(45), pytest.approx(135))]
     assert fc.now == pytest.approx(180)
+
+
+def test_boot_check_gives_connect_only_the_time_left():
+    """A slow connect uses its whole budget: the window still ends at ~3 minutes"""
+    fc = FakeClock()
+    budgets = []
+
+    def connect_saved(budget_s):
+        budgets.append(budget_s)
+        fc.now += budget_s   # connect_saved_wifi honours the budget
+        return False
+
+    assert not boot.boot_wifi_check(lambda: False, connect_saved, fc.sleep, fc.clock,
+                                    timeout_s=180, grace_s=45)
+    assert budgets == [pytest.approx(135)]
+    assert fc.now == pytest.approx(180)
+
+    # Retry between recovery-portal windows: no grace, full budget
+    fc2 = FakeClock()
+    budgets.clear()
+    assert not boot.boot_wifi_check(lambda: False, connect_saved, fc2.sleep, fc2.clock,
+                                    timeout_s=180, grace_s=0)
+    assert budgets == [pytest.approx(180)]
+
+    # Never less than MIN_CONNECT_S, so a real attempt can happen
+    fc3 = FakeClock()
+    budgets.clear()
+    boot.boot_wifi_check(lambda: False, connect_saved, fc3.sleep, fc3.clock,
+                         timeout_s=40, grace_s=40)
+    assert budgets == [boot.MIN_CONNECT_S]
+
+
+def test_ensure_wifi_passes_budget_to_switch_to_wifi(tmp_path, monkeypatch):
+    import connect_saved_wifi
+    cfg = tmp_path / 'device_config.json'
+    cfg.write_text(json.dumps({'wifi_ssid': 'Home', 'wifi_password': 'pw',
+                               'setup_complete': True}))
+    monkeypatch.setattr(boot, 'DEVICE_CONFIG_PATH', str(cfg))
+    seen = []
+    monkeypatch.setattr(connect_saved_wifi, 'switch_to_wifi',
+                        lambda ssid, password, timeout_s=None: seen.append((ssid, password, timeout_s)) or True)
+
+    def fake_check(is_connected, connect_saved, *a, **k):
+        return connect_saved(120)
+
+    monkeypatch.setattr(boot, 'boot_wifi_check', fake_check)
+    assert boot.ensure_wifi_or_recover() == 'saved'
+    assert seen == [('Home', 'pw', 120)]
 
 
 def test_boot_check_survives_connect_errors():
     fc = FakeClock()
 
-    def connect_saved():
+    def connect_saved(budget_s):
         raise RuntimeError("nmcli missing")
 
     assert not boot.boot_wifi_check(lambda: False, connect_saved, fc.sleep, fc.clock,

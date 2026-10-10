@@ -4,6 +4,7 @@ No Pi, network or nmcli needed: subprocess/nmcli is replaced by a fake that
 records every argv, and the portal's AP / WiFi calls are monkeypatched.
 """
 import json
+import socket
 import types
 
 import pytest
@@ -22,11 +23,12 @@ def nm_escape(value):
 class FakeNM:
     """Minimal NetworkManager stand-in that answers the nmcli argv we send"""
 
-    def __init__(self, profiles=None, correct=None, connected_ssid=None):
+    def __init__(self, profiles=None, correct=None, connected_ssid=None, active=None):
         self.profiles = dict(profiles or {})   # profile name -> SSID
         self.psk = {}                          # profile name -> stored password
         self.correct = correct or {}           # SSID -> password the router accepts
         self.connected_ssid = connected_ssid
+        self.active = active                   # profile name active on wlan0
         self.calls = []
 
     def __call__(self, argv, timeout=30):
@@ -44,6 +46,15 @@ class FakeNM:
         if args[:6] == ['nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show']:
             out = "".join(f"{nm_escape(n)}:802-11-wireless\n" for n in self.profiles)
             return True, out + "Wired connection 1:802-3-ethernet\n", ""
+        if args[:6] == ['nmcli', '-t', '-f', 'NAME,DEVICE', 'connection', 'show']:
+            assert args[6:] == ['--active']
+            out = f"{nm_escape(self.active)}:wlan0\n" if self.connected_ssid and self.active else ""
+            return True, out + "lo:lo\n", ""
+        if args[:4] == ['nmcli', '-s', '-g', '802-11-wireless-security.psk']:
+            name = args[-1]
+            if name not in self.profiles:
+                return False, "", "no such connection"
+            return True, nm_escape(self.psk.get(name, '')) + "\n", ""
         if args[:4] == ['nmcli', '-t', '-f', '802-11-wireless.ssid']:
             name = args[-1]
             if name not in self.profiles:
@@ -57,7 +68,9 @@ class FakeNM:
             ssid = self.profiles.get(name)
             if ssid is not None and self.correct.get(ssid) == self.psk.get(name):
                 self.connected_ssid = ssid
+                self.active = name
                 return True, "", ""
+            self.connected_ssid = self.active = None   # Activation tears the old one down
             return False, "", "Secrets were required"
         if args[:4] == ['nmcli', 'device', 'wifi', 'connect']:
             ssid, password = args[4], args[6]
@@ -65,12 +78,17 @@ class FakeNM:
                 self.profiles[ssid] = ssid
                 self.psk[ssid] = password
                 self.connected_ssid = ssid
+                self.active = ssid
                 return True, "", ""
             return False, "", "Secrets were required"
         return True, "", ""
 
 
 def no_sleep(_s):
+    return None
+
+
+def no_probe(_host, _port):
     return None
 
 
@@ -252,6 +270,143 @@ def test_connected_check_needs_wlan0_connected_state():
 
 
 # ============================================
+# Typed password must really be the one in use
+# ============================================
+
+class FakeClock:
+    """clock()/sleep() pair: sleeping advances the clock instantly"""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def clock(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+def test_parse_profile_psk_unescapes():
+    assert csw.parse_profile_psk('pa\\:ss\\\\word\n') == 'pa:ss\\word'
+    assert csw.parse_profile_psk('\n') is None
+    assert csw.parse_profile_psk('') is None
+
+
+def test_parse_active_wlan_profile():
+    out = 'lo:lo\nCafe\\:Wifi:wlan0\nWired:eth0\n'
+    assert csw.parse_active_wlan_profile(out) == 'Cafe:Wifi'
+    assert csw.parse_active_wlan_profile('lo:lo\n') is None
+
+
+def test_get_psk_argv_is_literal():
+    assert csw.build_get_psk_argv(MALICIOUS_SSID) == [
+        'sudo', 'nmcli', '-s', '-g', '802-11-wireless-security.psk',
+        'connection', 'show', 'id', MALICIOUS_SSID]
+
+
+def test_already_connected_with_same_password_takes_shortcut():
+    nm = FakeNM(profiles={'Home': 'Home'}, correct={'Home': 'pa:ss'},
+                connected_ssid='Home', active='Home')
+    nm.psk['Home'] = 'pa:ss'
+    assert csw.connect_with_networkmanager('Home', 'pa:ss', run=nm, sleep=no_sleep, wait_s=3)
+    assert not any(c[1:4] == ['nmcli', 'connection', 'modify'] for c in nm.calls)
+    assert not any(c[1:4] == ['nmcli', 'connection', 'up'] for c in nm.calls)
+
+
+def test_already_connected_with_other_password_is_not_trusted():
+    """Autoconnect of the old profile won the race: the typo must not count as working"""
+    nm = FakeNM(profiles={'Home': 'Home'}, correct={'Home': 'right'},
+                connected_ssid='Home', active='Home')
+    nm.psk['Home'] = 'right'
+    assert not csw.connect_with_networkmanager('Home', 'typo', run=nm, sleep=no_sleep, wait_s=3)
+    # The typo was tried on the real profile...
+    assert ['sudo', 'nmcli', 'connection', 'modify', 'id', 'Home', 'wifi-sec.psk', 'typo'] in nm.calls
+    # ...then the working password was put back and the device went back online
+    assert nm.psk['Home'] == 'right'
+    assert nm.connected_ssid == 'Home' and nm.active == 'Home'
+
+
+def test_already_connected_new_password_that_works_is_confirmed():
+    nm = FakeNM(profiles={'Home': 'Home'}, correct={'Home': 'new-pass'},
+                connected_ssid='Home', active='Home')
+    nm.psk['Home'] = 'old-pass'
+    assert csw.connect_with_networkmanager('Home', 'new-pass', run=nm, sleep=no_sleep, wait_s=3)
+    assert nm.psk['Home'] == 'new-pass'
+
+
+def test_wrong_password_restores_working_profile_password():
+    nm = FakeNM(profiles={'netplan-wlan0-Home': 'Home'}, correct={'Home': 'right'})
+    nm.psk['netplan-wlan0-Home'] = 'right'
+    assert not csw.connect_with_networkmanager('Home', 'wrong', run=nm, sleep=no_sleep, wait_s=2)
+    assert nm.psk['netplan-wlan0-Home'] == 'right'
+    # Wasn't online before, so no extra reconnect attempt
+    ups = [c for c in nm.calls if c[1:4] == ['nmcli', 'connection', 'up']]
+    assert len(ups) == 1
+
+
+def test_duplicate_profile_autoconnect_does_not_confirm_typed_password():
+    nm = FakeNM(profiles={'Home': 'Home', 'Home 1': 'Home'}, correct={'Home': 'right'})
+    nm.psk.update({'Home': 'right', 'Home 1': 'right'})
+
+    def run(argv, timeout=30):
+        result = nm(argv, timeout)
+        if argv[1:4] == ['nmcli', 'connection', 'up'] and not result[0]:
+            # NM falls back to the other saved profile for the same SSID
+            nm.connected_ssid, nm.active = 'Home', 'Home 1'
+        return result
+
+    assert not csw.connect_with_networkmanager('Home', 'typo', run=run, sleep=no_sleep, wait_s=3)
+    assert nm.psk['Home'] == 'right'
+
+
+def test_connect_respects_timeout_budget():
+    fc = FakeClock()
+    nm = FakeNM(correct={'Home': 'right'})
+    assert not csw.connect_with_networkmanager('Home', 'wrong', run=nm, sleep=fc.sleep,
+                                               wait_s=30, timeout_s=12, clock=fc.clock)
+    assert fc.now <= 13
+
+
+def test_rescans_stop_at_deadline():
+    fc = FakeClock()
+    calls = []
+
+    def run(argv, timeout=30):
+        calls.append(argv)
+        return False, "", "Error: No network with SSID 'Home' found."
+
+    result = csw.run_with_rescan(['nmcli', 'connect'], run=run, sleep=fc.sleep,
+                                 deadline=3, clock=fc.clock)
+    assert result[0] is False
+    assert calls == [['nmcli', 'connect']]   # No rescan: it wouldn't finish in time
+
+
+def test_default_runner_caps_nmcli_timeouts_to_budget(monkeypatch):
+    fc = FakeClock()
+    timeouts = []
+
+    def fake_run_cmd(argv, timeout=30):
+        timeouts.append(timeout)
+        fc.now += 1
+        return False, "", "failed"
+
+    monkeypatch.setattr(csw, 'run_cmd', fake_run_cmd)
+    assert not csw.connect_with_networkmanager('Home', 'pw', sleep=fc.sleep, wait_s=60,
+                                               timeout_s=12, clock=fc.clock)
+    assert timeouts and max(timeouts) <= 12 and min(timeouts) >= 5
+    assert fc.now <= 20
+
+
+def test_switch_to_wifi_passes_timeout(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(csw, 'stop_ap_mode', lambda: None)
+    monkeypatch.setattr(csw, 'connect_with_networkmanager',
+                        lambda ssid, password, timeout_s=None: seen.update(t=timeout_s) or True)
+    assert csw.switch_to_wifi('Home', 'pw', timeout_s=99)
+    assert seen['t'] == 99
+
+
+# ============================================
 # Captive portal
 # ============================================
 
@@ -428,6 +583,44 @@ def test_recovery_mode_is_wifi_only_and_keeps_old_wifi_until_confirmed(portal):
     assert cfg['user_name'] == 'Nat'
 
 
+def test_stale_finish_after_failure_does_not_retry_bad_password(portal):
+    fill_first_run(portal, password='wrong')
+    portal.wifi_results = [False]
+    portal.client.post('/api/finish')
+    assert portal.cp.setup_state['pending_password'] is None
+    assert portal.ap_starts == 1
+
+    # A stale /setup/done tab reloads after the phone rejoins LEE-XXXX
+    r = portal.client.post('/api/finish')
+    assert r.status_code == 409 and r.get_json()['retry'] is True
+    assert portal.wifi_calls == [('Home', 'wrong')]   # No second attempt
+    assert portal.ap_starts == 1                      # AP stayed up
+    assert portal.lcd[-1][0] == 'wifi_failed'
+
+    # The done page sends the user back to the WiFi page on that reply
+    done_page = portal.client.get('/setup/done').data.decode()
+    assert 'd.retry' in done_page and "'/setup/wifi'" in done_page
+
+    # New password: finish works again
+    portal.client.post('/api/wifi', json={'ssid': 'Home', 'password': 'right-password'})
+    portal.wifi_results = [True]
+    assert portal.client.post('/api/finish').status_code == 200
+    assert portal.wifi_calls[-1] == ('Home', 'right-password')
+    assert portal.config()['setup_complete'] is True
+
+
+def test_stale_finish_after_failure_refused_in_recovery(portal):
+    portal.cp.save_device_config({'wifi_ssid': 'Old', 'wifi_password': 'old',
+                                  'setup_complete': True})
+    portal.cp.reset_portal_state(recovery=True)
+    portal.client.post('/api/wifi', json={'ssid': 'New', 'password': 'bad'})
+    portal.wifi_results = [False]
+    portal.client.post('/api/finish')
+    r = portal.client.post('/api/finish')
+    assert r.status_code == 409 and r.get_json()['retry'] is True
+    assert portal.wifi_calls == [('New', 'bad')]
+
+
 def test_finish_while_connecting_does_not_start_second_attempt(portal):
     fill_first_run(portal)
     portal.cp.setup_state['connecting'] = True
@@ -510,7 +703,8 @@ def test_server_binds_ap_ip_with_retry():
             raise OSError(99, "Cannot assign requested address")
         return FakeServer(host, port)
 
-    server = cp.create_portal_server(80, server_factory=factory, sleep=no_sleep)
+    server = cp.create_portal_server(80, server_factory=factory, sleep=no_sleep,
+                                     bind_probe=no_probe)
     assert server.host == cp.AP_IP == '192.168.4.1'
     assert attempts == [cp.AP_IP] * 3
 
@@ -523,7 +717,8 @@ def test_server_falls_back_to_all_interfaces():
             raise OSError(99, "Cannot assign requested address")
         return FakeServer(host, port)
 
-    server = cp.create_portal_server(80, retries=4, server_factory=factory, sleep=no_sleep)
+    server = cp.create_portal_server(80, retries=4, server_factory=factory, sleep=no_sleep,
+                                     bind_probe=no_probe)
     assert server.host == '0.0.0.0'
 
 
@@ -531,10 +726,104 @@ def test_server_permission_error_propagates():
     import captive_portal as cp
 
     def factory(host, port, app, threaded):
-        raise PermissionError("port 80")
+        raise AssertionError("must not get this far")
+
+    def probe(host, port):
+        raise PermissionError(13, "Permission denied")
 
     with pytest.raises(PermissionError):
-        cp.create_portal_server(80, server_factory=factory, sleep=no_sleep)
+        cp.create_portal_server(80, server_factory=factory, sleep=no_sleep, bind_probe=probe)
+
+
+def test_server_probe_failure_retries_before_building_server():
+    import captive_portal as cp
+    probes, built = [], []
+
+    def probe(host, port):
+        probes.append(host)
+        if len(probes) < 3:
+            raise OSError(99, "Cannot assign requested address")
+
+    def factory(host, port, app, threaded):
+        built.append(host)
+        return FakeServer(host, port)
+
+    server = cp.create_portal_server(80, server_factory=factory, sleep=no_sleep, bind_probe=probe)
+    assert server.host == cp.AP_IP and built == [cp.AP_IP]
+    assert probes == [cp.AP_IP] * 3
+
+
+def test_server_factory_sys_exit_becomes_oserror():
+    """werkzeug >= 2.3 calls sys.exit(1) on bind errors; we must still retry/fall back"""
+    import captive_portal as cp
+    attempts = []
+
+    def factory(host, port, app, threaded):
+        attempts.append(host)
+        if host != '0.0.0.0':
+            raise SystemExit(1)
+        return FakeServer(host, port)
+
+    server = cp.create_portal_server(80, retries=2, server_factory=factory, sleep=no_sleep,
+                                     bind_probe=no_probe)
+    assert server.host == '0.0.0.0'
+    assert attempts == [cp.AP_IP, cp.AP_IP, '0.0.0.0']
+
+
+def test_real_werkzeug_unassigned_address_retries_then_falls_back():
+    """Real make_server: 192.0.2.1 (TEST-NET) is never on this host"""
+    import captive_portal as cp
+    sleeps = []
+    server = cp.create_portal_server(0, host='192.0.2.1', retries=2, sleep=sleeps.append)
+    try:
+        assert sleeps == [1.0, 1.0]
+        assert server.host == '0.0.0.0' and server.server_port > 0
+    finally:
+        server.server_close()
+
+
+def _busy_port():
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    blocker.bind(('127.0.0.1', 0))
+    blocker.listen(1)
+    return blocker, blocker.getsockname()[1]
+
+
+def test_real_werkzeug_port_in_use_raises_oserror_not_systemexit():
+    import captive_portal as cp
+    blocker, port = _busy_port()
+    sleeps = []
+    try:
+        with pytest.raises(OSError):
+            cp.create_portal_server(port, host='127.0.0.1', retries=2, sleep=sleeps.append)
+        assert sleeps == [1.0, 1.0]   # Retried, then the 0.0.0.0 fallback failed too
+        # Even if the port gets taken between our probe and werkzeug's own bind
+        with pytest.raises(OSError):
+            cp.create_portal_server(port, host='127.0.0.1', retries=1, sleep=no_sleep,
+                                    bind_probe=no_probe)
+    finally:
+        blocker.close()
+
+
+def test_recovery_loop_survives_portal_bind_failure():
+    """A busy port must not exit the boot process: recovery goes on to retry saved WiFi"""
+    import captive_portal as cp
+    import leeloo_boot as boot
+    blocker, port = _busy_port()
+    events = []
+
+    def run_portal():
+        events.append('portal')
+        cp.create_portal_server(port, host='127.0.0.1', retries=1, sleep=no_sleep)
+        return True
+
+    try:
+        result = boot.wifi_recovery_loop(run_portal, lambda: events.append('retry') or True,
+                                         sleep=lambda s: None, max_rounds=1)
+    finally:
+        blocker.close()
+    assert result == 'saved' and events == ['portal', 'retry']
 
 
 def test_run_portal_shuts_server_down_after_success(portal, monkeypatch):

@@ -95,6 +95,26 @@ def parse_wifi_profile_names(con_show_output):
     return names
 
 
+def parse_active_wlan_profile(active_output):
+    """Return the profile active on wlan0 from `nmcli -t -f NAME,DEVICE connection show --active`"""
+    for line in active_output.splitlines():
+        if not line.strip():
+            continue
+        fields = split_nmcli_terse(line)
+        if len(fields) >= 2 and fields[-1].strip() == WIFI_IFACE:
+            return ':'.join(fields[:-1])
+    return None
+
+
+def parse_profile_psk(psk_output):
+    """Return the password from `nmcli -s -g 802-11-wireless-security.psk connection show id NAME`"""
+    value = psk_output.rstrip('\n')
+    if not value:
+        return None
+    # -g output is terse: a ':' or '\\' in the password is backslash-escaped
+    return ':'.join(split_nmcli_terse(value))
+
+
 def parse_profile_ssid(profile_output):
     """Return the value of `nmcli -t -f 802-11-wireless.ssid connection show id NAME`"""
     for line in profile_output.splitlines():
@@ -119,6 +139,12 @@ def build_set_psk_argv(profile_name, password):
     """nmcli command that stores a (possibly new) password in an existing profile"""
     return ['sudo', 'nmcli', 'connection', 'modify', 'id', profile_name,
             'wifi-sec.psk', password]
+
+
+def build_get_psk_argv(profile_name):
+    """nmcli command that prints the password stored in a profile (root only)"""
+    return ['sudo', 'nmcli', '-s', '-g', '802-11-wireless-security.psk',
+            'connection', 'show', 'id', profile_name]
 
 
 def build_profile_up_argv(profile_name):
@@ -160,6 +186,22 @@ def is_connected_to(ssid, run=run_cmd):
     return bool(ssid) and get_wlan0_ssid(run) == ssid
 
 
+def get_active_wlan_profile(run=run_cmd):
+    """Name of the NetworkManager profile currently active on wlan0, or None"""
+    ok, stdout, _ = run(['nmcli', '-t', '-f', 'NAME,DEVICE', 'connection', 'show', '--active'])
+    if not ok:
+        return None
+    return parse_active_wlan_profile(stdout)
+
+
+def get_profile_psk(profile_name, run=run_cmd):
+    """Password stored in a profile, or None if it can't be read"""
+    ok, stdout, _ = run(build_get_psk_argv(profile_name))
+    if not ok:
+        return None
+    return parse_profile_psk(stdout)
+
+
 def find_profiles_for_ssid(ssid, run=run_cmd):
     """
     Names of saved NetworkManager WiFi profiles whose SSID is exactly `ssid`.
@@ -199,11 +241,12 @@ def _network_not_seen(stderr):
 
 
 def run_with_rescan(argv, run=run_cmd, sleep=time.sleep, attempts=SCAN_ATTEMPTS,
-                    rescan_wait_s=RESCAN_WAIT_S):
+                    rescan_wait_s=RESCAN_WAIT_S, deadline=None, clock=time.monotonic):
     """
     Run an nmcli connect/up command. Right after NetworkManager starts its
     scan list can still be empty, which fails with "No network with SSID"
-    even when the password is right, so rescan and try again a few times.
+    even when the password is right, so rescan and try again a few times
+    (but not past `deadline`, a clock() value, when one is given).
     """
     result = (False, "", "")
     for attempt in range(1, attempts + 1):
@@ -211,46 +254,84 @@ def run_with_rescan(argv, run=run_cmd, sleep=time.sleep, attempts=SCAN_ATTEMPTS,
         success, _, stderr = result
         if success or not _network_not_seen(stderr) or attempt == attempts:
             return result
+        if deadline is not None and clock() + rescan_wait_s >= deadline:
+            print("  Out of time for rescans")
+            return result
         print(f"  Network not in scan list yet, rescanning ({attempt}/{attempts})...")
         run(['sudo', 'nmcli', 'device', 'wifi', 'rescan', 'ifname', WIFI_IFACE])
         sleep(rescan_wait_s)
     return result
 
 
-def connect_with_networkmanager(ssid, password, run=run_cmd, sleep=time.sleep,
-                                wait_s=CONNECT_WAIT_S):
+def _deadline_run(deadline, clock):
+    """run_cmd whose per-command timeout never runs (much) past the deadline"""
+    def run(argv):
+        remaining = deadline - clock()
+        return run_cmd(argv, timeout=max(5, min(30, int(remaining))))
+    return run
+
+
+def connect_with_networkmanager(ssid, password, run=None, sleep=time.sleep,
+                                wait_s=CONNECT_WAIT_S, timeout_s=None, clock=time.monotonic):
     """
     Connect to WiFi using NetworkManager (more reliable).
-    Returns True only once nmcli shows wlan0 connected to exactly `ssid`.
+    Returns True only once nmcli shows wlan0 connected to exactly `ssid`,
+    using `password` (an existing connection with some other stored password
+    doesn't count, so a mistyped password is never reported as working).
+
+    timeout_s bounds the whole attempt (rescans, nmcli calls, waiting), give
+    or take one nmcli call of at least 5s.
     """
+    deadline = clock() + timeout_s if timeout_s is not None else None
+    if run is None:
+        run = _deadline_run(deadline, clock) if deadline is not None else run_cmd
+
     print(f"Connecting to {ssid} using NetworkManager...")
 
     # Ensure NM is managing wlan0
     run(['sudo', 'nmcli', 'device', 'set', WIFI_IFACE, 'managed', 'yes'])
     sleep(1)
 
-    # Check if already connected to this SSID
-    if is_connected_to(ssid, run):
-        print(f"  Already connected to {ssid}")
-        return True
-
     profiles = find_profiles_for_ssid(ssid, run)
+    was_connected = is_connected_to(ssid, run)
+
+    # Already connected to this SSID: only a success if it's with this password
+    # (NM autoconnect of an old profile can beat us right after it starts)
+    if was_connected:
+        active = get_active_wlan_profile(run)
+        if not password or (active and get_profile_psk(active, run) == password):
+            print(f"  Already connected to {ssid}")
+            return True
+        print(f"  Connected to {ssid}, but not with this password yet, trying it...")
+        if active:
+            if active in profiles:
+                profiles.remove(active)
+            profiles.insert(0, active)
+
+    expected_profile = None
+    restore_psk = None
     if profiles:
         # Connection exists: store the password the user just gave us (the
         # router password may have changed), then activate it. Don't fall back
         # to 'device wifi connect' here: each failed retry would add another
         # duplicate profile for the same SSID.
         profile = profiles[0]
+        expected_profile = profile
         print(f"  Activating existing connection: {profile}")
         if password:
-            run(build_set_psk_argv(profile, password))
-        success, _, stderr = run_with_rescan(build_profile_up_argv(profile), run, sleep)
+            old_psk = get_profile_psk(profile, run)
+            if old_psk != password:
+                restore_psk = old_psk
+                run(build_set_psk_argv(profile, password))
+        success, _, stderr = run_with_rescan(build_profile_up_argv(profile), run, sleep,
+                                             deadline=deadline, clock=clock)
         if not success:
             print(f"  Warning: Failed to activate - {stderr.strip()}")
     else:
         # Create new connection
         print("  Creating new connection...")
-        success, _, stderr = run_with_rescan(build_connect_argv(ssid, password), run, sleep)
+        success, _, stderr = run_with_rescan(build_connect_argv(ssid, password), run, sleep,
+                                             deadline=deadline, clock=clock)
         if not success:
             print(f"  Warning: Failed to connect - {stderr.strip()}")
 
@@ -258,21 +339,39 @@ def connect_with_networkmanager(ssid, password, run=run_cmd, sleep=time.sleep,
     print("  Waiting for connection...")
     for _ in range(wait_s):
         if is_connected_to(ssid, run):
-            print(f"  ✅ Connected to {ssid}")
-            return True
+            # With an existing profile, the one we just set must be the one
+            # that's up (not a duplicate profile holding another password).
+            # If nmcli can't say which profile is up, trust the SSID check.
+            active = get_active_wlan_profile(run) if expected_profile else None
+            if active is None or active == expected_profile:
+                print(f"  ✅ Connected to {ssid}")
+                return True
+        if deadline is not None and clock() >= deadline:
+            break
         sleep(1)
 
     print(f"  ❌ wlan0 did not connect to {ssid}")
+    if restore_psk:
+        # Don't leave the new (apparently wrong) password in a profile that
+        # worked before: put the old one back so autoconnect can still use it
+        print(f"  Restoring the previous password for {expected_profile}")
+        run(build_set_psk_argv(expected_profile, restore_psk))
+        if was_connected:
+            # We were online before trying the new password: get back online
+            run(build_profile_up_argv(expected_profile))
     return False
 
 
-def switch_to_wifi(ssid, password):
-    """Leave AP mode and join `ssid`. True only if the connection is confirmed."""
+def switch_to_wifi(ssid, password, timeout_s=None):
+    """
+    Leave AP mode and join `ssid`. True only if the connection is confirmed.
+    timeout_s (optional) bounds the connection attempt after AP mode is stopped.
+    """
     if not ssid or not password:
         print("No WiFi credentials to connect with")
         return False
     stop_ap_mode()
-    return connect_with_networkmanager(ssid, password)
+    return connect_with_networkmanager(ssid, password, timeout_s=timeout_s)
 
 
 def main():

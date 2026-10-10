@@ -32,6 +32,7 @@ import os
 import json
 import sys
 import html
+import socket
 import threading
 import time
 from flask import Flask, request, jsonify, redirect
@@ -1049,6 +1050,10 @@ def setup_done():
         // Trigger WiFi switch
         fetch('/api/finish', { method: 'POST' })
             .then(r => r.json())
+            .then(d => {
+                // Stale page after a failed attempt: re-enter the password first
+                if (d && d.retry) { window.location.href = '/setup/wifi'; }
+            })
             .catch(() => {});
     </script>
     """
@@ -1233,10 +1238,6 @@ def api_finish():
         return jsonify({'success': True, 'dev_mode': True})
 
     config = load_device_config()
-    ssid = setup_state.get('pending_ssid') or config.get('wifi_ssid')
-    password = setup_state.get('pending_password') or config.get('wifi_password')
-    if not ssid or not password:
-        return jsonify({'success': False, 'error': 'wifi not set, go back to step 1'}), 400
 
     with _state_lock:
         if setup_state.get('closed') or setup_state.get('finished'):
@@ -1245,6 +1246,15 @@ def api_finish():
         if setup_state.get('connecting'):
             # Page reloaded while an attempt is running: don't start a second one
             return jsonify({'success': True, 'status': 'connecting'})
+        if setup_state.get('wifi_retry') and not setup_state.get('pending_password'):
+            # The last attempt failed and no new password arrived since (e.g. a
+            # stale /setup/done tab reloaded): don't retry the known-bad one
+            return jsonify({'success': False, 'retry': True,
+                            'error': 'enter the wifi password again'}), 409
+        ssid = setup_state.get('pending_ssid') or config.get('wifi_ssid')
+        password = setup_state.get('pending_password') or config.get('wifi_password')
+        if not ssid or not password:
+            return jsonify({'success': False, 'error': 'wifi not set, go back to step 1'}), 400
         setup_state['connecting'] = True
         setup_state['step'] = 'connecting'
 
@@ -1319,6 +1329,7 @@ def _on_wifi_failed(ssid):
     with _state_lock:
         setup_state['error'] = f"could not connect to {ssid}. check the password and try again."
         setup_state['wifi_retry'] = True
+        setup_state['pending_password'] = None  # Known bad: /api/finish waits for a new one
 
     try:
         # NetworkManager is up right now: refresh the network list first
@@ -1346,19 +1357,49 @@ def _on_wifi_failed(ssid):
 # MAIN
 # ============================================
 
+def probe_bind(host, port):
+    """
+    Raise OSError if host:port can't be bound right now (PermissionError for
+    port 80 without root). Same SO_REUSEADDR setting as werkzeug's server.
+    """
+    family = socket.AF_INET6 if ':' in host else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+    finally:
+        sock.close()
+
+
+def _build_server(factory, host, port):
+    """Call the server factory, turning werkzeug's sys.exit() on bind errors into OSError"""
+    try:
+        return factory(host, port, app, threaded=True)
+    except SystemExit as e:
+        # werkzeug >= 2.3 prints the bind error and calls sys.exit(1) instead
+        # of raising, which would skip our retry/fallback and kill the boot
+        raise OSError(f"web server could not bind {host}:{port} (exit {e.code})") from None
+
+
 def create_portal_server(port, host=AP_IP, retries=SERVER_BIND_RETRIES, delay_s=1.0,
-                         server_factory=None, sleep=time.sleep):
+                         server_factory=None, sleep=time.sleep, bind_probe=None):
     """
     Create the portal web server bound to the AP address only, so it is not
     reachable from the home LAN. The AP address can take a moment to appear
     on wlan0, so retry briefly, then fall back to 0.0.0.0 (the server is
     still shut down once setup completes). PermissionError (port 80 without
     root) is raised for the caller to handle.
+
+    Each attempt probes the bind with a plain socket first: werkzeug >= 2.3
+    exits the process on a bind error instead of raising, so the probe is
+    what lets us see the real OSError and keep retrying.
     """
     factory = server_factory or make_server
+    probe = bind_probe or probe_bind
     for attempt in range(1, retries + 1):
         try:
-            server = factory(host, port, app, threaded=True)
+            probe(host, port)
+            server = _build_server(factory, host, port)
             print(f"[PORTAL] Web server on {host}:{port}")
             return server
         except PermissionError:
@@ -1367,7 +1408,8 @@ def create_portal_server(port, host=AP_IP, retries=SERVER_BIND_RETRIES, delay_s=
             print(f"[PORTAL] Can't bind {host}:{port} yet ({e}), retry {attempt}/{retries}")
             sleep(delay_s)
     print(f"[PORTAL] Falling back to 0.0.0.0:{port} (still closed after setup)")
-    server = factory('0.0.0.0', port, app, threaded=True)
+    probe('0.0.0.0', port)
+    server = _build_server(factory, '0.0.0.0', port)
     print(f"[PORTAL] Web server on 0.0.0.0:{port}")
     return server
 
