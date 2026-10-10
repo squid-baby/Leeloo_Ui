@@ -101,7 +101,9 @@ sudo bash boot/leeloo_setup.sh
 
 **What it does:**
 1. Installs apt packages: `hostapd`, `dnsmasq`, `python3-flask` (captive portal), `libopenblas0`, `libjpeg-dev`, `i2c-tools`, etc.
-2. Installs pip packages from `requirements.txt` (system-wide, no venv)
+2. Installs pip packages from `requirements.txt` (system-wide, no venv; adds
+   `--break-system-packages` only when the installed pip supports it, so it
+   works on both Bookworm and Bullseye)
 3. Copies `boot/waveshare35a.dtbo` → `/boot/firmware/overlays/` (verified working version — **do not replace from LCD-show repo**)
 4. Patches `/boot/firmware/config.txt` with all required settings
 5. Patches `/boot/firmware/cmdline.txt` for clean headless boot
@@ -163,7 +165,11 @@ Once the device is shipped, the end user:
 3. **Connects phone to WiFi:** `LEELOO-SETUP` (no password)
 4. **Captive portal auto-opens** (or browse to `http://192.168.4.1`)
 5. Fills out the setup form:
-   - WiFi network + password (their home WiFi)
+   - WiFi network + password (their home WiFi). The network list is scanned
+     before the setup WiFi starts; a hidden or unlisted network can be typed
+     in the "or type a network name" field (a typed name wins over the list).
+     The password must be 8-63 characters (or a 64-digit hex key); the portal
+     says so if it isn't. Open networks (no password) aren't supported.
    - Name
    - ZIP code (for weather)
    - Telegram opt-in (optional)
@@ -328,7 +334,7 @@ sudo python3 -c "import board; import neopixel; p = neopixel.NeoPixel(board.D12,
 **Most common causes:**
 1. DIN wire on wrong pin — must be **Pin 32** (GPIO 12), not Pin 11 (GPIO 17)
 2. `dtparam=audio=off` missing from config.txt — audio and WS2812B share PWM0 DMA
-3. `adafruit-circuitpython-neopixel` not installed — run `sudo pip3 install adafruit-circuitpython-neopixel --break-system-packages`
+3. `adafruit-circuitpython-neopixel` not installed — run `sudo pip3 install adafruit-circuitpython-neopixel --break-system-packages` (leave out `--break-system-packages` on Bullseye, whose pip rejects it)
 4. Running without sudo — service must run as `User=root`
 
 ### Tap sensor not detecting

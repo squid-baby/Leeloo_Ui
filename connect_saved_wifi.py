@@ -7,6 +7,11 @@ Uses NetworkManager for reliable WiFi connection.
 SECURITY: the SSID and password come from the open captive portal and this
 runs as root. Every command is an argv list (never shell=True), so the values
 reach nmcli as single literal arguments and can't inject shell commands.
+
+The service already runs as root, so nmcli is called directly (no sudo): a
+subprocess timeout then kills nmcli itself instead of orphaning it under a
+killed sudo. Activations also get nmcli's own --wait, a few seconds shorter
+than the subprocess timeout, so nmcli normally gives up cleanly first.
 """
 
 import os
@@ -26,14 +31,38 @@ FAILED_CONNECT_WAIT_S = 5    # Shorter wait once nmcli already gave a definite e
 SCAN_ATTEMPTS = 3            # Tries when NM hasn't seen the network in a scan yet
 RESCAN_WAIT_S = 5
 NM_WIFI_TYPES = ('802-11-wireless', 'wifi')  # nmcli -t prints the long name
+NMCLI_WAIT_MARGIN_S = 5      # Subprocess timeout is this much longer than nmcli --wait
+MIN_NMCLI_WAIT_S = 5
+
+
+def is_nmcli_activation(argv):
+    """nmcli commands that wait for NetworkManager to activate a connection"""
+    argv = list(argv)
+    return (argv[:1] == ['nmcli']
+            and (argv[1:4] == ['device', 'wifi', 'connect'] or argv[1:3] == ['connection', 'up']))
+
+
+def with_nmcli_wait(argv, timeout):
+    """
+    (argv, subprocess timeout) for running argv within ~timeout seconds.
+    An nmcli activation gets nmcli's own `--wait N`, with the subprocess
+    timeout NMCLI_WAIT_MARGIN_S longer than N, so nmcli gives up by itself
+    instead of being killed halfway.
+    """
+    argv = list(argv)
+    if not is_nmcli_activation(argv):
+        return argv, timeout
+    wait_s = max(MIN_NMCLI_WAIT_S, int(timeout) - NMCLI_WAIT_MARGIN_S)
+    return ['nmcli', '--wait', str(wait_s)] + argv[1:], wait_s + NMCLI_WAIT_MARGIN_S
 
 
 def run_cmd(argv, timeout=30):
     """Run an argv command (no shell) and return (success, stdout, stderr)"""
     if not isinstance(argv, (list, tuple)):
         raise TypeError("run_cmd needs an argv list, never a shell string")
+    argv, timeout = with_nmcli_wait(argv, timeout)
     try:
-        result = subprocess.run(list(argv), capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
         return result.returncode == 0, result.stdout, result.stderr
     except subprocess.TimeoutExpired:
         # str(TimeoutExpired) repeats argv, which can contain the WiFi password
@@ -130,28 +159,37 @@ def parse_profile_ssid(profile_output):
 # argv builders (kept separate so tests can check them)
 # ============================================
 
-def build_connect_argv(ssid, password):
+def build_connect_argv(ssid, password, hidden=False):
     """nmcli command that creates + activates a new WiFi profile"""
-    return ['sudo', 'nmcli', 'device', 'wifi', 'connect', ssid,
+    argv = ['nmcli', 'device', 'wifi', 'connect', ssid,
             'password', password, 'ifname', WIFI_IFACE]
+    if hidden:
+        # Hidden networks never show up in a scan: probe for the SSID directly
+        argv += ['hidden', 'yes']
+    return argv
 
 
 def build_set_psk_argv(profile_name, password):
     """nmcli command that stores a (possibly new) password in an existing profile"""
-    return ['sudo', 'nmcli', 'connection', 'modify', 'id', profile_name,
+    return ['nmcli', 'connection', 'modify', 'id', profile_name,
             'wifi-sec.psk', password]
 
 
 def build_get_psk_argv(profile_name):
     """nmcli command that prints the password stored in a profile (root only)"""
-    return ['sudo', 'nmcli', '-s', '-g', '802-11-wireless-security.psk',
+    return ['nmcli', '-s', '-g', '802-11-wireless-security.psk',
             'connection', 'show', 'id', profile_name]
 
 
 def build_profile_up_argv(profile_name):
     """nmcli command that activates an existing profile on wlan0"""
-    return ['sudo', 'nmcli', 'connection', 'up', 'id', profile_name,
+    return ['nmcli', 'connection', 'up', 'id', profile_name,
             'ifname', WIFI_IFACE]
+
+
+def build_delete_profile_argv(profile_name):
+    """nmcli command that deletes a saved profile"""
+    return ['nmcli', 'connection', 'delete', 'id', profile_name]
 
 
 # ============================================
@@ -203,16 +241,21 @@ def get_profile_psk(profile_name, run=run_cmd):
     return parse_profile_psk(stdout)
 
 
+def list_wifi_profiles(run=run_cmd):
+    """Names of all saved WiFi profiles, or None if nmcli couldn't list them"""
+    ok, stdout, _ = run(['nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show'])
+    if not ok:
+        return None
+    return parse_wifi_profile_names(stdout)
+
+
 def find_profiles_for_ssid(ssid, run=run_cmd):
     """
     Names of saved NetworkManager WiFi profiles whose SSID is exactly `ssid`.
     (Profile names can be "SSID", "netplan-wlan0-SSID", "preconfigured", ...)
     """
-    ok, stdout, _ = run(['nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show'])
-    if not ok:
-        return []
     matches = []
-    for name in parse_wifi_profile_names(stdout):
+    for name in list_wifi_profiles(run) or []:
         ok, details, _ = run(['nmcli', '-t', '-f', '802-11-wireless.ssid',
                               'connection', 'show', 'id', name])
         if ok and parse_profile_ssid(details) == ssid:
@@ -224,15 +267,48 @@ def find_profiles_for_ssid(ssid, run=run_cmd):
 # Mode switching + connecting
 # ============================================
 
-def stop_ap_mode():
-    """Stop AP mode services and restore NetworkManager"""
-    _wm_stop_ap_mode()  # stops hostapd + dnsmasq, flushes wlan0
-    run_cmd(['sudo', 'killall', 'hostapd'])
-    time.sleep(0.5)
-    # Restart NetworkManager (it was stopped for AP mode)
-    print("Restarting NetworkManager...")
-    run_cmd(['sudo', 'systemctl', 'start', 'NetworkManager'])
-    time.sleep(3)
+def ap_mode_active(run=run_cmd):
+    """True while hostapd runs (as the systemd service or started directly)"""
+    ok, _, _ = run(['systemctl', 'is-active', '--quiet', 'hostapd'])
+    if ok:
+        return True
+    ok, _, _ = run(['pgrep', '-x', 'hostapd'])
+    return ok
+
+
+def networkmanager_running(run=run_cmd):
+    ok, _, _ = run(['systemctl', 'is-active', '--quiet', 'NetworkManager'])
+    return ok
+
+
+def ensure_wlan0_ready(run=run_cmd):
+    """
+    Raise wlan0 and hand it to NetworkManager. NM doesn't raise a link it
+    already manages, so a wlan0 left down (e.g. by AP teardown) would stay
+    "unavailable" and every connect would fail. Both commands are no-ops
+    when wlan0 is already up and managed.
+    """
+    run(['ip', 'link', 'set', WIFI_IFACE, 'up'])
+    run(['nmcli', 'device', 'set', WIFI_IFACE, 'managed', 'yes'])
+
+
+def stop_ap_mode(run=run_cmd, sleep=time.sleep):
+    """
+    Leave AP mode (only if hostapd is really up) and make sure NetworkManager
+    runs and manages a raised wlan0. Safe to call when already in client mode.
+    """
+    if ap_mode_active(run):
+        _wm_stop_ap_mode()  # stops hostapd + dnsmasq, resets wlan0
+        run(['killall', 'hostapd'])
+        sleep(0.5)
+    else:
+        print("AP mode not active, leaving wlan0 alone")
+    if not networkmanager_running(run):
+        # It was stopped for AP mode
+        print("Restarting NetworkManager...")
+        run(['systemctl', 'start', 'NetworkManager'])
+        sleep(3)
+    ensure_wlan0_ready(run)
 
 
 def _network_not_seen(stderr):
@@ -277,7 +353,7 @@ def run_with_rescan(argv, run=run_cmd, sleep=time.sleep, attempts=SCAN_ATTEMPTS,
             print("  Out of time for rescans")
             return result
         print(f"  Network not in scan list yet, rescanning ({attempt}/{attempts})...")
-        run(['sudo', 'nmcli', 'device', 'wifi', 'rescan', 'ifname', WIFI_IFACE])
+        run(['nmcli', 'device', 'wifi', 'rescan', 'ifname', WIFI_IFACE])
         sleep(rescan_wait_s)
     return result
 
@@ -300,9 +376,12 @@ def connect_with_networkmanager(ssid, password, run=None, sleep=time.sleep,
     doesn't count, so a mistyped password is never reported as working).
 
     timeout_s bounds the whole attempt (rescans, nmcli calls, waiting), give
-    or take one nmcli call of at least 5s. When nmcli already reported a
-    definite failure (wrong password), only wait failed_wait_s, so the setup
-    AP comes back sooner.
+    or take one nmcli call (at most MIN_NMCLI_WAIT_S + NMCLI_WAIT_MARGIN_S).
+    When nmcli already reported a definite failure (wrong password), only
+    wait failed_wait_s, so the setup AP comes back sooner.
+
+    A failed attempt leaves no new profile behind, and a password nmcli
+    refuses to store counts as a failed attempt.
     """
     deadline = clock() + timeout_s if timeout_s is not None else None
     if run is None:
@@ -310,8 +389,8 @@ def connect_with_networkmanager(ssid, password, run=None, sleep=time.sleep,
 
     print(f"Connecting to {ssid} using NetworkManager...")
 
-    # Ensure NM is managing wlan0
-    run(['sudo', 'nmcli', 'device', 'set', WIFI_IFACE, 'managed', 'yes'])
+    # Ensure wlan0 is up and NM is managing it
+    ensure_wlan0_ready(run)
     sleep(1)
 
     profiles = find_profiles_for_ssid(ssid, run)
@@ -332,6 +411,7 @@ def connect_with_networkmanager(ssid, password, run=None, sleep=time.sleep,
 
     expected_profile = None
     restore_psk = None
+    profiles_before = None   # All WiFi profiles before 'device wifi connect' (create path)
     if profiles:
         # Connection exists: store the password the user just gave us (the
         # router password may have changed), then activate it. Don't fall back
@@ -343,8 +423,13 @@ def connect_with_networkmanager(ssid, password, run=None, sleep=time.sleep,
         if password:
             old_psk = get_profile_psk(profile, run)
             if old_psk != password:
+                ok, _, stderr = run(build_set_psk_argv(profile, password))
+                if not ok:
+                    # e.g. a password NM rejects (too short): 'connection up'
+                    # would just use the old stored one and look like success
+                    print(f"  ❌ Could not store the new password - {stderr.strip()}")
+                    return False
                 restore_psk = old_psk
-                run(build_set_psk_argv(profile, password))
         success, _, stderr = run_with_rescan(build_profile_up_argv(profile), run, sleep,
                                              deadline=deadline, clock=clock)
         if not success:
@@ -354,8 +439,14 @@ def connect_with_networkmanager(ssid, password, run=None, sleep=time.sleep,
     else:
         # Create new connection
         print("  Creating new connection...")
+        profiles_before = list_wifi_profiles(run)
         success, _, stderr = run_with_rescan(build_connect_argv(ssid, password), run, sleep,
                                              deadline=deadline, clock=clock)
+        if (not success and _network_not_seen(stderr)
+                and (deadline is None or clock() < deadline)):
+            # Typed name of a network no scan shows: it may be hidden
+            print("  Not in any scan, trying it as a hidden network...")
+            success, _, stderr = run(build_connect_argv(ssid, password, hidden=True))
         if not success:
             print(f"  Warning: Failed to connect - {stderr.strip()}")
             if _definite_failure(stderr):
@@ -377,6 +468,8 @@ def connect_with_networkmanager(ssid, password, run=None, sleep=time.sleep,
         sleep(1)
 
     print(f"  ❌ wlan0 did not connect to {ssid}")
+    if not expected_profile:
+        _delete_new_profiles(ssid, profiles_before, run)
     if restore_psk:
         # Don't leave the new (apparently wrong) password in a profile that
         # worked before: put the old one back so autoconnect can still use it
@@ -388,10 +481,26 @@ def connect_with_networkmanager(ssid, password, run=None, sleep=time.sleep,
     return False
 
 
+def _delete_new_profiles(ssid, profiles_before, run):
+    """
+    Remove profiles for `ssid` that the failed 'device wifi connect' created
+    (a killed or failed nmcli can leave one behind with autoconnect on and
+    the wrong password). Profiles that existed before are never touched.
+    """
+    if profiles_before is None:
+        print("  Profile list unknown before connecting, not deleting anything")
+        return
+    for name in find_profiles_for_ssid(ssid, run):
+        if name not in profiles_before:
+            print(f"  Deleting profile left by the failed attempt: {name}")
+            run(build_delete_profile_argv(name))
+
+
 def switch_to_wifi(ssid, password, timeout_s=None):
     """
-    Leave AP mode and join `ssid`. True only if the connection is confirmed.
-    timeout_s (optional) bounds the connection attempt after AP mode is stopped.
+    Leave AP mode (if it's up) and join `ssid`. True only if the connection
+    is confirmed. timeout_s (optional) bounds the connection attempt after
+    AP mode is stopped.
     """
     if not ssid or not password:
         print("No WiFi credentials to connect with")
