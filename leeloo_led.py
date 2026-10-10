@@ -132,6 +132,10 @@ class LEDManager:
             return
         await self._cancel_ambient()
         await self._cancel_current()
+        # The superseded animation's finally (in its own _run_animation) may
+        # have restarted ambient while we waited for it: stop that again, or
+        # the breathe fights this animation over the pixels for its whole run
+        await self._cancel_ambient()
         if self._recording:
             # Recording started while we were cancelling the old animation
             print(f"[LED] {name} skipped (recording)")
@@ -249,6 +253,10 @@ class LEDManager:
             if state != self._ambient_state:
                 print(f"[LED] ambient → {state} (deferred until {self._current_animation or 'animation'} ends)")
             self._ambient_state = state
+            if state is None:
+                # Never leave a stray breathe running once ambient is off
+                # (nothing would stop it after the animation ends)
+                await self._cancel_ambient()
             return
 
         ambient_already_running = (

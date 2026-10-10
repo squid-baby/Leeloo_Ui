@@ -218,3 +218,39 @@ async def test_recording_started_cancels_animation_cleanly(led):
     assert not nudge.cancelled()
     assert led.is_recording
     led.recording_finished()
+
+
+# -----------------------------------------------------------------------------
+# Ambient restarted by a superseded animation's finally
+# -----------------------------------------------------------------------------
+
+async def test_replacing_animation_stops_ambient_restarted_by_old_one(led):
+    """Review finding: B replaces A; A's _run_animation finally restarts
+    ambient (A's task is already done) before B starts. That stray breathe
+    must not keep running alongside B."""
+    await led.set_ambient("idle")
+    nudge = asyncio.ensure_future(led.nudge(duration=5))
+    await asyncio.sleep(0.05)
+    msg = asyncio.ensure_future(led.message_received())
+    await asyncio.sleep(0.05)
+    assert led.current_animation == "message_received"
+    assert _live_ambient_tasks() == []
+    await asyncio.wait_for(asyncio.gather(nudge, msg), timeout=5.0)
+    assert len(_live_ambient_tasks()) == 1  # resumed once B ended
+
+
+async def test_set_ambient_none_during_animation_stops_stray_breathe(led):
+    """set_ambient(None) while an animation runs must not leave an ambient
+    task breathing (None maps to PURPLE in _breathe)."""
+    await led.set_ambient("idle")
+    nudge = asyncio.ensure_future(led.nudge(duration=0.3))
+    await asyncio.sleep(0.05)
+    # Simulate a stray breathe that slipped in alongside the animation
+    stray = asyncio.ensure_future(asyncio.sleep(10))
+    led._ambient_task = stray
+    await led.set_ambient(None)
+    assert led.current_animation == "nudge" and not nudge.done()
+    assert stray.cancelled()
+    await asyncio.wait_for(nudge, timeout=2.0)
+    assert led._ambient_state is None
+    assert _live_ambient_tasks() == []

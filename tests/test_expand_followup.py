@@ -179,3 +179,48 @@ async def test_render_normal_skips_while_voice_owns_screen(env):
     brain.ui_state = UIState.NORMAL
     brain._render_normal()
     assert tracker.fb_writes == before + 1
+
+
+async def test_second_tap_after_dismiss_during_finally_starts_voice(env):
+    """Review finding: tap to dismiss, then tap to talk while the dismissed
+    expansion is still in its (shielded) refresh + re-render, with nothing
+    queued. The second tap must start voice, not be swallowed."""
+    brain, tracker = env
+    sessions = _arm_voice(brain)
+    _slow_refresh_and_record_renders(brain, tracker, delay=1.0)
+
+    a = brain._start_expansion(FrameType.MESSAGES, lines("A"), duration=5.0)
+    await wait_for(lambda: brain.ui_state == UIState.EXPANDED)
+
+    await brain._handle_single_tap()  # dismiss
+    assert sessions == []
+    await asyncio.sleep(0.1)
+    assert brain.ui_state == UIState.NORMAL
+    assert brain._expand_tasks == {a} and not a.done()  # only finishing
+
+    await brain._handle_single_tap()  # tap to talk
+    assert sessions == [UIState.NORMAL]
+
+    await asyncio.wait_for(asyncio.gather(a, return_exceptions=True), timeout=3.0)
+    assert a.cancelled()
+    assert len(_renders(tracker)) == 1  # dismissed one still re-rendered
+
+
+async def test_replaced_expansion_finishing_still_dismisses_queued(env):
+    """A dismissed/replaced expansion counts as finishing, but the one
+    queued behind it is running: the tap dismisses that one."""
+    brain, tracker = env
+    sessions = _arm_voice(brain)
+    _slow_refresh_and_record_renders(brain, tracker, delay=0.5)
+
+    a = brain._start_expansion(FrameType.MESSAGES, lines("A"), duration=5.0)
+    await wait_for(lambda: brain.ui_state == UIState.EXPANDED)
+    b = brain._start_expansion(FrameType.ALBUM, lines("B"), duration=5.0)
+    await wait_for(lambda: a in brain._expand_finishing)
+    assert brain._has_running_expansion()  # b is queued
+
+    await brain._handle_single_tap()
+    await asyncio.wait_for(asyncio.gather(a, b, return_exceptions=True), timeout=3.0)
+    assert sessions == []
+    assert b.cancelled()
+    assert ("start", "B") not in tracker.events
