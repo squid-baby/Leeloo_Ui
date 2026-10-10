@@ -100,7 +100,7 @@ sudo bash boot/leeloo_setup.sh
 ```
 
 **What it does:**
-1. Installs apt packages: `hostapd`, `dnsmasq`, `libopenblas0`, `libjpeg-dev`, `i2c-tools`, etc.
+1. Installs apt packages: `hostapd`, `dnsmasq`, `python3-flask` (captive portal), `libopenblas0`, `libjpeg-dev`, `i2c-tools`, etc.
 2. Installs pip packages from `requirements.txt` (system-wide, no venv)
 3. Copies `boot/waveshare35a.dtbo` → `/boot/firmware/overlays/` (verified working version — **do not replace from LCD-show repo**)
 4. Patches `/boot/firmware/config.txt` with all required settings
@@ -168,13 +168,40 @@ Once the device is shipped, the end user:
    - ZIP code (for weather)
    - Telegram opt-in (optional)
    - Crew code (to join an existing crew) or creates a new one
-6. Device reboots, connects to their WiFi
+6. Device leaves setup mode and joins their WiFi (no reboot). Setup is only
+   marked complete (`"setup_complete": true`) once `nmcli` confirms `wlan0`
+   is connected to that network.
+   - **Wrong password:** the setup WiFi (`LEE-XXXX`) comes back and the LCD
+     says *"wifi failed — join LEE-XXXX again and re-enter the password"*.
+     Re-joining opens the WiFi page with an error; after re-entering the
+     password the portal skips straight to the finish step (name, ZIP and
+     crew are kept).
 7. Welcome screen shows:
    - **Phase 1 (60s):** Telegram QR code to connect `@Leeloo2259_bot`
    - **Phase 2 (60s):** Spotify OAuth QR if not already connected
 8. Device is fully operational
 
 > **Spotify auto-connect:** If the user's Spotify was previously linked (via another device on the same crew), tokens are auto-delivered by the relay server when the device joins the crew. Phase 2 is skipped.
+
+### WiFi Recovery (router changed or down)
+
+On every boot after setup, `leeloo_boot.py` waits up to ~3 minutes for the
+saved WiFi (NetworkManager autoconnect first, then an explicit connect). If it
+still isn't connected, the device starts the captive portal in **WiFi-only
+recovery mode**:
+
+- The LCD says it can't reach the saved network and to join `LEE-XXXX` to
+  enter a new password. Only the WiFi page works; user, crew and location
+  settings are kept.
+- If no new WiFi details arrive within ~10 minutes, the AP is stopped and the
+  saved WiFi is retried (LCD: *"retrying wifi"*). This repeats until one of
+  them works, so a temporary router outage doesn't strand the device.
+
+The portal web server only listens on the AP address (`192.168.4.1`; if that
+address isn't up after ~10s of retries it falls back to all interfaces) and is
+shut down as soon as setup succeeds; once `setup_complete` is true, its
+config-changing endpoints refuse requests (except WiFi re-entry in recovery
+mode).
 
 ---
 
@@ -343,6 +370,14 @@ Add to service file (setup script handles this automatically):
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 -u /home/pi/leeloo-ui/leeloo_boot.py
 ```
+
+### Service keeps restarting
+
+`leeloo_boot.py` exits with code 1 on fatal errors and when the brain crashes,
+and `leeloo.service` uses `Restart=on-failure` (with `StartLimitIntervalSec=0`,
+so systemd never gives up). Check the cause with
+`sudo journalctl -u leeloo.service -n 100 --no-pager`. `systemctl stop`
+does not trigger a restart.
 
 ### `No module named 'neopixel'` in logs
 

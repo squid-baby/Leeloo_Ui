@@ -65,6 +65,7 @@ apt-get install -y \
     python3-pip \
     python3-dev \
     python3-smbus \
+    python3-flask \
     git \
     hostapd \
     dnsmasq \
@@ -95,8 +96,8 @@ while IFS= read -r line; do
 done < "$LEELOO_DIR/requirements.txt"
 
 # Verify critical imports
-python3 -c "import PIL; import numpy; import websockets; print('[OK] Core imports verified')" \
-    || fail "Core Python package import failed (PIL/numpy/websockets). Run pip3 install manually."
+python3 -c "import PIL; import numpy; import websockets; import flask; print('[OK] Core imports verified')" \
+    || fail "Core Python package import failed (PIL/numpy/websockets/flask). Run pip3 install manually."
 
 ok "Python packages installed"
 
