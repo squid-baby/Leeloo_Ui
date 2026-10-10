@@ -180,8 +180,8 @@ async def test_triple_tap(clock):
 
 
 async def test_rebound_is_not_a_second_tap(clock, capsys):
-    """Ringing that is still visible on the first read after the blind period
-    is rejected by DEBOUNCE_TIME, not counted as a 2nd tap."""
+    """Ringing that is still visible after the settle/drain period is not
+    counted as a 2nd tap (its return to rest is a falling edge)."""
     events = []
 
     async def on_tap(tap_type):
@@ -191,8 +191,145 @@ async def test_rebound_is_not_a_second_tap(clock, capsys):
     await run_sequence(clock, mgr, [0.1])
     assert events == ["single_tap"]
     out = capsys.readouterr().out
-    assert out.count("Hit!") >= 2          # the rebound was seen...
-    assert out.count("Raw tap #") == 1     # ...but debounced
+    assert "falling edge, ignored" in out  # the rebound was seen...
+    assert out.count("Raw tap #") == 1     # ...but not counted
+
+
+class ScheduledAccel:
+    """ADXL345 stand-in driven by explicit (start, end, reading) windows,
+    relative to `origin`; BASELINE outside every window. Lets a test put a
+    rebound on an exact poll."""
+
+    def __init__(self, clock, origin, windows):
+        self.clock = clock
+        self.origin = origin
+        self.windows = windows
+
+    @property
+    def acceleration(self):
+        t = self.clock.now - self.origin
+        for start, end, reading in self.windows:
+            if start <= t < end:
+                return reading
+        return BASELINE
+
+
+async def run_windows(clock, windows, total=2.0):
+    events = []
+
+    async def on_tap(tap_type):
+        events.append(tap_type)
+
+    mgr = TapManager(callback=on_tap)
+    mgr.accel = ScheduledAccel(clock, clock.now, windows)
+    mgr._prev_magnitude = 9.8
+    loop_task = asyncio.ensure_future(mgr.start())
+    await clock.advance(total)
+    mgr.stop()
+    await clock.advance(0.2)
+    loop_task.cancel()
+    try:
+        await loop_task
+    except asyncio.CancelledError:
+        pass
+    return events
+
+
+# Poll schedule with the tap spike at [0.1, 0.15): reads at 0.00, 0.04, 0.08,
+# 0.12 (accepted tap) → settle → drain read at 0.20 → first post-blind read at
+# 0.28 (0.16 after the tap, inside the 0.18 debounce) → 0.32 (past it) → ...
+TAP_WINDOW = (0.1, 0.15, SPIKE)
+REBOUND_UP = (0.0, 0.0, 12.5)    # delta 2.7 above rest
+REBOUND_DOWN = (0.0, 0.0, 7.0)   # delta 2.8 below rest
+
+
+@pytest.mark.parametrize("rebound", [REBOUND_UP, REBOUND_DOWN], ids=["up", "down"])
+async def test_single_rebound_reading_after_blind_period_is_not_double_tap(clock, capsys, rebound):
+    """Review regression: one rebound reading on the first post-blind poll
+    followed by baseline. The rebound is debounced, and its return to rest one
+    poll later (past the debounce) used to be accepted as raw tap #2 → a false
+    double tap (crew-wide nudge / 'love' reaction)."""
+    events = await run_windows(clock, [TAP_WINDOW, (0.27, 0.30, rebound)])
+    out = capsys.readouterr().out
+    assert "falling edge, ignored" in out
+    assert out.count("Raw tap #") == 1, out
+    assert events == ["single_tap"]
+
+
+@pytest.mark.parametrize("rb_start", [round(0.155 + 0.01 * i, 3) for i in range(13)])
+@pytest.mark.parametrize("rb_len", [0.03, 0.07])
+async def test_rebound_sweep_never_yields_double_tap(clock, rb_start, rb_len):
+    """A rebound (one or two readings) that starts anywhere from just after
+    the spike up to the first post-blind poll never becomes a 2nd tap.
+    (A disturbance that first appears 0.2s after the tap is indistinguishable
+    from a fast human 2nd tap and is deliberately accepted.)"""
+    events = await run_windows(
+        clock, [TAP_WINDOW, (rb_start, rb_start + rb_len, REBOUND_UP)])
+    assert events == ["single_tap"]
+
+
+async def test_decaying_ringing_after_blind_period_is_ignored(clock):
+    """Overshoot that swings through rest with shrinking amplitude: each swing
+    is a big delta, but none moves further from rest than the one before."""
+    events = await run_windows(clock, [
+        TAP_WINDOW,
+        (0.27, 0.30, (0.0, 0.0, 13.0)),   # +3.2 (debounced rising edge)
+        (0.31, 0.34, (0.0, 0.0, 7.2)),    # -2.6 (past debounce, smaller swing)
+        (0.35, 0.38, (0.0, 0.0, 11.5)),   # +1.7
+    ])
+    assert events == ["single_tap"]
+
+
+async def test_real_second_tap_after_rebound_still_counts(clock):
+    """Rejecting the rebound must not swallow a real 2nd tap 0.3s later."""
+    events = await run_windows(clock, [
+        TAP_WINDOW,
+        (0.27, 0.30, REBOUND_UP),
+        (0.40, 0.45, SPIKE),
+    ])
+    assert events == ["double_tap"]
+
+
+async def test_tap_below_rest_is_detected(clock):
+    """Magnitude dips (tap direction opposing gravity) are rising edges too."""
+    events = await run_windows(clock, [(0.1, 0.15, (0.0, 0.0, 5.0))])
+    assert events == ["single_tap"]
+
+
+def test_falling_edge_is_not_a_hit():
+    mgr = TapManager(callback=None)
+    readings = iter([SPIKE, BASELINE])
+
+    class Seq:
+        @property
+        def acceleration(self):
+            return next(readings)
+
+    mgr.accel = Seq()
+    mgr._prev_magnitude = 9.8
+    assert mgr._check_tap() is True     # rest → spike: rising
+    assert mgr._check_tap() is False    # spike → rest: falling
+
+
+def test_rest_level_reanchors_after_sustained_offset(capsys):
+    """If the resting magnitude shifts by more than the threshold (sensor
+    offset change), the rest level re-anchors so taps work again."""
+    shifted = (0.0, 0.0, 12.0)
+    readings = [BASELINE] + [shifted] * leeloo_tap.REST_REANCHOR_READS + [(0.0, 0.0, 16.5)]
+    it = iter(readings)
+
+    class Seq:
+        @property
+        def acceleration(self):
+            return next(it)
+
+    mgr = TapManager(callback=None)
+    mgr.accel = Seq()
+    mgr._prev_magnitude = 9.8
+    results = [mgr._check_tap() for _ in readings]
+    assert "re-anchored" in capsys.readouterr().out
+    assert abs(mgr._rest_magnitude - 12.0) < leeloo_tap.TAP_THRESHOLD
+    assert results[-1] is True   # tap from the new rest level is detected
 
 
 async def test_two_separate_single_taps(clock):

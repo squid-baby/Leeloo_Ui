@@ -341,6 +341,35 @@ async def test_welcome_renders_off_loop(env):
     assert calls and not any(on_main for _, on_main in calls)
 
 
+@pytest.mark.parametrize("spotify", [False, True])
+async def test_welcome_qr_generation_off_loop(env, spotify):
+    """Both welcome phases build their QR PNG in the executor."""
+    brain = env
+    calls = []
+    brain._render_normal = lambda: None
+    brain._calculate_box_right = lambda: 230
+    brain._update_music = lambda: None
+    brain.device_config = {"user_name": "nat", "telegram_opted_in": True}
+    brain.crew_config = {"invite_code": "ABC-123"}
+    brain._should_show_spotify_qr = lambda: spotify
+    brain._generate_spotify_oauth_url = lambda: "https://example.invalid/auth"
+
+    def gen_qr(qr_url, label_text, sublabel_text, label_color, hint_text=None):
+        calls.append((label_text, threading.current_thread() is threading.main_thread()))
+        return str(brain.tmp_path / "qr.png")
+    brain._generate_qr_image = gen_qr
+    real_expand = brain.expand_frame
+
+    async def short_expand(frame_type, content_lines, duration=0.0):
+        await real_expand(frame_type, content_lines, duration=0.01)
+    brain.expand_frame = short_expand
+    await asyncio.wait_for(brain._launch_welcome_screen(), timeout=3)
+    expected = ["scan for Telegram"] + (["scan to sync"] if spotify else [])
+    assert [c[0] for c in calls] == expected
+    assert not any(on_main for _, on_main in calls)
+    assert brain._welcome_qr_active is False
+
+
 async def test_run_initial_render_off_loop(env, monkeypatch):
     brain = env
     calls = []
@@ -537,6 +566,119 @@ async def test_nudge_intent_does_not_leave_processing(env):
     brain.intent_router = Router()
     brain.ws_client.connected = False
     await asyncio.wait_for(brain._handle_single_tap(), timeout=3)
+    assert brain.ui_state == UIState.NORMAL
+
+
+async def test_voice_nudge_keeps_cyan_nudge_running(env):
+    """Review regression: the voice finally used to call led.off()
+    unconditionally, cancelling the 30s cyan nudge that the NUDGE intent had
+    just started (a brief flicker instead of the confirmation)."""
+    brain = env
+    brain._update_music = lambda: None
+    sent = []
+
+    class Voice:
+        async def record_and_transcribe(self):
+            return "send a nudge"
+
+    class Router:
+        async def route(self, transcript):
+            await asyncio.sleep(0.02)
+            return FakeIntent("NUDGE")
+
+    async def send_nudge():
+        await asyncio.sleep(0.05)
+        sent.append(1)
+
+    brain.voice = Voice()
+    brain.intent_router = Router()
+    brain.ws_client.connected = True
+    brain.ws_client.send_nudge = send_nudge
+    await asyncio.wait_for(brain._handle_single_tap(), timeout=3)
+    assert sent == [1]
+    await asyncio.sleep(0.2)
+    assert brain.led.current_animation == "nudge"
+    assert brain.led._animation_task and not brain.led._animation_task.done()
+    assert brain.ui_state == UIState.NORMAL
+    await brain.led.off()
+
+
+async def test_voice_success_leaves_no_voice_leds(env):
+    """A normal intent (no LED action) ends with the voice LEDs off and the
+    ambient breathe back."""
+    brain = env
+    brain._update_music = lambda: None
+
+    class Voice:
+        async def record_and_transcribe(self):
+            return "hello"
+
+    class Router:
+        async def route(self, transcript):
+            await asyncio.sleep(0.05)  # processing breathe is running
+            return FakeIntent("UNKNOWN")
+
+    brain.voice = Voice()
+    brain.intent_router = Router()
+    await brain.led.set_ambient("idle")
+    await asyncio.wait_for(brain._handle_single_tap(), timeout=3)
+    await asyncio.sleep(0.05)
+    assert brain.led.current_animation is None
+    assert not (brain.led._animation_task and not brain.led._animation_task.done())
+    assert len(_live_ambient_tasks()) == 1
+
+
+async def test_cancel_during_routing_stops_processing_leds(env):
+    brain = env
+    brain._update_music = lambda: None
+    routing = asyncio.Event()
+
+    class Voice:
+        async def record_and_transcribe(self):
+            return "hello"
+
+    class Router:
+        async def route(self, transcript):
+            routing.set()
+            await asyncio.sleep(3600)
+
+    brain.voice = Voice()
+    brain.intent_router = Router()
+    task = asyncio.ensure_future(brain._handle_single_tap())
+    await asyncio.wait_for(routing.wait(), timeout=2)
+    await wait_for(lambda: brain.led.current_animation == "processing")
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.1)
+    assert brain.led.current_animation is None
+    assert not (brain.led._animation_task and not brain.led._animation_task.done())
+    assert brain.ui_state == UIState.NORMAL
+
+
+async def test_cancel_before_processing_breathe_starts(env):
+    """Cancelled after the processing task was created but before it ran:
+    the task must be cancelled too, or it would start after the finally's
+    off() and breathe green forever."""
+    brain = env
+    brain._update_music = lambda: None
+
+    class Voice:
+        async def record_and_transcribe(self):
+            return "hello"
+
+    class Router:
+        async def route(self, transcript):
+            # No await before this: the processing task has not run yet
+            raise asyncio.CancelledError()
+
+    brain.voice = Voice()
+    brain.intent_router = Router()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(brain._handle_single_tap(), timeout=3)
+    await asyncio.sleep(0.1)
+    assert brain.led.current_animation is None
+    assert not (brain.led._animation_task and not brain.led._animation_task.done())
     assert brain.ui_state == UIState.NORMAL
 
 

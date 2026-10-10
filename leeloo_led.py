@@ -405,6 +405,12 @@ class LEDManager:
         self._set_color(OFF)
 
     @property
+    def current_animation(self):
+        """Name of the transient animation that owns the LEDs
+        ('listening', 'processing', 'nudge', ...) or None"""
+        return self._current_animation
+
+    @property
     def is_animating(self):
         """Check if an animation is currently running"""
         return self._current_animation is not None

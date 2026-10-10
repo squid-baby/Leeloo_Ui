@@ -15,6 +15,7 @@ import sys
 import json
 import time
 import asyncio
+import functools
 import struct
 import threading
 from enum import Enum, auto
@@ -1061,6 +1062,7 @@ class LeelooBrain:
 
     async def _voice_interaction(self):
         """Full voice interaction: listen → transcribe → route → act"""
+        processing_task = None
         try:
             # Ensure ambient LED is fully off before any audio — WS2812B DMA and
             # INMP441 I2S DMA conflict on Pi Zero if both run simultaneously.
@@ -1089,7 +1091,7 @@ class LeelooBrain:
             # Process (don't clobber an expansion that started meanwhile)
             if self.ui_state == UIState.LISTENING:
                 self.ui_state = UIState.PROCESSING
-            asyncio.create_task(self.led.processing())
+            processing_task = asyncio.create_task(self.led.processing())
             print("[BRAIN] Processing intent...")
 
             # Refresh music data in the executor CONCURRENTLY with intent
@@ -1135,7 +1137,16 @@ class LeelooBrain:
             # message), its own finally resets it.
             if self.ui_state in (UIState.LISTENING, UIState.PROCESSING):
                 self.ui_state = UIState.NORMAL
-            await self.led.off()
+            # The processing breathe may not have started yet (created but
+            # not run) when we are cancelled — cancel the task itself so it
+            # can never start after the off() below and breathe forever.
+            if processing_task is not None and not processing_task.done():
+                processing_task.cancel()
+            # Only stop LEDs this voice session owns. After a successful
+            # _execute_intent the LEDs may belong to an action — e.g. the 30s
+            # cyan nudge started by the NUDGE intent — which must keep running.
+            if self.led.current_animation in ("listening", "processing"):
+                await self.led.off()
 
     async def _execute_intent(self, intent):
         """Execute a classified intent"""
@@ -2058,21 +2069,25 @@ Write ONLY the 65-word paragraph, no preamble or explanation."""
 
         # Save original album art path to restore later
         original_art_path = self.album_art_path
+        loop = asyncio.get_running_loop()
 
         try:
             # _welcome_qr_active already set True before task creation
 
             # --- PHASE 1: Telegram QR (always if opted) ---
             if telegram_opted and crew_code:
-                qr_path = self._generate_qr_image(
+                # QR build + PIL compositing + PNG save: 100ms+ on a Pi Zero,
+                # keep it off the event loop (taps / WebSocket keep flowing)
+                qr_path = await loop.run_in_executor(None, functools.partial(
+                    self._generate_qr_image,
                     qr_url=f"https://t.me/Leeloo2259_bot?start={crew_code.replace('-', '')}",
                     label_text="scan for Telegram",
                     sublabel_text=crew_code,
                     label_color=COLORS['lavender']
-                )
+                ))
                 if qr_path:
                     self.album_art_path = qr_path
-                    await asyncio.get_running_loop().run_in_executor(None, self._render_normal)
+                    await loop.run_in_executor(None, self._render_normal)
                     print("[BRAIN] Telegram QR shown in album art box")
 
                 lines = [
@@ -2091,16 +2106,17 @@ Write ONLY the 65-word paragraph, no preamble or explanation."""
 
             # --- PHASE 2: Spotify OAuth QR (conditional) ---
             if show_spotify:
-                qr_path = self._generate_qr_image(
+                qr_path = await loop.run_in_executor(None, functools.partial(
+                    self._generate_qr_image,
                     qr_url=self._generate_spotify_oauth_url(),
                     label_text="scan to sync",
                     sublabel_text="your Spotify",
                     label_color=COLORS['green'],
                     hint_text="(optional)"
-                )
+                ))
                 if qr_path:
                     self.album_art_path = qr_path
-                    await asyncio.get_running_loop().run_in_executor(None, self._render_normal)
+                    await loop.run_in_executor(None, self._render_normal)
                     print("[BRAIN] Spotify OAuth QR shown in album art box")
 
                 lines = [
