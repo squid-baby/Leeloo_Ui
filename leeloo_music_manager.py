@@ -13,6 +13,7 @@ import base64
 
 # Import centralized album art utility
 from leeloo_album_art import download_and_create_album_art
+from leeloo_fileutil import atomic_write_json
 
 LEELOO_HOME = os.environ.get("LEELOO_HOME", "/home/pi/leeloo-ui")  # same override as leeloo_brain
 TOKENS_FILE = os.path.join(LEELOO_HOME, "spotify_tokens.json")
@@ -81,9 +82,8 @@ def load_tokens():
 
 
 def save_tokens(tokens):
-    """Save Spotify tokens"""
-    with open(TOKENS_FILE, 'w') as f:
-        json.dump(tokens, f, indent=2)
+    """Save Spotify tokens (atomic, owner-only: they are secrets)"""
+    atomic_write_json(TOKENS_FILE, tokens, indent=2, mode=0o600)
 
 
 def refresh_access_token():
@@ -339,8 +339,7 @@ def update_music_display():
                 listeners = get_listeners_for_artist_name(artist)
                 if listeners:
                     shared_music['listeners'] = listeners
-                    with open(CURRENT_MUSIC_FILE, 'w') as f:
-                        json.dump(shared_music, f, indent=2)
+                    atomic_write_json(CURRENT_MUSIC_FILE, shared_music, indent=2)
                     print(f"   📤 Updated shared music listeners: {listeners}")
         age = time.time() - shared_music.get('timestamp', 0)
         print(f"📤 Nothing playing → showing shared: {shared_music.get('artist')} - {shared_music.get('track')} ({int(age/60)} min old)")
