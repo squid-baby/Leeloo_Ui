@@ -125,7 +125,8 @@ def test_run_cmd_passes_argv_without_shell(monkeypatch):
     argv = csw.build_connect_argv(MALICIOUS_SSID, MALICIOUS_PASSWORD)
     ok, out, _ = csw.run_cmd(argv)
     assert ok and out == "ok"
-    assert seen['argv'] == argv
+    assert seen['argv'] == csw.with_nmcli_wait(argv, 30)[0]
+    assert seen['argv'][3:] == argv[1:]
     assert not seen['kwargs'].get('shell', False)
 
 
@@ -154,10 +155,10 @@ def test_run_cmd_refuses_shell_strings():
 
 def test_connect_argv_keeps_values_literal():
     argv = csw.build_connect_argv(MALICIOUS_SSID, MALICIOUS_PASSWORD)
-    assert argv == ['sudo', 'nmcli', 'device', 'wifi', 'connect', MALICIOUS_SSID,
+    assert argv == ['nmcli', 'device', 'wifi', 'connect', MALICIOUS_SSID,
                     'password', MALICIOUS_PASSWORD, 'ifname', 'wlan0']
     assert csw.build_set_psk_argv('My:Net', MALICIOUS_PASSWORD)[-1] == MALICIOUS_PASSWORD
-    assert csw.build_profile_up_argv(MALICIOUS_SSID)[5] == MALICIOUS_SSID
+    assert csw.build_profile_up_argv(MALICIOUS_SSID)[4] == MALICIOUS_SSID
 
 
 def test_new_network_connect_passes_malicious_values_as_single_items():
@@ -183,7 +184,7 @@ def test_existing_profile_gets_new_password_and_no_duplicate_profile():
     nm.psk['netplan-wlan0-Home'] = 'old-pass'
     assert csw.connect_with_networkmanager('Home', 'new-pass', run=nm,
                                            sleep=no_sleep, wait_s=3)
-    assert ['sudo', 'nmcli', 'connection', 'modify', 'id', 'netplan-wlan0-Home',
+    assert ['nmcli', 'connection', 'modify', 'id', 'netplan-wlan0-Home',
             'wifi-sec.psk', 'new-pass'] in nm.calls
     assert not any('connect' in c and 'wifi' in c for c in nm.calls)
 
@@ -222,7 +223,7 @@ def test_existing_profile_failure_does_not_create_another_profile():
     nm = FakeNM(profiles={'Home': 'Home'}, correct={'Home': 'right'})
     assert not csw.connect_with_networkmanager('Home', 'wrong', run=nm,
                                                sleep=no_sleep, wait_s=2)
-    assert not any(c[1:5] == ['nmcli', 'device', 'wifi', 'connect'] for c in nm.calls)
+    assert not any(c[:4] == ['nmcli', 'device', 'wifi', 'connect'] for c in nm.calls)
 
 
 # ============================================
@@ -300,7 +301,7 @@ def test_parse_active_wlan_profile():
 
 def test_get_psk_argv_is_literal():
     assert csw.build_get_psk_argv(MALICIOUS_SSID) == [
-        'sudo', 'nmcli', '-s', '-g', '802-11-wireless-security.psk',
+        'nmcli', '-s', '-g', '802-11-wireless-security.psk',
         'connection', 'show', 'id', MALICIOUS_SSID]
 
 
@@ -309,8 +310,8 @@ def test_already_connected_with_same_password_takes_shortcut():
                 connected_ssid='Home', active='Home')
     nm.psk['Home'] = 'pa:ss'
     assert csw.connect_with_networkmanager('Home', 'pa:ss', run=nm, sleep=no_sleep, wait_s=3)
-    assert not any(c[1:4] == ['nmcli', 'connection', 'modify'] for c in nm.calls)
-    assert not any(c[1:4] == ['nmcli', 'connection', 'up'] for c in nm.calls)
+    assert not any(c[:3] == ['nmcli', 'connection', 'modify'] for c in nm.calls)
+    assert not any(c[:3] == ['nmcli', 'connection', 'up'] for c in nm.calls)
 
 
 def test_already_connected_with_other_password_is_not_trusted():
@@ -320,7 +321,7 @@ def test_already_connected_with_other_password_is_not_trusted():
     nm.psk['Home'] = 'right'
     assert not csw.connect_with_networkmanager('Home', 'typo', run=nm, sleep=no_sleep, wait_s=3)
     # The typo was tried on the real profile...
-    assert ['sudo', 'nmcli', 'connection', 'modify', 'id', 'Home', 'wifi-sec.psk', 'typo'] in nm.calls
+    assert ['nmcli', 'connection', 'modify', 'id', 'Home', 'wifi-sec.psk', 'typo'] in nm.calls
     # ...then the working password was put back and the device went back online
     assert nm.psk['Home'] == 'right'
     assert nm.connected_ssid == 'Home' and nm.active == 'Home'
@@ -340,7 +341,7 @@ def test_wrong_password_restores_working_profile_password():
     assert not csw.connect_with_networkmanager('Home', 'wrong', run=nm, sleep=no_sleep, wait_s=2)
     assert nm.psk['netplan-wlan0-Home'] == 'right'
     # Wasn't online before, so no extra reconnect attempt
-    ups = [c for c in nm.calls if c[1:4] == ['nmcli', 'connection', 'up']]
+    ups = [c for c in nm.calls if c[:3] == ['nmcli', 'connection', 'up']]
     assert len(ups) == 1
 
 
@@ -350,7 +351,7 @@ def test_duplicate_profile_autoconnect_does_not_confirm_typed_password():
 
     def run(argv, timeout=30):
         result = nm(argv, timeout)
-        if argv[1:4] == ['nmcli', 'connection', 'up'] and not result[0]:
+        if argv[:3] == ['nmcli', 'connection', 'up'] and not result[0]:
             # NM falls back to the other saved profile for the same SSID
             nm.connected_ssid, nm.active = 'Home', 'Home 1'
         return result
@@ -485,7 +486,7 @@ def test_finish_success_marks_complete_only_after_connect(portal):
 
 
 def test_wrong_password_keeps_setup_incomplete_and_brings_ap_back(portal):
-    fill_first_run(portal, password='wrong')
+    fill_first_run(portal, password='wrong-password')
     portal.wifi_results = [False]
     portal.client.post('/api/finish')
 
@@ -564,7 +565,7 @@ def test_recovery_mode_is_wifi_only_and_keeps_old_wifi_until_confirmed(portal):
     portal.cp.reset_portal_state(recovery=True)
 
     assert portal.client.post('/api/info', json={'user_name': 'Eve', 'zip_code': '12345'}).status_code == 403
-    r = portal.client.post('/api/wifi', json={'ssid': 'NewNet', 'password': 'bad'})
+    r = portal.client.post('/api/wifi', json={'ssid': 'NewNet', 'password': 'bad-password'})
     assert r.get_json() == {'success': True, 'next': '/setup/done'}
     assert portal.config()['wifi_ssid'] == 'OldNet'  # Not replaced yet
 
@@ -575,16 +576,16 @@ def test_recovery_mode_is_wifi_only_and_keeps_old_wifi_until_confirmed(portal):
     assert cfg['wifi_password'] == 'old-pass'
     assert portal.lcd[-1][0] == 'wifi_failed'
 
-    portal.client.post('/api/wifi', json={'ssid': 'NewNet', 'password': 'good'})
+    portal.client.post('/api/wifi', json={'ssid': 'NewNet', 'password': 'good-password'})
     portal.wifi_results = [True]
     portal.client.post('/api/finish')
     cfg = portal.config()
-    assert cfg['wifi_ssid'] == 'NewNet' and cfg['wifi_password'] == 'good'
+    assert cfg['wifi_ssid'] == 'NewNet' and cfg['wifi_password'] == 'good-password'
     assert cfg['user_name'] == 'Nat'
 
 
 def test_stale_finish_after_failure_does_not_retry_bad_password(portal):
-    fill_first_run(portal, password='wrong')
+    fill_first_run(portal, password='wrong-password')
     portal.wifi_results = [False]
     portal.client.post('/api/finish')
     assert portal.cp.setup_state['pending_password'] is None
@@ -593,7 +594,7 @@ def test_stale_finish_after_failure_does_not_retry_bad_password(portal):
     # A stale /setup/done tab reloads after the phone rejoins LEE-XXXX
     r = portal.client.post('/api/finish')
     assert r.status_code == 409 and r.get_json()['retry'] is True
-    assert portal.wifi_calls == [('Home', 'wrong')]   # No second attempt
+    assert portal.wifi_calls == [('Home', 'wrong-password')]   # No second attempt
     assert portal.ap_starts == 1                      # AP stayed up
     assert portal.lcd[-1][0] == 'wifi_failed'
 
@@ -613,12 +614,12 @@ def test_stale_finish_after_failure_refused_in_recovery(portal):
     portal.cp.save_device_config({'wifi_ssid': 'Old', 'wifi_password': 'old',
                                   'setup_complete': True})
     portal.cp.reset_portal_state(recovery=True)
-    portal.client.post('/api/wifi', json={'ssid': 'New', 'password': 'bad'})
+    portal.client.post('/api/wifi', json={'ssid': 'New', 'password': 'bad-password'})
     portal.wifi_results = [False]
     portal.client.post('/api/finish')
     r = portal.client.post('/api/finish')
     assert r.status_code == 409 and r.get_json()['retry'] is True
-    assert portal.wifi_calls == [('New', 'bad')]
+    assert portal.wifi_calls == [('New', 'bad-password')]
 
 
 def test_finish_while_connecting_does_not_start_second_attempt(portal):
@@ -897,25 +898,25 @@ def test_api_wifi_rechecks_connecting_under_lock(portal):
     """A /api/finish that starts after the guard passed must not get its
     credentials swapped by a /api/wifi that was already past the guard"""
     cp = portal.cp
-    fill_first_run(portal, password='P1')
+    fill_first_run(portal, password='password-1')
     with cp._state_lock:
         cp.setup_state['connecting'] = True   # /api/finish won the race
     # Call the view directly: the before_request guard already ran (and passed)
     with cp.app.test_request_context('/api/wifi', method='POST',
-                                     json={'ssid': 'Home', 'password': 'P2'}):
+                                     json={'ssid': 'Home', 'password': 'password-2'}):
         resp, status = cp.api_wifi()
     assert status == 409 and resp.get_json()['success'] is False
-    assert portal.config()['wifi_password'] == 'P1'
-    assert cp.setup_state['pending_password'] == 'P1'
+    assert portal.config()['wifi_password'] == 'password-1'
+    assert cp.setup_state['pending_password'] == 'password-1'
 
 
 def test_api_wifi_rechecks_finished_under_lock(portal):
     cp = portal.cp
-    fill_first_run(portal, password='P1')
+    fill_first_run(portal, password='password-1')
     with cp._state_lock:
         cp.setup_state['finished'] = True
     with cp.app.test_request_context('/api/wifi', method='POST',
-                                     json={'ssid': 'Evil', 'password': 'x'}):
+                                     json={'ssid': 'Evil', 'password': 'evil-password'}):
         resp, status = cp.api_wifi()
     assert status == 409
     assert portal.config()['wifi_ssid'] == 'Home'
@@ -952,7 +953,7 @@ def test_unclear_failure_keeps_full_wait_and_can_still_connect():
     nm = FakeNM(correct={'Home': 'pw'})
 
     def run(argv, timeout=30):
-        if argv[1:5] == ['nmcli', 'device', 'wifi', 'connect']:
+        if argv[:4] == ['nmcli', 'device', 'wifi', 'connect']:
             nm.calls.append(list(argv))
             return False, "", "sudo timed out after 30s"
         if fc.now >= 1 + csw.FAILED_CONNECT_WAIT_S + 3:

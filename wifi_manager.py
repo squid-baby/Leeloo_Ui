@@ -204,51 +204,88 @@ def stop_ap_mode():
     run_command(['sudo', 'systemctl', 'stop', 'hostapd'])
     run_command(['sudo', 'systemctl', 'stop', 'dnsmasq'])
 
-    # Reset wlan0
+    # Reset wlan0 (drops the AP address and AP state), then raise it again:
+    # NetworkManager doesn't raise a link it already manages, so a wlan0
+    # left down stays "unavailable" and every connect attempt fails
     run_command(['sudo', 'ip', 'addr', 'flush', 'dev', 'wlan0'])
     run_command(['sudo', 'ip', 'link', 'set', 'wlan0', 'down'])
     time.sleep(0.5)
+    run_command(['sudo', 'ip', 'link', 'set', 'wlan0', 'up'])
 
     print("AP mode stopped")
 
 
+MAX_SCAN_RESULTS = 15
+
+
+def _nmcli_unescape(value):
+    """Undo `nmcli -t` escaping of a single field ("My\\:Net" -> "My:Net")"""
+    out = []
+    i = 0
+    while i < len(value):
+        if value[i] == '\\' and i + 1 < len(value):
+            out.append(value[i + 1])
+            i += 2
+            continue
+        out.append(value[i])
+        i += 1
+    return ''.join(out)
+
+
+def _add_network(networks, ssid):
+    if ssid and ssid not in networks and not ssid.startswith('LEE-'):
+        networks.append(ssid)
+
+
+def parse_nmcli_ssids(output):
+    """SSIDs from `nmcli -t -f SSID device wifi list` (hidden/our AP skipped)"""
+    networks = []
+    for line in (output or '').splitlines():
+        _add_network(networks, _nmcli_unescape(line))
+    return networks
+
+
+def parse_iwlist_ssids(output):
+    """SSIDs from `iwlist wlan0 scan`"""
+    networks = []
+    for line in (output or '').splitlines():
+        if 'ESSID:' in line:
+            _add_network(networks, line.split('ESSID:', 1)[1].strip().strip('"'))
+    return networks
+
+
 def scan_wifi_networks():
     """
-    Scan for available WiFi networks.
-    Uses iwlist scan (works even when hostapd isn't running yet).
-    Called by captive portal API before AP mode fully takes over.
-    Returns list of SSIDs.
-    """
-    networks = []
+    Scan for available WiFi networks. Returns a list of SSIDs.
 
-    # Try iwlist scan first (works when wlan0 is in managed mode)
+    Call it BEFORE NetworkManager is stopped / wlan0 is released for the AP:
+    NetworkManager's scan is the reliable one, and once hostapd owns wlan0
+    the brcmfmac driver often refuses scans. If NetworkManager can't scan
+    (it's stopped), raise wlan0 and fall back to iwlist (a down link can't
+    scan at all).
+    """
+    # NetworkManager: fresh scan first, then whatever it has cached
+    for rescan in ('yes', 'no'):
+        try:
+            result = run_command(['nmcli', '-t', '-f', 'SSID', 'device', 'wifi', 'list',
+                                  '--rescan', rescan, 'ifname', 'wlan0'])
+            if result and result.returncode == 0:
+                networks = parse_nmcli_ssids(result.stdout)
+                if networks:
+                    return networks[:MAX_SCAN_RESULTS]
+        except Exception as e:
+            print(f"nmcli scan error: {e}")
+
+    # Fallback: iwlist (NetworkManager not running)
     try:
+        run_command(['sudo', 'ip', 'link', 'set', 'wlan0', 'up'])
         result = run_command(['sudo', 'iwlist', 'wlan0', 'scan'])
         if result and result.returncode == 0:
-            for line in result.stdout.split('\n'):
-                if 'ESSID:' in line:
-                    ssid = line.split('ESSID:')[1].strip().strip('"')
-                    if ssid and ssid not in networks and not ssid.startswith('LEE-'):
-                        networks.append(ssid)
-            if networks:
-                return networks[:15]
+            return parse_iwlist_ssids(result.stdout)[:MAX_SCAN_RESULTS]
     except Exception as e:
         print(f"iwlist scan error: {e}")
 
-    # Fallback: nmcli scan (if NM is managing wlan0)
-    try:
-        run_command(['sudo', 'nmcli', 'device', 'wifi', 'rescan'])
-        time.sleep(2)
-        result = run_command(['nmcli', '-t', '-f', 'SSID', 'device', 'wifi', 'list'])
-        if result and result.returncode == 0:
-            for line in result.stdout.strip().split('\n'):
-                ssid = line.strip()
-                if ssid and ssid not in networks and not ssid.startswith('LEE-'):
-                    networks.append(ssid)
-    except Exception as e:
-        print(f"nmcli scan error: {e}")
-
-    return networks[:15]
+    return []
 
 
 def connect_to_wifi(ssid, password):

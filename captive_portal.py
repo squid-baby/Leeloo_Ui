@@ -43,6 +43,7 @@ from wifi_manager import (
 )
 from connect_saved_wifi import switch_to_wifi, stop_ap_mode as restore_client_mode
 from leeloo_device_id import get_device_crew_code
+from leeloo_fileutil import atomic_write_json
 
 app = Flask(__name__)
 
@@ -146,17 +147,50 @@ def load_device_config():
 
 
 def save_device_config(data):
+    # Atomic: a power cut mid-write must not wipe the config (that would send
+    # the device back to first-run setup). 0600: it holds the WiFi password.
     existing = load_device_config()
     existing.update(data)
-    os.makedirs(os.path.dirname(DEVICE_CONFIG_PATH), exist_ok=True)
-    with open(DEVICE_CONFIG_PATH, 'w') as f:
-        json.dump(existing, f, indent=2)
+    atomic_write_json(DEVICE_CONFIG_PATH, existing, indent=2, mode=0o600)
 
 
 def save_crew_config(data):
-    os.makedirs(os.path.dirname(CREW_CONFIG_PATH), exist_ok=True)
-    with open(CREW_CONFIG_PATH, 'w') as f:
-        json.dump(data, f, indent=2)
+    atomic_write_json(CREW_CONFIG_PATH, data, indent=2)
+
+
+# WPA2 passphrase: 8-63 characters (bytes, as NetworkManager counts them),
+# or the raw key as exactly 64 hex digits
+WIFI_PASSWORD_ERROR = 'wifi password must be 8-63 characters (or 64 hex digits)'
+_HEX_DIGITS = frozenset('0123456789abcdefABCDEF')
+
+
+def validate_wifi_credentials(ssid, password):
+    """
+    Error message for an unusable SSID/password, or None if they're fine.
+    The SSID can come from the scan list or be typed (hidden networks): either
+    way it must be 1-32 bytes of UTF-8. Open networks aren't supported (the
+    connect path always needs a password), so a password is required.
+    """
+    if not isinstance(ssid, str) or not isinstance(password, str):
+        return 'missing ssid or password'
+    if not ssid:
+        return 'pick a network or type its name'
+    if not password:
+        return 'enter the wifi password'
+    if '\x00' in ssid or '\x00' in password:
+        return 'invalid characters in network name or password'
+    try:
+        ssid_bytes = len(ssid.encode('utf-8'))
+        password_bytes = len(password.encode('utf-8'))
+    except UnicodeEncodeError:
+        return 'invalid characters in network name or password'
+    if ssid_bytes > 32:
+        return 'network name is too long (max 32 bytes)'
+    if len(password) == 64 and all(c in _HEX_DIGITS for c in password):
+        return None
+    if not 8 <= password_bytes <= 63:
+        return WIFI_PASSWORD_ERROR
+    return None
 
 
 # ============================================
@@ -534,13 +568,21 @@ def setup_wifi():
 
         <form id="wifiForm">
             <label>NETWORK</label>
-            <select name="ssid" id="ssid" required>
+            <select name="ssid" id="ssid">
                 <option value="">scanning...</option>
             </select>
 
+            <label>OR TYPE A NETWORK NAME</label>
+            <input type="text" name="ssid_other" id="ssidOther"
+                   placeholder="other / hidden network" maxlength="32"
+                   autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+            <div class="hint">a typed name is used instead of the list</div>
+
             <label>PASSWORD</label>
             <input type="password" name="password" id="password"
-                   placeholder="enter wifi password" required>
+                   placeholder="enter wifi password" required
+                   minlength="8" maxlength="64">
+            <div class="hint">8-63 characters</div>
 
             <button type="submit" class="btn" id="wifiBtn">CONNECT</button>
         </form>
@@ -569,22 +611,41 @@ def setup_wifi():
                 if (networks.length > 0) {{
                     networks.forEach(n => addOption(select, String(n), String(n)));
                 }} else {{
-                    addOption(select, '', 'no networks found');
+                    addOption(select, '', 'no networks found: type the name below');
                 }}
             }} catch (e) {{
                 console.error('scan failed:', e);
+                const select = document.getElementById('ssid');
+                while (select.firstChild) {{
+                    select.removeChild(select.firstChild);
+                }}
+                addOption(select, '', 'scan failed: type the name below');
             }}
         }}
         loadNetworks();
 
+        // A typed network name (hidden or unlisted network) wins over the list
+        function chosenSsid() {{
+            const typed = document.getElementById('ssidOther').value;
+            if (typed.trim() !== '') {{
+                return typed;
+            }}
+            return document.getElementById('ssid').value;
+        }}
+
         document.getElementById('wifiForm').addEventListener('submit', async (e) => {{
             e.preventDefault();
             const btn = document.getElementById('wifiBtn');
+            const ssid = chosenSsid();
+            if (!ssid) {{
+                alert('pick a network or type its name');
+                return;
+            }}
             btn.disabled = true;
             btn.textContent = 'SAVING...';
 
             const data = {{
-                ssid: document.getElementById('ssid').value,
+                ssid: ssid,
                 password: document.getElementById('password').value
             }};
 
@@ -1099,11 +1160,12 @@ def guard_state_changing_requests():
 
 @app.route('/api/networks', methods=['GET'])
 def api_networks():
-    # Use cached networks (scanned before AP mode started)
-    # because wlan0 is owned by hostapd and can't scan
+    # Use cached networks (scanned before NetworkManager was stopped for the
+    # AP) because hostapd owns wlan0 now and scans are often refused
     if cached_networks:
         return jsonify({'networks': cached_networks})
-    # Fallback: try scanning anyway (might work in dev mode)
+    # Fallback: try scanning anyway (might work in dev mode). The page also
+    # lets the user type a network name, so an empty list isn't a dead end.
     networks = scan_wifi_networks()
     return jsonify({'networks': networks})
 
@@ -1115,11 +1177,9 @@ def api_wifi():
     ssid = data.get('ssid')
     password = data.get('password')
 
-    if not isinstance(ssid, str) or not isinstance(password, str) or not ssid or not password:
-        return jsonify({'success': False, 'error': 'missing ssid or password'})
-
-    if len(ssid.encode('utf-8')) > 32:
-        return jsonify({'success': False, 'error': 'network name is too long'})
+    error = validate_wifi_credentials(ssid, password)
+    if error:
+        return jsonify({'success': False, 'error': error})
 
     with _state_lock:
         # Check again under the lock: the before_request guard ran without it,
@@ -1494,11 +1554,15 @@ def run_captive_portal(lcd_update_callback=None, dev_mode=False, recovery=False,
             server.server_close()
         return False
 
-    # Pre-scan WiFi networks BEFORE starting AP mode
-    # (once hostapd owns wlan0, we can't scan anymore)
+    # Pre-scan WiFi networks while NetworkManager still runs, BEFORE wlan0 is
+    # released for the AP (once NM is stopped and hostapd owns wlan0, scans
+    # come back empty or are refused)
     print("[PORTAL] Pre-scanning WiFi networks...")
     cached_networks = scan_wifi_networks()
     print(f"[PORTAL] Found {len(cached_networks)} networks: {cached_networks}")
+
+    # Now stop NetworkManager so hostapd can have wlan0
+    release_wlan0_for_ap()
 
     print(f"[PORTAL] PRODUCTION MODE{' (WiFi recovery)' if recovery else ''} — starting AP...")
     ssid = start_ap_mode()

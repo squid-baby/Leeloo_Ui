@@ -28,6 +28,7 @@ sys.path.insert(0, '/home/pi/leeloo-ui/boot')
 sys.path.insert(0, '/home/pi/leeloo-ui')
 
 from boot.leeloo_splash import show_splash, clear_screen, write_to_fb
+from leeloo_fileutil import atomic_write_json
 
 # Configuration
 LEELOO_HOME = '/home/pi/leeloo-ui'
@@ -53,9 +54,10 @@ def load_json(path):
         return {}
 
 
-def save_json(path, data):
-    with open(path, 'w') as f:
-        json.dump(data, f, indent=2)
+def save_json(path, data, mode=None):
+    # Atomic: a power cut mid-write must not leave an empty config (an empty
+    # device_config.json sends the device back to first-run setup)
+    atomic_write_json(path, data, indent=2, mode=mode)
 
 
 def is_first_run():
@@ -343,7 +345,8 @@ def ensure_wifi_or_recover():
     print(f"[BOOT] No WiFi after {BOOT_WIFI_WAIT_S}s, starting WiFi recovery")
 
     def run_portal():
-        disconnect_wifi_for_setup()
+        # The portal scans for networks while NetworkManager still runs, then
+        # releases wlan0 for the AP itself (stopping NM first empties the list)
         return run_setup_portal(recovery=True, idle_timeout_s=RECOVERY_PORTAL_WINDOW_S)
 
     def on_retry():
@@ -405,7 +408,7 @@ def do_deferred_geocoding():
                 config['timezone'] = timezone
                 print(f"[BOOT] Timezone: {timezone}")
 
-        save_json(DEVICE_CONFIG_PATH, config)
+        save_json(DEVICE_CONFIG_PATH, config, mode=0o600)  # Holds the WiFi password
         print("[BOOT] Geocoding complete, config updated")
 
     except Exception as e:
@@ -545,13 +548,12 @@ def main():
     if first_run:
         # ALWAYS run captive portal on first run — user needs to set up
         # name, crew, etc. even if WiFi happens to be connected.
-        print("First run - disconnecting WiFi for captive portal setup")
+        print("First run - starting captive portal setup")
         show_splash("Starting setup...", 20)
         time.sleep(0.5)
 
-        # Disconnect any existing WiFi so AP mode can take over wlan0
-        disconnect_wifi_for_setup()
-
+        # The portal scans for networks while NetworkManager still runs, then
+        # disconnects any WiFi and releases wlan0 for the AP itself
         run_first_run_screen()
 
         # Blocks until the home WiFi is confirmed. A wrong password brings
