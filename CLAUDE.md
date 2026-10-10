@@ -130,7 +130,7 @@ cd /home/pi/leeloo-ui
 sudo python3 leeloo_brain.py  # See print() output
 
 # Check tap detection
-sudo python3 test_tap_live.py
+sudo python3 leeloo_tap.py  # prints detected taps
 
 # Test display
 sudo python3 show_on_display.py
@@ -257,7 +257,47 @@ File is `LeeLoo_boot.png` in `/home/pi/leeloo-ui/` — scaled to fill 480x320 at
 sshpass -p 'gadget' scp new_image.png pi@leeloo.local:/home/pi/leeloo-ui/LeeLoo_boot.png
 ```
 
+### 15. **Show Expanded Frames Only Through `_start_expansion()`**
+Never `create_task(self.expand_frame(...))` directly. `_start_expansion()` cancels the running and queued expansions and serialises them with a lock, so two frames never draw at once and an old task never resets `ui_state` after a new one starts. Cancel with `_cancel_expansions()`.
+```python
+# ✅ GOOD
+self._start_expansion(FrameType.MESSAGES, lines, duration=EXPANDED_HOLD_DURATION)
+# ❌ BAD — old expansion keeps drawing; it even cancelled itself before
+self._expand_task = asyncio.create_task(self.expand_frame(...))
+```
+
+### 16. **LED Recording Guard (DMA, see #11)**
+`_voice_interaction` calls `await self.led.recording_started()` before `arecord` and `self.led.recording_finished()` in `finally`. While the guard is on, every LED animation is skipped and `set_ambient()` only stores the state. Incoming messages / nudges during recording no longer kill the audio. Keep new LED effects inside `_run_animation()` so they respect the guard.
+
+### 17. **Threads: Display Lock, Music Lock, Loop Handle**
+Executor threads and the event loop share `self.display` and the framebuffer: hold `self._display_lock` for render + full-frame writes. Spotify refresh + `current_music.json` writes hold `self._music_lock`. Never hold either across an `await`. To start a coroutine from a thread, use `asyncio.run_coroutine_threadsafe(coro, self._loop)` — `ensure_future` raises in a thread.
+
+### 18. **Power-Safe JSON Writes**
+The device can lose power any time. Write config/state JSON with `leeloo_fileutil.atomic_write_json()` (temp file + `os.replace`), never `open(path, 'w')`. Use `mode=0o600` for secrets (`device_config.json` holds the WiFi password, `spotify_tokens.json`). Use `durable=False` only for small writes on the event loop (skips a slow SD-card fsync).
+
+### 19. **WiFi Setup Rules**
+- Never `shell=True` with SSIDs or passwords (portal input runs as root) — argv lists only.
+- `setup_complete` is written **only after** WiFi is confirmed connected. A wrong password brings the setup AP back with an LCD error.
+- Boot recovery: no WiFi for ~3 min → WiFi-only recovery portal; no input for ~10 min → retry saved WiFi; repeat.
+- The portal server shuts down after setup and refuses setup POSTs afterwards.
+
+### 20. **Python 3.9 Compatibility**
+Pi OS Bullseye ships Python 3.9. No `str | None` annotations (use `Optional[str]`), no `Task.cancelling()`, no `asyncio.timeout()`, no `match`. `tests/test_py39_compat.py` checks annotations.
+
 ## Testing
+
+### Automated Tests (run these before every deploy)
+```bash
+# One time: install test tools on your laptop (not needed on the Pi)
+pip install -r requirements.txt -r requirements-dev.txt
+
+# Run all tests (no Pi hardware, network or API keys needed)
+python3 -m pytest -q
+
+# Run one file, with names of each test
+python3 -m pytest -v tests/test_tap.py
+```
+Every new feature or fix gets a test in `tests/` that **fails before** the change and **passes after** it. Hardware (LEDs, accelerometer) runs in mock mode in tests.
 
 ### Without Hardware
 ```python
@@ -276,7 +316,7 @@ sudo python3 demos/demo_message_expand.py
 sudo python3 demos/demo_weather_typewriter.py
 
 # Tap detection
-sudo python3 test_tap_live.py
+sudo python3 leeloo_tap.py  # prints detected taps
 ```
 
 ## Server Deployment
@@ -291,9 +331,10 @@ ssh root@leeloobot.xyz "pm2 restart leeloo-relay"
 ssh root@leeloobot.xyz "pm2 logs leeloo-relay --lines 20"
 ```
 
-**Telegram Bot:** Integrated in `server.js`
-- Webhook: `https://leeloobot.xyz/api/telegram/webhook`
+**Telegram Bot:** `leeloo_server/telegram_bot.py` (systemd service, **long polling** — no webhook)
+- Talks to the relay's `/api/telegram/*` endpoints on localhost
 - Bot: `@Leeloo2259_bot`
+- `relay_server.py` is old and not deployed; `server.js` is the live relay
 
 ## Environment Variables
 
@@ -322,12 +363,20 @@ SPOTIFY_CLIENT_SECRET=...      # Client credentials flow + token refresh
 - ❌ Run continuous LED animations (ambient breathe) while voice recording — DMA conflict kills audio
 - ❌ Trust `is_playing` from `current_music.json` without checking `spotify_tokens.json` exists
 - ❌ Write off-screen content in a tight loop without `await asyncio.sleep(0)` — blocks I2S reads
+- ❌ Call `expand_frame()` through `create_task` — use `_start_expansion()`
+- ❌ Write JSON state with `open(path, 'w')` — use `atomic_write_json()`
+- ❌ Hardcode model IDs or Spotify credentials — `HAIKU_MODEL` constant, `.env`
+- ❌ Use `shell=True` with any user-provided value
+- ❌ Call `asyncio.ensure_future()` from an executor thread
 
 ## Tuning Values
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
 | `TAP_THRESHOLD` | 1.2 m/s² | Lower = more sensitive |
+| `DOUBLE_TAP_WINDOW` | 0.55s | Max gap between taps; also single-tap delay |
+| `DEBOUNCE_TIME` | 0.18s | Rejects rebound; must stay < double-tap window |
+| `SETTLE_TIME` | 0.08s | Blind time after a spike (~0.16s total with drain) |
 | Music polling (active) | 20s | When is_playing=true |
 | Music polling (recent) | 60s | Last played <5min |
 | Music polling (idle) | 120s | Idle state |
@@ -348,7 +397,9 @@ SPOTIFY_CLIENT_SECRET=...      # Client credentials flow + token refresh
 ├── gadget_display.py        # Display renderer
 ├── display/                 # Frame animator, reactions
 ├── boot/                    # Systemd service, splash
-├── demos/                   # Test scripts
+├── demos/                   # Demo scripts (manual, on hardware)
+├── tests/                   # pytest suite (runs without hardware)
+├── leeloo_fileutil.py       # atomic_write_json (power-safe writes)
 ├── album_art/               # Cached album art
 ├── .env                     # API keys (gitignored)
 ├── device_config.json       # WiFi, user, location
