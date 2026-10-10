@@ -887,3 +887,78 @@ def test_real_server_serves_then_shuts_down():
         cp.stop_portal_server(server)
     with pytest.raises(urllib.error.URLError):
         opener.open(url, timeout=2)
+
+
+# ============================================
+# Review fixes: credential race + faster failure
+# ============================================
+
+def test_api_wifi_rechecks_connecting_under_lock(portal):
+    """A /api/finish that starts after the guard passed must not get its
+    credentials swapped by a /api/wifi that was already past the guard"""
+    cp = portal.cp
+    fill_first_run(portal, password='P1')
+    with cp._state_lock:
+        cp.setup_state['connecting'] = True   # /api/finish won the race
+    # Call the view directly: the before_request guard already ran (and passed)
+    with cp.app.test_request_context('/api/wifi', method='POST',
+                                     json={'ssid': 'Home', 'password': 'P2'}):
+        resp, status = cp.api_wifi()
+    assert status == 409 and resp.get_json()['success'] is False
+    assert portal.config()['wifi_password'] == 'P1'
+    assert cp.setup_state['pending_password'] == 'P1'
+
+
+def test_api_wifi_rechecks_finished_under_lock(portal):
+    cp = portal.cp
+    fill_first_run(portal, password='P1')
+    with cp._state_lock:
+        cp.setup_state['finished'] = True
+    with cp.app.test_request_context('/api/wifi', method='POST',
+                                     json={'ssid': 'Evil', 'password': 'x'}):
+        resp, status = cp.api_wifi()
+    assert status == 409
+    assert portal.config()['wifi_ssid'] == 'Home'
+
+
+def test_definite_failure_classification():
+    assert csw._definite_failure("Error: Connection activation failed: (7) Secrets were required, "
+                                 "but not provided.")
+    assert csw._definite_failure("Error: Failed to add/activate new connection: "
+                                 "802-11-wireless-security.psk: property is invalid")
+    # Might still come up / appear later: keep the full wait
+    assert not csw._definite_failure("Error: No network with SSID 'Home' found.")
+    assert not csw._definite_failure("sudo timed out after 30s")
+    assert not csw._definite_failure("Error: Timeout expired (90 seconds)")
+    assert not csw._definite_failure("Error: NetworkManager is not running.")
+    assert not csw._definite_failure("")
+    assert not csw._definite_failure(None)
+
+
+@pytest.mark.parametrize('profiles', [None, {'Home': 'Home'}])
+def test_wrong_password_fails_fast(profiles):
+    """'Secrets were required' is final: don't poll for the full wait_s"""
+    fc = FakeClock()
+    nm = FakeNM(profiles=profiles, correct={'Home': 'right'})
+    assert not csw.connect_with_networkmanager('Home', 'wrong', run=nm, sleep=fc.sleep,
+                                               wait_s=30, clock=fc.clock)
+    # 1s after "managed yes" + at most FAILED_CONNECT_WAIT_S of polling
+    assert fc.now <= 1 + csw.FAILED_CONNECT_WAIT_S
+
+
+def test_unclear_failure_keeps_full_wait_and_can_still_connect():
+    """A timed-out nmcli may still be activating: keep polling and accept success"""
+    fc = FakeClock()
+    nm = FakeNM(correct={'Home': 'pw'})
+
+    def run(argv, timeout=30):
+        if argv[1:5] == ['nmcli', 'device', 'wifi', 'connect']:
+            nm.calls.append(list(argv))
+            return False, "", "sudo timed out after 30s"
+        if fc.now >= 1 + csw.FAILED_CONNECT_WAIT_S + 3:
+            nm.connected_ssid, nm.active = 'Home', 'Home'   # NM finished late
+        return nm(argv, timeout)
+
+    assert csw.connect_with_networkmanager('Home', 'pw', run=run, sleep=fc.sleep,
+                                           wait_s=30, clock=fc.clock)
+    assert fc.now > 1 + csw.FAILED_CONNECT_WAIT_S

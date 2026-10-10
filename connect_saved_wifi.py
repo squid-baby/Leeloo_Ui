@@ -22,6 +22,7 @@ DEVICE_CONFIG_PATH = os.path.join(LEELOO_HOME, "device_config.json")
 
 WIFI_IFACE = "wlan0"
 CONNECT_WAIT_S = 30          # How long to wait for wlan0 to come up on the new network
+FAILED_CONNECT_WAIT_S = 5    # Shorter wait once nmcli already gave a definite error
 SCAN_ATTEMPTS = 3            # Tries when NM hasn't seen the network in a scan yet
 RESCAN_WAIT_S = 5
 NM_WIFI_TYPES = ('802-11-wireless', 'wifi')  # nmcli -t prints the long name
@@ -240,6 +241,24 @@ def _network_not_seen(stderr):
     return 'no network with ssid' in text or 'could not be found' in text
 
 
+# nmcli errors meaning NetworkManager tried and gave up on this connection
+# (wrong password, password too short, activation failed)
+NM_DEFINITE_FAILURES = ('secrets were required', 'activation failed', 'property is invalid')
+
+
+def _definite_failure(stderr):
+    """
+    nmcli already gave up for good (e.g. "Secrets were required" for a wrong
+    password). Not when the network just isn't in the scan list, when the
+    command timed out, or when NM wasn't ready yet: the connection may still
+    come up then, so those keep the full wait.
+    """
+    text = (stderr or '').lower()
+    if _network_not_seen(text) or 'timed out' in text or 'timeout' in text:
+        return False
+    return any(marker in text for marker in NM_DEFINITE_FAILURES)
+
+
 def run_with_rescan(argv, run=run_cmd, sleep=time.sleep, attempts=SCAN_ATTEMPTS,
                     rescan_wait_s=RESCAN_WAIT_S, deadline=None, clock=time.monotonic):
     """
@@ -272,7 +291,8 @@ def _deadline_run(deadline, clock):
 
 
 def connect_with_networkmanager(ssid, password, run=None, sleep=time.sleep,
-                                wait_s=CONNECT_WAIT_S, timeout_s=None, clock=time.monotonic):
+                                wait_s=CONNECT_WAIT_S, timeout_s=None, clock=time.monotonic,
+                                failed_wait_s=FAILED_CONNECT_WAIT_S):
     """
     Connect to WiFi using NetworkManager (more reliable).
     Returns True only once nmcli shows wlan0 connected to exactly `ssid`,
@@ -280,7 +300,9 @@ def connect_with_networkmanager(ssid, password, run=None, sleep=time.sleep,
     doesn't count, so a mistyped password is never reported as working).
 
     timeout_s bounds the whole attempt (rescans, nmcli calls, waiting), give
-    or take one nmcli call of at least 5s.
+    or take one nmcli call of at least 5s. When nmcli already reported a
+    definite failure (wrong password), only wait failed_wait_s, so the setup
+    AP comes back sooner.
     """
     deadline = clock() + timeout_s if timeout_s is not None else None
     if run is None:
@@ -327,6 +349,8 @@ def connect_with_networkmanager(ssid, password, run=None, sleep=time.sleep,
                                              deadline=deadline, clock=clock)
         if not success:
             print(f"  Warning: Failed to activate - {stderr.strip()}")
+            if _definite_failure(stderr):
+                wait_s = min(wait_s, failed_wait_s)
     else:
         # Create new connection
         print("  Creating new connection...")
@@ -334,6 +358,8 @@ def connect_with_networkmanager(ssid, password, run=None, sleep=time.sleep,
                                              deadline=deadline, clock=clock)
         if not success:
             print(f"  Warning: Failed to connect - {stderr.strip()}")
+            if _definite_failure(stderr):
+                wait_s = min(wait_s, failed_wait_s)
 
     # Wait for connection to stabilize
     print("  Waiting for connection...")

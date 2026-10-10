@@ -1121,17 +1121,25 @@ def api_wifi():
     if len(ssid.encode('utf-8')) > 32:
         return jsonify({'success': False, 'error': 'network name is too long'})
 
-    recovery = setup_state.get('recovery', False)
-    if not recovery:
-        # First run: keep it on disk with the rest of the setup answers.
-        # (In recovery the working config is only replaced once the new
-        # WiFi is confirmed, so the boot retry still uses the old one.)
-        save_device_config({
-            'wifi_ssid': ssid,
-            'wifi_password': password,
-        })
-
     with _state_lock:
+        # Check again under the lock: the before_request guard ran without it,
+        # and a /api/finish may have started a connection attempt since then.
+        # Changing the credentials now would race with that attempt.
+        if setup_state.get('closed') or setup_state.get('finished'):
+            return jsonify({'success': False, 'error': 'setup is already finished'}), 409
+        if setup_state.get('connecting'):
+            return jsonify({'success': False, 'error': 'connecting to wifi, please wait'}), 409
+
+        recovery = setup_state.get('recovery', False)
+        if not recovery:
+            # First run: keep it on disk with the rest of the setup answers.
+            # (In recovery the working config is only replaced once the new
+            # WiFi is confirmed, so the boot retry still uses the old one.)
+            save_device_config({
+                'wifi_ssid': ssid,
+                'wifi_password': password,
+            })
+
         setup_state['ssid'] = ssid
         setup_state['pending_ssid'] = ssid
         setup_state['pending_password'] = password
