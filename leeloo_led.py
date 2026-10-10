@@ -13,6 +13,12 @@ LED behaviors:
 - off:              all off
 - set_ambient:      persistent background breathe (blue=idle, purple=playing)
                     automatically resumes after any transient animation
+
+Recording guard (CLAUDE.md gotcha 11): WS2812B (GPIO 12 PWM DMA) and the
+INMP441 mic (I2S DMA) share the Pi Zero DMA controller, so ANY LED update
+while arecord runs kills the audio. Between recording_started() and
+recording_finished() transient animations return immediately, ambient
+breathe never starts and set_ambient() only remembers the desired state.
 """
 
 import asyncio
@@ -57,6 +63,9 @@ class LEDManager:
         # Ambient background state (persists across transient animations)
         self._ambient_state = None      # "idle" | "playing" | None
         self._ambient_task = None       # asyncio task for ambient breathe
+
+        # Recording guard — True while the mic (arecord) is running
+        self._recording = False
 
         # Hardware
         if HARDWARE_AVAILABLE:
@@ -104,9 +113,19 @@ class LEDManager:
 
     async def _run_animation(self, name, coro):
         """Run a transient animation, cancelling any existing one.
-        Ambient breathe is suspended during the animation and resumes after."""
+        Ambient breathe is suspended during the animation and resumes after.
+        Skipped entirely while the mic is recording (DMA conflict)."""
+        if self._recording:
+            print(f"[LED] {name} skipped (recording)")
+            coro.close()  # never started — avoid 'coroutine was never awaited'
+            return
         await self._cancel_ambient()
         await self._cancel_current()
+        if self._recording:
+            # Recording started while we were cancelling the old animation
+            print(f"[LED] {name} skipped (recording)")
+            coro.close()
+            return
         self._current_animation = name
         self._animation_task = asyncio.create_task(coro)
         try:
@@ -123,18 +142,36 @@ class LEDManager:
 
     async def _cancel_ambient(self):
         """Cancel ambient breathe task without clearing ambient state"""
-        if self._ambient_task and not self._ambient_task.done():
-            self._ambient_task.cancel()
-            try:
-                await self._ambient_task
-            except asyncio.CancelledError:
-                pass
-        self._ambient_task = None
+        # Loop: while we await the cancelled task, another coroutine (e.g. an
+        # animation's finally block) may start a fresh ambient task. Clearing
+        # self._ambient_task blindly would orphan that new task — it could
+        # never be cancelled again and would keep DMA busy during recording.
+        while self._ambient_task is not None:
+            task = self._ambient_task
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            if self._ambient_task is task:
+                self._ambient_task = None
 
     def _start_ambient_task(self):
         """Spawn the ambient breathe coroutine as a background task.
         Reads _ambient_state dynamically each tick so color changes don't
-        require a cancel/restart (avoids the OFF-flash flicker)."""
+        require a cancel/restart (avoids the OFF-flash flicker).
+
+        Idempotent: never starts a second breathe task while one is alive
+        (two tasks fight over the pixels and the orphan can't be cancelled).
+        Also does nothing while recording or while a transient animation
+        owns the LEDs — that animation's finally restarts ambient."""
+        if self._recording:
+            return
+        if self._ambient_task and not self._ambient_task.done():
+            return
+        if self._animation_task and not self._animation_task.done():
+            return
 
         async def _breathe():
             start = time.time()
@@ -164,6 +201,13 @@ class LEDManager:
         if state not in ("idle", "playing", None):
             raise ValueError(f"Unknown ambient state: {state!r}")
 
+        if self._recording:
+            # Only remember it — recording_finished() starts the breathe
+            if state != self._ambient_state:
+                print(f"[LED] ambient → {state} (deferred until recording ends)")
+            self._ambient_state = state
+            return
+
         ambient_already_running = (
             self._ambient_task and not self._ambient_task.done()
         )
@@ -178,9 +222,12 @@ class LEDManager:
         # Starting fresh or turning off — cancel everything cleanly
         await self._cancel_current()
         await self._cancel_ambient()
+        self._ambient_state = state
+        if self._recording:
+            # Recording started while we were cancelling — just keep the state
+            return
         self._set_color(OFF)
 
-        self._ambient_state = state
         if state:
             print(f"[LED] ambient → {state}")
             self._start_ambient_task()
@@ -189,11 +236,19 @@ class LEDManager:
 
     async def ack(self):
         """Quick green flash — tap acknowledgment (100ms)"""
+        if self._recording:
+            print("[LED] ack skipped (recording)")
+            return
         print("[LED] ack (green flash)")
         await self._cancel_ambient()
         await self._cancel_current()
+        if self._recording:
+            return
         self._set_color(GREEN)
         await asyncio.sleep(0.1)
+        if self._recording:
+            # Recording started during the flash — leave the listening colour
+            return
         self._set_color(OFF)
         # Resume ambient after the flash
         if self._ambient_state:
@@ -206,6 +261,42 @@ class LEDManager:
         await self._cancel_current()
         self._current_animation = "listening"
         self._set_color(GREEN)
+
+    async def recording_started(self):
+        """Enter the recording guard — call after listening(), before arecord.
+        From now until recording_finished() nothing may touch the LEDs:
+        WS2812B DMA and INMP441 I2S DMA conflict (CLAUDE.md gotcha 11)."""
+        self._recording = True
+        # Anything that slipped in just before the flag was set (e.g. a
+        # cancelled animation's finally restarting ambient) must stop now.
+        had_activity = bool(
+            (self._ambient_task and not self._ambient_task.done()) or
+            (self._animation_task and not self._animation_task.done())
+        )
+        await self._cancel_ambient()
+        if self._animation_task and not self._animation_task.done():
+            await self._cancel_current()
+        if had_activity:
+            # Something may have overwritten the listening colour — restore it
+            # (still before arecord starts, so this write is safe)
+            self._current_animation = "listening"
+            self._set_color(GREEN)
+        print("[LED] recording guard ON")
+
+    def recording_finished(self):
+        """Leave the recording guard (sync, safe in a finally block).
+        Restores the ambient breathe if one is set."""
+        if not self._recording:
+            return
+        self._recording = False
+        print("[LED] recording guard OFF")
+        if self._ambient_state:
+            self._start_ambient_task()
+
+    @property
+    def is_recording(self):
+        """True while the recording guard is active"""
+        return self._recording
 
     async def processing(self):
         """Pulsing green breathe — waiting for STT/LLM response"""
@@ -287,6 +378,9 @@ class LEDManager:
         # ambient after cancellation — don't also restart here or we get two
         # concurrent ambient tasks and the orphaned one can't be cancelled,
         # leaving DMA active and killing I2S audio on the next tap.
+        if self._recording:
+            # Keep the solid listening colour — any LED write now kills audio
+            return
         has_run_animation_task = bool(
             self._animation_task and not self._animation_task.done()
         )
@@ -309,6 +403,12 @@ class LEDManager:
             self._ambient_task.cancel()
         self._ambient_task = None
         self._set_color(OFF)
+
+    @property
+    def current_animation(self):
+        """Name of the transient animation that owns the LEDs
+        ('listening', 'processing', 'nudge', ...) or None"""
+        return self._current_animation
 
     @property
     def is_animating(self):

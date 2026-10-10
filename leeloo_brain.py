@@ -15,7 +15,9 @@ import sys
 import json
 import time
 import asyncio
+import functools
 import struct
+import threading
 from enum import Enum, auto
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -212,8 +214,29 @@ class LeelooBrain:
         self.location_configured = self.latitude is not None and self.longitude is not None
 
         # Animation
-        self._expand_task = None  # Current expand/hold/collapse task
+        self._expand_task = None  # Most recently started expansion task (see _start_expand_task)
+        self._expand_tasks = set()  # All live expansion tasks (running or queued)
+        self._expand_cancel_sent = set()  # Live tasks already cancelled (see _cancel_expansions)
+        self._expand_lock = None  # asyncio.Lock, created lazily on the loop (py3.9 binds at creation)
         self._welcome_qr_active = False  # Prevents display loop from overwriting QR
+
+        # Serialises self.display use and full-frame framebuffer writes between
+        # the display-tick executor thread and expansions. Only ever held inside
+        # synchronous code (never across an await). RLock: _display_tick holds
+        # it while calling _render_normal, which takes it too.
+        self._display_lock = threading.RLock()
+
+        # Serialises _update_music (network + spotify_tokens.json) across
+        # executor threads. Separate from _display_lock so a slow Spotify call
+        # never stalls rendering. Never held across an await.
+        self._music_lock = threading.Lock()
+
+        # Event loop (set in run()) — lets executor threads schedule coroutines
+        self._loop = None
+
+        # True from the tap that starts a voice session until it fully ends —
+        # independent of ui_state, which an incoming expansion can overwrite
+        self._voice_active = False
 
         # Hang scheduling
         self._pending_hang_dt = None  # ISO datetime string of proposed hang (set on propose, cleared on confirm)
@@ -312,9 +335,7 @@ class LeelooBrain:
             ("", None, None),
             *self._format_display_text(text, COLORS['white']),
         ]
-        self._expand_task = asyncio.ensure_future(
-            self.expand_frame(FrameType.MESSAGES, lines, duration=EXPANDED_HOLD_DURATION)
-        )
+        self._start_expansion(FrameType.MESSAGES, lines, duration=EXPANDED_HOLD_DURATION)
 
         # While message is showing, check for music mentions in background
         try:
@@ -324,10 +345,13 @@ class LeelooBrain:
                 result = await self._search_spotify_display_only(query, pushed_by=sender)
                 if result:
                     print(f"[BRAIN] Album art updated: {result['artist']} - {result['track']}")
-                    # Force display refresh to show new album art
+                    # Force display refresh to show new album art (off the event
+                    # loop; _render_normal skips the write while the message
+                    # expansion still owns the screen — its collapse re-renders)
                     self.last_music_fetch = 0
-                    self._update_music()
-                    self._render_normal()
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, self._update_music)
+                    await loop.run_in_executor(None, self._render_normal)
                 else:
                     print(f"[BRAIN] No Spotify result for: {query}")
             else:
@@ -360,7 +384,7 @@ class LeelooBrain:
             if result:
                 print(f"[BRAIN] Shared song art updated: {result['artist']} - {result['track']}")
                 self.last_music_fetch = 0
-                self._update_music()
+                await asyncio.get_running_loop().run_in_executor(None, self._update_music)
 
         asyncio.ensure_future(_fetch_and_display())
 
@@ -373,9 +397,7 @@ class LeelooBrain:
                     ("", None, None),
                     *self._format_display_text(note, COLORS['white']),
                 ]
-                self._expand_task = asyncio.ensure_future(
-                    self.expand_frame(FrameType.MESSAGES, lines, duration=EXPANDED_HOLD_DURATION)
-                )
+                self._start_expansion(FrameType.MESSAGES, lines, duration=EXPANDED_HOLD_DURATION)
             asyncio.ensure_future(_show_note())
         else:
             lines = [
@@ -383,9 +405,7 @@ class LeelooBrain:
                 ("", None, None),
                 *self._format_display_text(f"{artist} - {track}", COLORS['white']),
             ]
-            self._expand_task = asyncio.ensure_future(
-                self.expand_frame(FrameType.ALBUM, lines, duration=15.0)
-            )
+            self._start_expansion(FrameType.ALBUM, lines, duration=15.0)
 
     def _on_ws_nudge(self, sender):
         """Handle incoming nudge"""
@@ -411,9 +431,7 @@ class LeelooBrain:
             ("", None, None),
             *self._format_display_text(display_line, COLORS['white']),
         ]
-        self._expand_task = asyncio.ensure_future(
-            self.expand_frame(FrameType.MESSAGES, lines, duration=EXPANDED_HOLD_DURATION)
-        )
+        self._start_expansion(FrameType.MESSAGES, lines, duration=EXPANDED_HOLD_DURATION)
 
     def _on_ws_hang_confirm(self, sender):
         """Handle incoming hang confirmation — proposer side: lock in the hang time"""
@@ -432,9 +450,7 @@ class LeelooBrain:
             ("", None, None),
             (f"{sender.lower()} is in", "normal", COLORS['white']),
         ]
-        self._expand_task = asyncio.ensure_future(
-            self.expand_frame(FrameType.MESSAGES, lines, duration=10.0)
-        )
+        self._start_expansion(FrameType.MESSAGES, lines, duration=10.0)
 
     def _on_member_joined(self, name: str):
         print(f"[BRAIN] {name} came online")
@@ -451,9 +467,8 @@ class LeelooBrain:
         print(f"[BRAIN] Spotify connected! Triggering music refresh...")
         # Force immediate music update to show currently playing
         self.last_music_fetch = 0
-        # Dismiss welcome screen if showing (user just authed)
-        if self._expand_task and not self._expand_task.done():
-            self._expand_task.cancel()
+        # Dismiss welcome screen (or any expansion) if showing (user just authed)
+        self._cancel_expansions()
         # Show confirmation
         asyncio.ensure_future(self._show_spotify_connected())
 
@@ -466,9 +481,7 @@ class LeelooBrain:
             ("your music will now", "normal", COLORS['white']),
             ("show on your LEELOO", "normal", COLORS['white']),
         ]
-        self._expand_task = asyncio.create_task(
-            self.expand_frame(FrameType.ALBUM, lines, duration=10.0)
-        )
+        self._start_expansion(FrameType.ALBUM, lines, duration=10.0)
 
     # =========================================================================
     # DATA REFRESH
@@ -500,11 +513,27 @@ class LeelooBrain:
 
     def _update_music(self):
         """Refresh music data — uses Spotify OAuth if tokens exist, else reads cache file.
-        Uses tiered polling: faster when actively playing, slower when idle."""
+        Uses tiered polling: faster when actively playing, slower when idle.
+        Thread-safe: called from several executor threads (display tick,
+        expansion collapse, voice, message/song refreshes)."""
         # Don't overwrite album art while welcome QR is being displayed
         if self._welcome_qr_active:
             return
 
+        # One refresh at a time. Without this, e.g. a collapse's forced refresh
+        # and the next display tick (last_music_fetch is still 0 until the
+        # network call returns) both hit Spotify at once, and both may refresh
+        # the OAuth token — rewriting spotify_tokens.json non-atomically while
+        # the other thread reads it. A caller that waited re-checks the poll
+        # interval inside the lock, so it normally skips the duplicate call.
+        with self._music_lock:
+            self._refresh_music_data()
+
+        # Update ambient LED state based on current playback
+        self._sync_ambient_led()
+
+    def _refresh_music_data(self):
+        """Body of _update_music — caller holds self._music_lock."""
         now = time.time()
 
         # Tiered polling intervals based on playback state
@@ -519,6 +548,14 @@ class LeelooBrain:
             interval = 120  # 2 min - idle, check occasionally
 
         if now - self.last_music_fetch > interval:
+            # Claim this fetch with a unique non-zero marker (negative, so it
+            # still reads as "stale"). If someone forces a refresh (sets
+            # last_music_fetch = 0) while we are on the network, the marker is
+            # gone when we finish: we then leave 0 in place so the forced
+            # caller, waiting on the lock, fetches again instead of skipping
+            # with our possibly older data.
+            claim = -now
+            self.last_music_fetch = claim
             # Check if user has Spotify OAuth tokens for "currently playing"
             spotify_tokens_path = os.path.join(LEELOO_HOME, "spotify_tokens.json")
             if os.path.exists(spotify_tokens_path):
@@ -538,7 +575,7 @@ class LeelooBrain:
                             'last_updated': now,
                         }
                         self.album_art_path = get_album_art_path(result)
-                        self.last_music_fetch = now
+                        self._finish_music_fetch(claim, now)
                         return
                 except Exception as e:
                     print(f"[BRAIN] Spotify currently-playing error: {e}")
@@ -562,10 +599,12 @@ class LeelooBrain:
             else:
                 self.music_data = None
                 self.album_art_path = None
-            self.last_music_fetch = now
+            self._finish_music_fetch(claim, now)
 
-        # Update ambient LED state based on current playback
-        self._sync_ambient_led()
+    def _finish_music_fetch(self, claim, now):
+        """Record a completed fetch unless a forced refresh arrived meanwhile"""
+        if self.last_music_fetch == claim:
+            self.last_music_fetch = now
 
     def _sync_ambient_led(self):
         """Switch ambient LED breathe to match current playback state.
@@ -579,69 +618,173 @@ class LeelooBrain:
             self.music_data.get('is_playing', False)
         )
         new_state = "playing" if is_playing else "idle"
-        if new_state != self._led_ambient_state:
-            self._led_ambient_state = new_state
-            asyncio.ensure_future(self.led.set_ambient(new_state))
+        if new_state == self._led_ambient_state:
+            return
+
+        # Usually called from executor threads (_display_tick, expand collapse),
+        # where asyncio.ensure_future raises "There is no current event loop in
+        # thread" — so hand the coroutine to the loop thread-safely.
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+
+        coro = self.led.set_ambient(new_state)
+        try:
+            if running_loop is not None:
+                running_loop.create_task(coro)
+            elif self._loop is not None and not self._loop.is_closed():
+                asyncio.run_coroutine_threadsafe(coro, self._loop)
+            else:
+                coro.close()
+                print(f"[BRAIN] Ambient LED → {new_state} deferred (no event loop yet)")
+                return
+        except Exception as e:
+            coro.close()
+            print(f"[BRAIN] Ambient LED schedule failed: {e}")
+            return
+        # Only record the new state once it is actually scheduled, so a failed
+        # attempt is retried on the next music update
+        self._led_ambient_state = new_state
 
     # =========================================================================
     # DISPLAY RENDERING
     # =========================================================================
 
     def _render_normal(self):
-        """Render the normal UI to framebuffer"""
-        self._update_time()
+        """Render the normal UI to framebuffer.
+        Blocking (200-500ms on Pi Zero) — call via run_in_executor from async code.
+        Skips the write when an expansion or voice session owns the screen
+        (ui_state != NORMAL), checked under the display lock right before
+        rendering so a late call can never paint over an expansion."""
+        with self._display_lock:
+            if self.ui_state != UIState.NORMAL:
+                return
 
-        img = self.display.render(
-            self.weather_data,
-            self.time_data,
-            self.contacts,
-            self.music_data,
-            album_art_path=self.album_art_path,
-            unread_counts=self.message_mgr.get_unread_counts() if self.message_mgr else {}
-        )
+            self._update_time()
 
-        # Calculate box_right from album art position
-        # (The display.render already computed this internally)
-        write_to_framebuffer(img)
+            img = self.display.render(
+                self.weather_data,
+                self.time_data,
+                self.contacts,
+                self.music_data,
+                album_art_path=self.album_art_path,
+                unread_counts=self.message_mgr.get_unread_counts() if self.message_mgr else {}
+            )
+
+            # Calculate box_right from album art position
+            # (The display.render already computed this internally)
+            write_to_framebuffer(img)
 
     def _calculate_box_right(self):
-        """Calculate box_right from album art position"""
-        temp_img = Image.new('RGB', (SCREEN_WIDTH, SCREEN_HEIGHT), COLORS['bg'])
-        temp_draw = ImageDraw.Draw(temp_img)
-        self.display.image = temp_img
-        self.display.draw = temp_draw
-        album_x = self.display.draw_album_art(album_art_path=self.album_art_path)
-        return album_x - 10  # 5px gap + 5px padding
+        """Calculate box_right from album art position (blocking — use executor)"""
+        with self._display_lock:
+            temp_img = Image.new('RGB', (SCREEN_WIDTH, SCREEN_HEIGHT), COLORS['bg'])
+            temp_draw = ImageDraw.Draw(temp_img)
+            self.display.image = temp_img
+            self.display.draw = temp_draw
+            album_x = self.display.draw_album_art(album_art_path=self.album_art_path)
+            return album_x - 10  # 5px gap + 5px padding
 
     # =========================================================================
     # FRAME EXPANSION (async)
     # =========================================================================
 
+    def _start_expansion(self, frame_type: FrameType, content_lines, duration=EXPANDED_HOLD_DURATION):
+        """Show an expanded frame, replacing whatever expansion is running or
+        queued. The ONLY way callers should start expand_frame (sync-safe:
+        usable from WebSocket callbacks running on the event loop)."""
+        return self._start_expand_task(
+            lambda: self.expand_frame(frame_type, content_lines, duration=duration)
+        )
+
+    def _start_expand_task(self, coro_factory):
+        """Cancel every live expansion and start coro_factory() as the new one.
+
+        Guarantees:
+        - at most one expansion draws at a time (they all run under
+          self._expand_lock),
+        - the new one starts only after the previous one's finally block
+          (collapse, ui_state reset, re-render) has completely finished, so an
+          old task can never reset ui_state to NORMAL after the new one set
+          EXPANDING,
+        - correct even if two requests arrive in the same loop iteration
+          (the first task is cancelled before it ever starts and its factory
+          is never called).
+
+        coro_factory: zero-arg callable returning the coroutine to run. It is
+        called only once the lock is held. It may await expand_frame()
+        directly any number of times (e.g. _show_welcome_with_qr) — only this
+        wrapper takes the lock, so that can't deadlock.
+
+        Must be called on the event loop thread."""
+        self._cancel_expansions()
+
+        async def _exclusive():
+            if self._expand_lock is None:
+                self._expand_lock = asyncio.Lock()
+            async with self._expand_lock:
+                await coro_factory()
+
+        task = asyncio.ensure_future(_exclusive())
+        self._expand_tasks.add(task)
+        task.add_done_callback(self._on_expand_task_done)
+        self._expand_task = task
+        return task
+
+    def _on_expand_task_done(self, task):
+        """Forget a finished expansion task and log unexpected errors"""
+        self._expand_tasks.discard(task)
+        self._expand_cancel_sent.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            print(f"[BRAIN] Expansion error: {exc!r}")
+
+    def _cancel_expansions(self):
+        """Cancel all running and queued expansions (synchronous).
+        Their finally blocks run on the next loop iterations; a new expansion
+        waits for them via the expansion lock.
+
+        Each task is cancelled only once: a second cancel would land inside
+        its finally (e.g. a second tap while the collapse refresh is still
+        running) and abort the music refresh and re-render, leaving the old
+        expanded frame on screen until the next display tick."""
+        for task in list(self._expand_tasks):
+            if not task.done() and task not in self._expand_cancel_sent:
+                self._expand_cancel_sent.add(task)
+                task.cancel()
+
+    def _has_live_expansion(self):
+        """True while any expansion task (running, queued, or still in its
+        finally) has not finished"""
+        return any(not task.done() for task in self._expand_tasks)
+
     async def expand_frame(self, frame_type: FrameType, content_lines, duration=EXPANDED_HOLD_DURATION):
         """
         Expand a frame, show content with typewriter, hold, then collapse.
+
+        Don't call this directly to show something — use _start_expansion(),
+        which cancels the previous expansion and serialises them.
 
         Args:
             frame_type: Which frame to expand (WEATHER, MESSAGES, ALBUM, etc.)
             content_lines: List of (text, size, color) tuples for typewriter
             duration: How long to hold expanded view (seconds)
         """
-        if self.ui_state != UIState.NORMAL:
-            # Cancel existing expansion
-            if self._expand_task and not self._expand_task.done():
-                self._expand_task.cancel()
-                try:
-                    await self._expand_task
-                except asyncio.CancelledError:
-                    pass
+        loop = asyncio.get_running_loop()
 
+        # Set before the first await: from here the display tick won't paint
         self.ui_state = UIState.EXPANDING
         self.expanded_frame = frame_type
         self.message_view_active = (frame_type == FrameType.MESSAGES)
 
         try:
-            # Calculate box_right for animator
-            box_right = self._calculate_box_right()
+            # Calculate box_right for animator (PIL work — off the event loop;
+            # takes the display lock, so any in-flight full-frame write from
+            # the display tick finishes before the animation starts)
+            box_right = await loop.run_in_executor(None, self._calculate_box_right)
             animator = FrameAnimator(self.display, box_right=box_right, fb_path=FB_PATH)
 
             # Expand animation
@@ -675,9 +818,13 @@ class LeelooBrain:
             self.expanded_frame = None
             self.message_view_active = False
             # Force data refresh before re-rendering (picks up new album art, etc.)
+            # Both block (network / PIL) — run them in the executor.
             self.last_music_fetch = 0
-            self._update_music()
-            self._render_normal()
+            try:
+                await loop.run_in_executor(None, self._update_music)
+                await loop.run_in_executor(None, self._render_normal)
+            except Exception as e:
+                print(f"[BRAIN] Re-render after collapse failed: {e}")
 
     async def _typewriter(self, content_lines, box_right):
         """Typewriter effect — writes text character by character to framebuffer.
@@ -850,35 +997,79 @@ class LeelooBrain:
 
     async def _handle_single_tap(self):
         """Single tap — activate voice (or cancel current expansion)"""
-        if self.ui_state in (UIState.EXPANDED, UIState.EXPANDING):
-            # Cancel current expansion — tap to dismiss
-            if self._expand_task and not self._expand_task.done():
-                self._expand_task.cancel()
+        if (self.ui_state in (UIState.EXPANDED, UIState.EXPANDING, UIState.COLLAPSING)
+                or self._has_live_expansion()):
+            # Cancel current (and any queued) expansion — tap to dismiss.
+            # COLLAPSING too: starting voice mid-collapse would let the
+            # collapse's finally reset ui_state to NORMAL during recording.
+            # Any live expansion task counts, whatever ui_state says: a
+            # cancelled one's finally sets NORMAL before its (slow) music
+            # refresh and re-render, a newer one may be queued on the lock
+            # behind it, and the welcome flow is NORMAL while it builds a QR.
+            # Starting voice there would let the queued expansion take over
+            # the screen (and ui_state) mid-recording.
+            self._cancel_expansions()
             return
 
         # Ignore taps while already listening or processing — concurrent
         # voice sessions spawn competing arecord processes that corrupt
         # the I2S state and kill all subsequent recordings until restart.
-        if self.ui_state in (UIState.LISTENING, UIState.PROCESSING):
+        # _voice_active also covers the case where an incoming expansion
+        # overwrote ui_state while a voice session was still running.
+        if self.ui_state in (UIState.LISTENING, UIState.PROCESSING) or self._voice_active:
             return
 
-        # LED acknowledgment
-        await self.led.ack()
+        if not self.voice:
+            # LED acknowledgment
+            await self.led.ack()
+            # No voice — demo expand weather
+            print("[BRAIN] Voice not available — demo weather expand")
+            self._start_expansion(
+                FrameType.WEATHER,
+                [
+                    ("weather report", "large", COLORS['tan']),
+                    ("", None, None),
+                    (f"{self.weather_data.get('temp_f', '??')}F" if self.weather_data else "no data", "large", COLORS['white']),
+                    ("", None, None),
+                    ("tap to talk coming soon", "normal", COLORS['tan']),
+                ],
+                duration=10.0
+            )
+            return
 
-        # Voice interaction
-        if self.voice and self.intent_router:
-            await self._voice_interaction()
-        elif self.voice and not self.intent_router:
-            # Voice only mode — just transcribe, no intent routing
-            print("[BRAIN] Voice-only mode (no intent router)")
-            self.ui_state = UIState.LISTENING
-            await self.led.listening()
-            transcript = await self.voice.record_and_transcribe()
-            await self.led.off()
-            self.ui_state = UIState.NORMAL
-            if transcript:
-                self._expand_task = asyncio.create_task(
-                    self.expand_frame(
+        # Claim the voice session before the first await so a second tap
+        # during the ack flash can't start a competing session
+        self._voice_active = True
+        try:
+            # LED acknowledgment
+            await self.led.ack()
+
+            # Voice interaction
+            if self.intent_router:
+                await self._voice_interaction()
+            else:
+                # Voice only mode — just transcribe, no intent routing
+                print("[BRAIN] Voice-only mode (no intent router)")
+                transcript = ""
+                try:
+                    # Ambient must be fully off before any audio (DMA conflict)
+                    await self.led._cancel_ambient()
+                    self.ui_state = UIState.LISTENING
+                    await self.led.listening()
+                    try:
+                        # Recording guard (DMA conflict) — see _voice_interaction
+                        await self.led.recording_started()
+                        transcript = await self.voice.record_and_transcribe()
+                    finally:
+                        self.led.recording_finished()
+                finally:
+                    # Always leave the voice state, even on error/CancelledError
+                    # (which propagates after this block)
+                    if self.ui_state in (UIState.LISTENING, UIState.PROCESSING):
+                        self.ui_state = UIState.NORMAL
+                    await self.led.off()
+                if transcript:
+                    self._start_expansion(
                         FrameType.WEATHER,
                         [
                             ("you said:", "large", COLORS['tan']),
@@ -887,23 +1078,8 @@ class LeelooBrain:
                         ],
                         duration=10.0
                     )
-                )
-        else:
-            # No voice — demo expand weather
-            print("[BRAIN] Voice not available — demo weather expand")
-            self._expand_task = asyncio.create_task(
-                self.expand_frame(
-                    FrameType.WEATHER,
-                    [
-                        ("weather report", "large", COLORS['tan']),
-                        ("", None, None),
-                        (f"{self.weather_data.get('temp_f', '??')}F" if self.weather_data else "no data", "large", COLORS['white']),
-                        ("", None, None),
-                        ("tap to talk coming soon", "normal", COLORS['tan']),
-                    ],
-                    duration=10.0
-                )
-            )
+        finally:
+            self._voice_active = False
 
     async def _handle_double_tap(self):
         """Double tap — nudge (normal) or heart reaction (message view)"""
@@ -938,6 +1114,7 @@ class LeelooBrain:
 
     async def _voice_interaction(self):
         """Full voice interaction: listen → transcribe → route → act"""
+        processing_task = None
         try:
             # Ensure ambient LED is fully off before any audio — WS2812B DMA and
             # INMP441 I2S DMA conflict on Pi Zero if both run simultaneously.
@@ -948,37 +1125,80 @@ class LeelooBrain:
             await self.led.listening()
             print("[BRAIN] Listening...")
 
-            transcript = await self.voice.record_and_transcribe()
+            try:
+                # Recording guard: from here until arecord exits, incoming
+                # message/song/nudge LED animations and ambient breathe are
+                # held off. Entered inside the try so a cancel during
+                # recording_started() still clears it.
+                await self.led.recording_started()
+                transcript = await self.voice.record_and_transcribe()
+            finally:
+                self.led.recording_finished()
             print(f"[BRAIN] Transcript: '{transcript}'")
 
             if not transcript:
                 await self.led.error()
-                self.ui_state = UIState.NORMAL
                 return
 
-            # Process
-            self.ui_state = UIState.PROCESSING
-            asyncio.create_task(self.led.processing())
+            # Process (don't clobber an expansion that started meanwhile)
+            if self.ui_state == UIState.LISTENING:
+                self.ui_state = UIState.PROCESSING
+            processing_task = asyncio.create_task(self.led.processing())
             print("[BRAIN] Processing intent...")
 
-            # Force-refresh music data so Claude has the latest context
+            # Refresh music data in the executor CONCURRENTLY with intent
+            # routing instead of before it: a Spotify refresh (and possible
+            # album-art download) takes 0.5-3s on the Pi and would delay every
+            # voice command. The router snapshots its context when the call
+            # starts, so Claude sees the cached music_data — at most one poll
+            # interval old (20s while playing). We still wait for the refresh
+            # before executing, so actions like "share this song" use the
+            # latest track.
+            loop = asyncio.get_running_loop()
             self.last_music_fetch = 0
-            self._update_music()
+            music_refresh = loop.run_in_executor(None, self._update_music)
+            # Mark the result as retrieved even if routing fails below
+            music_refresh.add_done_callback(lambda f: f.cancelled() or f.exception())
 
             intent = await self.intent_router.route(transcript)
             print(f"[BRAIN] Intent: {intent.action}")
+
+            try:
+                await music_refresh
+            except Exception as e:
+                print(f"[BRAIN] Music refresh error: {e}")
 
             await self.led.off()
 
             # Execute
             await self._execute_intent(intent)
 
+        except asyncio.CancelledError:
+            print("[BRAIN] Voice interaction cancelled")
+            raise
         except Exception as e:
             print(f"[BRAIN] Voice error: {e}")
             import traceback
             traceback.print_exc()
             await self.led.error()
-            self.ui_state = UIState.NORMAL
+        finally:
+            # Always leave the voice state and stop the LEDs — even on
+            # CancelledError — or the device ignores taps until restart.
+            # Only reset our own states: if an expansion took over ui_state
+            # (e.g. one just started by _execute_intent or an incoming
+            # message), its own finally resets it.
+            if self.ui_state in (UIState.LISTENING, UIState.PROCESSING):
+                self.ui_state = UIState.NORMAL
+            # The processing breathe may not have started yet (created but
+            # not run) when we are cancelled — cancel the task itself so it
+            # can never start after the off() below and breathe forever.
+            if processing_task is not None and not processing_task.done():
+                processing_task.cancel()
+            # Only stop LEDs this voice session owns. After a successful
+            # _execute_intent the LEDs may belong to an action — e.g. the 30s
+            # cyan nudge started by the NUDGE intent — which must keep running.
+            if self.led.current_animation in ("listening", "processing"):
+                await self.led.off()
 
     async def _execute_intent(self, intent):
         """Execute a classified intent"""
@@ -993,35 +1213,29 @@ class LeelooBrain:
             # Combine: text + blank line + rain viz
             content = text_lines + [("", None, None)] + rain_viz
 
-            self._expand_task = asyncio.create_task(
-                self.expand_frame(
-                    FrameType.WEATHER,
-                    content,
-                    duration=EXPANDED_HOLD_DURATION
-                )
+            self._start_expansion(
+                FrameType.WEATHER,
+                content,
+                duration=EXPANDED_HOLD_DURATION
             )
         elif action == "ALBUM_INFO":
-            self._expand_task = asyncio.create_task(
-                self.expand_frame(
-                    FrameType.ALBUM,
-                    self._format_display_text(intent.response_text, COLORS['green']),
-                    duration=EXPANDED_HOLD_DURATION
-                )
+            self._start_expansion(
+                FrameType.ALBUM,
+                self._format_display_text(intent.response_text, COLORS['green']),
+                duration=EXPANDED_HOLD_DURATION
             )
         elif action == "MESSAGE_SEND":
             msg = intent.params.get('message', '')
             if self.ws_client and self.ws_client.connected and msg:
                 await self.ws_client.send_message(msg)
-            self._expand_task = asyncio.create_task(
-                self.expand_frame(
-                    FrameType.MESSAGES,
-                    [
-                        ("message sent", "large", COLORS['lavender']),
-                        ("", None, None),
-                        (msg, "normal", COLORS['white']),
-                    ],
-                    duration=EXPANDED_HOLD_DURATION
-                )
+            self._start_expansion(
+                FrameType.MESSAGES,
+                [
+                    ("message sent", "large", COLORS['lavender']),
+                    ("", None, None),
+                    (msg, "normal", COLORS['white']),
+                ],
+                duration=EXPANDED_HOLD_DURATION
             )
         elif action == "MESSAGE_READOUT":
             if self.message_mgr:
@@ -1032,9 +1246,7 @@ class LeelooBrain:
                     lines.append(("", None, None))
                 if not messages:
                     lines.append(("no messages", "normal", COLORS['white']))
-                self._expand_task = asyncio.create_task(
-                    self.expand_frame(FrameType.MESSAGES, lines, duration=EXPANDED_HOLD_DURATION)
-                )
+                self._start_expansion(FrameType.MESSAGES, lines, duration=EXPANDED_HOLD_DURATION)
                 self.message_mgr.mark_all_read()
         elif action == "NUDGE":
             # Send nudge — cyan LED
@@ -1053,19 +1265,17 @@ class LeelooBrain:
                         self.music_data.get('track', ''),
                         self.music_data.get('album', '')
                     )
-                self._expand_task = asyncio.create_task(
-                    self.expand_frame(
-                        FrameType.ALBUM,
-                        [
-                            ("song shared!", "large", COLORS['green']),
-                            ("", None, None),
-                            *self._format_display_text(
-                                f"{self.music_data.get('artist', '')} - {self.music_data.get('track', '')}",
-                                COLORS['white']
-                            ),
-                        ],
-                        duration=10.0
-                    )
+                self._start_expansion(
+                    FrameType.ALBUM,
+                    [
+                        ("song shared!", "large", COLORS['green']),
+                        ("", None, None),
+                        *self._format_display_text(
+                            f"{self.music_data.get('artist', '')} - {self.music_data.get('track', '')}",
+                            COLORS['white']
+                        ),
+                    ],
+                    duration=10.0
                 )
             else:
                 # Search Spotify and push
@@ -1073,33 +1283,29 @@ class LeelooBrain:
                 print(f"[BRAIN] Song push search: '{query}'")
                 result = await self._search_and_push_song(query)
                 if result:
-                    self._expand_task = asyncio.create_task(
-                        self.expand_frame(
-                            FrameType.ALBUM,
-                            [
-                                ("song shared!", "large", COLORS['green']),
-                                ("", None, None),
-                                *self._format_display_text(
-                                    f"{result.get('artist', '')} - {result.get('track', '')}",
-                                    COLORS['white']
-                                ),
-                            ],
-                            duration=10.0
-                        )
+                    self._start_expansion(
+                        FrameType.ALBUM,
+                        [
+                            ("song shared!", "large", COLORS['green']),
+                            ("", None, None),
+                            *self._format_display_text(
+                                f"{result.get('artist', '')} - {result.get('track', '')}",
+                                COLORS['white']
+                            ),
+                        ],
+                        duration=10.0
                     )
                 else:
-                    self._expand_task = asyncio.create_task(
-                        self.expand_frame(
-                            FrameType.ALBUM,
-                            [
-                                ("couldn't find it", "large", COLORS['green']),
-                                ("", None, None),
-                                *self._format_display_text(f"searched for: {query}", COLORS['white']),
-                                ("", None, None),
-                                *self._format_display_text("wanna try a different song?", COLORS['white']),
-                            ],
-                            duration=10.0
-                        )
+                    self._start_expansion(
+                        FrameType.ALBUM,
+                        [
+                            ("couldn't find it", "large", COLORS['green']),
+                            ("", None, None),
+                            *self._format_display_text(f"searched for: {query}", COLORS['white']),
+                            ("", None, None),
+                            *self._format_display_text("wanna try a different song?", COLORS['white']),
+                        ],
+                        duration=10.0
                     )
         elif action == "HANG_PROPOSE":
             dt_str = intent.params.get('datetime', '')
@@ -1120,16 +1326,14 @@ class LeelooBrain:
                 self._pending_hang_dt = dt_str
             if self.ws_client and self.ws_client.connected and dt_str:
                 await self.ws_client.send_hang_propose(dt_str, desc)
-            self._expand_task = asyncio.create_task(
-                self.expand_frame(
-                    FrameType.MESSAGES,
-                    [
-                        ("hang proposed!", "large", COLORS['lavender']),
-                        ("", None, None),
-                        *self._format_display_text(intent.response_text, COLORS['white']),
-                    ],
-                    duration=EXPANDED_HOLD_DURATION
-                )
+            self._start_expansion(
+                FrameType.MESSAGES,
+                [
+                    ("hang proposed!", "large", COLORS['lavender']),
+                    ("", None, None),
+                    *self._format_display_text(intent.response_text, COLORS['white']),
+                ],
+                duration=EXPANDED_HOLD_DURATION
             )
         elif action == "HANG_CONFIRM":
             print("[BRAIN] Hang confirmed")
@@ -1144,16 +1348,14 @@ class LeelooBrain:
                 self._pending_hang_dt = None
             if self.ws_client and self.ws_client.connected:
                 await self.ws_client.send_hang_confirm()
-            self._expand_task = asyncio.create_task(
-                self.expand_frame(
-                    FrameType.MESSAGES,
-                    [
-                        ("hang confirmed!", "large", COLORS['lavender']),
-                        ("", None, None),
-                        *self._format_display_text(intent.response_text, COLORS['white']),
-                    ],
-                    duration=10.0
-                )
+            self._start_expansion(
+                FrameType.MESSAGES,
+                [
+                    ("hang confirmed!", "large", COLORS['lavender']),
+                    ("", None, None),
+                    *self._format_display_text(intent.response_text, COLORS['white']),
+                ],
+                duration=10.0
             )
         elif action == "TELEGRAM_SETUP":
             # Show Telegram setup instructions
@@ -1169,33 +1371,27 @@ class LeelooBrain:
             ]
             if crew_code:
                 lines.append((f"your crew code: {crew_code}", "normal", COLORS['green']))
-            self._expand_task = asyncio.create_task(
-                self.expand_frame(
-                    FrameType.MESSAGES,
-                    lines,
-                    duration=EXPANDED_HOLD_DURATION
-                )
+            self._start_expansion(
+                FrameType.MESSAGES,
+                lines,
+                duration=EXPANDED_HOLD_DURATION
             )
         elif action == "TIME_QUERY":
             # Generate Tolkien-style cosmic time description
             print("[BRAIN] Time query — generating cosmic description")
             time_text = await self._generate_cosmic_time()
-            self._expand_task = asyncio.create_task(
-                self.expand_frame(
-                    FrameType.TIME,
-                    self._format_display_text(time_text, COLORS['purple']),
-                    duration=EXPANDED_HOLD_DURATION
-                )
+            self._start_expansion(
+                FrameType.TIME,
+                self._format_display_text(time_text, COLORS['purple']),
+                duration=EXPANDED_HOLD_DURATION
             )
         elif action == "UNKNOWN":
             # Show the response text if any
             if intent.response_text:
-                self._expand_task = asyncio.create_task(
-                    self.expand_frame(
-                        FrameType.WEATHER,
-                        self._format_display_text(intent.response_text, COLORS['tan']),
-                        duration=10.0
-                    )
+                self._start_expansion(
+                    FrameType.WEATHER,
+                    self._format_display_text(intent.response_text, COLORS['tan']),
+                    duration=10.0
                 )
         else:
             print(f"[BRAIN] Unknown intent: {action}")
@@ -1758,12 +1954,12 @@ Write ONLY the 65-word paragraph, no preamble or explanation."""
             test = current_line + (" " if current_line else "") + word
             if len(test) > 22:
                 if current_line:
-                    lines.append((current_line, "normal", COLORS['white']))
+                    lines.append((current_line, "normal", color))
                 current_line = word
             else:
                 current_line = test
         if current_line:
-            lines.append((current_line, "normal", COLORS['white']))
+            lines.append((current_line, "normal", color))
 
         return lines
 
@@ -1837,9 +2033,16 @@ Write ONLY the 65-word paragraph, no preamble or explanation."""
         """Synchronous display update — runs in thread executor"""
         if self._welcome_qr_active:
             return  # Don't overwrite QR during welcome screen
+        # Network refreshes outside the display lock
         self._update_weather()
         self._update_music()
-        self._render_normal()
+        with self._display_lock:
+            # Re-check right before writing: an expansion (or the welcome
+            # screen) may have started while this tick was fetching data —
+            # an in-flight tick must never paint over it
+            if self.ui_state != UIState.NORMAL or self._welcome_qr_active:
+                return
+            self._render_normal()
 
     # =========================================================================
     # FIRST BOOT WELCOME
@@ -1986,21 +2189,25 @@ Write ONLY the 65-word paragraph, no preamble or explanation."""
 
         # Save original album art path to restore later
         original_art_path = self.album_art_path
+        loop = asyncio.get_running_loop()
 
         try:
             # _welcome_qr_active already set True before task creation
 
             # --- PHASE 1: Telegram QR (always if opted) ---
             if telegram_opted and crew_code:
-                qr_path = self._generate_qr_image(
+                # QR build + PIL compositing + PNG save: 100ms+ on a Pi Zero,
+                # keep it off the event loop (taps / WebSocket keep flowing)
+                qr_path = await loop.run_in_executor(None, functools.partial(
+                    self._generate_qr_image,
                     qr_url=f"https://t.me/Leeloo2259_bot?start={crew_code.replace('-', '')}",
                     label_text="scan for Telegram",
                     sublabel_text=crew_code,
                     label_color=COLORS['lavender']
-                )
+                ))
                 if qr_path:
                     self.album_art_path = qr_path
-                    self._render_normal()
+                    await loop.run_in_executor(None, self._render_normal)
                     print("[BRAIN] Telegram QR shown in album art box")
 
                 lines = [
@@ -2019,16 +2226,17 @@ Write ONLY the 65-word paragraph, no preamble or explanation."""
 
             # --- PHASE 2: Spotify OAuth QR (conditional) ---
             if show_spotify:
-                qr_path = self._generate_qr_image(
+                qr_path = await loop.run_in_executor(None, functools.partial(
+                    self._generate_qr_image,
                     qr_url=self._generate_spotify_oauth_url(),
                     label_text="scan to sync",
                     sublabel_text="your Spotify",
                     label_color=COLORS['green'],
                     hint_text="(optional)"
-                )
+                ))
                 if qr_path:
                     self.album_art_path = qr_path
-                    self._render_normal()
+                    await loop.run_in_executor(None, self._render_normal)
                     print("[BRAIN] Spotify OAuth QR shown in album art box")
 
                 lines = [
@@ -2065,6 +2273,19 @@ Write ONLY the 65-word paragraph, no preamble or explanation."""
             except:
                 pass
 
+    def _launch_welcome_screen(self):
+        """Start the first-boot welcome flow as an expansion task, so a crew
+        message or a tap cancels it like any other expansion."""
+        self._welcome_qr_active = True  # Block music updates BEFORE task starts
+        welcome_task = self._start_expand_task(self._show_welcome_with_qr)
+        # If it's cancelled before it ever starts, its finally (which clears
+        # the flag) never runs — clear it here too or the display loop would
+        # stay frozen forever
+        welcome_task.add_done_callback(
+            lambda _t: setattr(self, '_welcome_qr_active', False)
+        )
+        return welcome_task
+
     async def run(self):
         """Main entry point — start all subsystems"""
         print("[BRAIN] Starting LEELOO Brain...")
@@ -2072,13 +2293,16 @@ Write ONLY the 65-word paragraph, no preamble or explanation."""
         print(f"[BRAIN] Crew: {self.contacts}")
         print(f"[BRAIN] Location: {'configured' if self.location_configured else 'not set'}")
 
+        # Event loop handle for executor threads (_sync_ambient_led)
+        self._loop = asyncio.get_running_loop()
+
         # Move console off LCD
         os.system("sudo con2fbmap 1 0 2>/dev/null")
 
-        # Initial render
-        self._update_weather()
-        self._update_music()
-        self._render_normal()
+        # Initial render (network + PIL — keep it off the event loop)
+        await self._loop.run_in_executor(None, self._update_weather)
+        await self._loop.run_in_executor(None, self._update_music)
+        await self._loop.run_in_executor(None, self._render_normal)
 
         # Start ambient LED breathe (uses same logic as _sync_ambient_led)
         spotify_tokens_path = os.path.join(LEELOO_HOME, "spotify_tokens.json")
@@ -2108,10 +2332,7 @@ Write ONLY the 65-word paragraph, no preamble or explanation."""
 
         # Auto-expand welcome screen with QR code on first boot
         if is_first_boot:
-            self._welcome_qr_active = True  # Block music updates BEFORE task starts
-            self._expand_task = asyncio.create_task(
-                self._show_welcome_with_qr()
-            )
+            self._launch_welcome_screen()
             print("[BRAIN] First boot welcome screen launched")
 
         try:
