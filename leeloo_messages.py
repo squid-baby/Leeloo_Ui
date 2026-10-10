@@ -52,7 +52,9 @@ class MessageManager:
     def _save(self):
         """Save messages to JSON file"""
         try:
-            atomic_write_json(self.storage_path, self._messages, indent=2)
+            # durable=False: runs on the event loop (every incoming message); fsync
+            # on the SD card could block it for 100+ ms
+            atomic_write_json(self.storage_path, self._messages, indent=2, durable=False)
         except Exception as e:
             print(f"[MSG] Error saving messages: {e}")
 

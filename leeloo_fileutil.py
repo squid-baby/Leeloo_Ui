@@ -17,8 +17,13 @@ import os
 import tempfile
 
 
-def atomic_write_json(path, data, indent=2, mode=None):
+def atomic_write_json(path, data, indent=2, mode=None, durable=True):
     """Write data as JSON to path atomically.
+
+    durable: fsync the file and directory (survives power loss right after
+             the call). Set False for small writes made on the asyncio event
+             loop: fsync on an SD card can take 10-100+ ms and would block it.
+             The rename alone still never leaves a partial file in place.
 
     mode: file permission bits for a new file (e.g. 0o600 for secrets).
           An existing file keeps its current permissions unless mode is given.
@@ -37,7 +42,8 @@ def atomic_write_json(path, data, indent=2, mode=None):
         with os.fdopen(fd, "w") as f:
             json.dump(data, f, indent=indent)
             f.flush()
-            os.fsync(f.fileno())
+            if durable:
+                os.fsync(f.fileno())
         os.chmod(tmp_path, mode)
         os.replace(tmp_path, path)
     except BaseException:
@@ -46,6 +52,9 @@ def atomic_write_json(path, data, indent=2, mode=None):
         except OSError:
             pass
         raise
+
+    if not durable:
+        return
 
     # Persist the rename itself (directory entry) — best effort
     try:

@@ -130,12 +130,16 @@ class LEDManager:
             print(f"[LED] {name} skipped (recording)")
             coro.close()  # never started — avoid 'coroutine was never awaited'
             return
-        await self._cancel_ambient()
-        await self._cancel_current()
-        # The superseded animation's finally (in its own _run_animation) may
-        # have restarted ambient while we waited for it: stop that again, or
-        # the breathe fights this animation over the pixels for its whole run
-        await self._cancel_ambient()
+        try:
+            await self._cancel_ambient()
+            await self._cancel_current()
+            # The superseded animation's finally (in its own _run_animation) may
+            # have restarted ambient while we waited for it: stop that again, or
+            # the breathe fights this animation over the pixels for its whole run
+            await self._cancel_ambient()
+        except asyncio.CancelledError:
+            coro.close()  # our caller was cancelled before the animation started
+            raise
         if self._recording:
             # Recording started while we were cancelling the old animation
             print(f"[LED] {name} skipped (recording)")

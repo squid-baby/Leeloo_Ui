@@ -312,7 +312,7 @@ class LeelooClient:
             async for message in self.websocket:
                 try:
                     data = json.loads(message)
-                except (ValueError, TypeError) as e:
+                except (ValueError, TypeError, RecursionError) as e:
                     print(f"[CLIENT] Ignoring malformed frame (not JSON): {e}")
                     continue
                 if not isinstance(data, dict):
