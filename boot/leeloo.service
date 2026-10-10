@@ -1,6 +1,8 @@
 [Unit]
 Description=LEELOO Main Service
 After=network.target
+# Never stop restarting after repeated crashes (the device has no other UI)
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -8,6 +10,8 @@ User=root
 WorkingDirectory=/home/pi/leeloo-ui
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 -u /home/pi/leeloo-ui/leeloo_boot.py
+# leeloo_boot.py exits 1 on fatal errors and when the brain crashes,
+# so on-failure restarts it; a deliberate stop exits 0 and stays stopped.
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

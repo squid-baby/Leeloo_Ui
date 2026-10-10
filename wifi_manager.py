@@ -20,21 +20,27 @@ DNSMASQ_CONF = "/etc/dnsmasq.d/leeloo-ap.conf"
 WPA_SUPPLICANT_CONF = "/etc/wpa_supplicant/wpa_supplicant.conf"
 
 
+def _cmd_label(argv):
+    """Short command name for logs (argv can hold a WiFi password)"""
+    return ' '.join(argv[:4])
+
+
 def run_command(cmd, check=False):
-    """Run a shell command and return result"""
+    """Run a command as an argv list (no shell) and return result"""
+    argv = cmd if isinstance(cmd, list) else cmd.split()
     try:
         result = subprocess.run(
-            cmd if isinstance(cmd, list) else cmd.split(),
+            argv,
             capture_output=True,
             text=True,
             timeout=30
         )
         if check and result.returncode != 0:
-            print(f"Command failed: {' '.join(cmd)}")
+            print(f"Command failed: {_cmd_label(argv)}")
             print(f"stderr: {result.stderr}")
         return result
     except subprocess.TimeoutExpired:
-        print(f"Command timed out: {cmd}")
+        print(f"Command timed out: {_cmd_label(argv)}")
         return None
     except Exception as e:
         print(f"Command error: {e}")
@@ -131,7 +137,7 @@ def start_ap_mode():
     """
     Start WiFi Access Point mode for setup.
     Expects NetworkManager to have already released wlan0
-    (via 'nmcli device set wlan0 managed no' in leeloo_boot.py).
+    (via release_wlan0_for_ap()).
     Returns the SSID being broadcast.
     """
     print("Starting AP mode...")
@@ -175,6 +181,20 @@ def start_ap_mode():
 
     print(f"AP mode started: {ssid}")
     return ssid
+
+
+def release_wlan0_for_ap():
+    """
+    Fully release wlan0 for hostapd AP mode.
+    NetworkManager (via netplan) aggressively reclaims wlan0,
+    so it must be stopped entirely while the AP is up.
+    """
+    # Stop NetworkManager completely — it fights hostapd for wlan0
+    run_command(['sudo', 'systemctl', 'stop', 'NetworkManager'])
+    # Also kill wpa_supplicant which NM may have spawned
+    run_command(['sudo', 'killall', 'wpa_supplicant'])
+    print("[WIFI] NetworkManager stopped, wlan0 free for AP mode")
+    time.sleep(1)
 
 
 def stop_ap_mode():

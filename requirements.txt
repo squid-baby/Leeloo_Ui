@@ -12,6 +12,7 @@ websockets>=12.0                        # WebSocket client (relay server)
 
 # Setup & configuration
 qrcode[pil]>=7.4.0                      # QR code generation (WiFi setup, Spotify OAuth)
+flask>=2.2                              # Captive portal web server (first-run WiFi setup)
 
 # AI & voice
 anthropic>=0.79.0                       # Claude Haiku intent router
