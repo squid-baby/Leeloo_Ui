@@ -217,6 +217,8 @@ class LeelooBrain:
         self._expand_task = None  # Most recently started expansion task (see _start_expand_task)
         self._expand_tasks = set()  # All live expansion tasks (running or queued)
         self._expand_cancel_sent = set()  # Live tasks already cancelled (see _cancel_expansions)
+        self._expand_single = set()  # Live tasks that run exactly one expand_frame (_start_expansion)
+        self._expand_finishing = set()  # Of those, the ones inside expand_frame's finally
         self._expand_lock = None  # asyncio.Lock, created lazily on the loop (py3.9 binds at creation)
         self._welcome_qr_active = False  # Prevents display loop from overwriting QR
 
@@ -695,10 +697,11 @@ class LeelooBrain:
         queued. The ONLY way callers should start expand_frame (sync-safe:
         usable from WebSocket callbacks running on the event loop)."""
         return self._start_expand_task(
-            lambda: self.expand_frame(frame_type, content_lines, duration=duration)
+            lambda: self.expand_frame(frame_type, content_lines, duration=duration),
+            single_expansion=True,
         )
 
-    def _start_expand_task(self, coro_factory):
+    def _start_expand_task(self, coro_factory, single_expansion=False):
         """Cancel every live expansion and start coro_factory() as the new one.
 
         Guarantees:
@@ -717,6 +720,13 @@ class LeelooBrain:
         directly any number of times (e.g. _show_welcome_with_qr) — only this
         wrapper takes the lock, so that can't deadlock.
 
+        single_expansion: True when coro_factory runs exactly one
+        expand_frame and nothing after it (_start_expansion). Only such a
+        task counts as 'just finishing' once its finally starts (cancelled
+        or not), so a tap then starts voice instead of dismissing it (see
+        _has_running_expansion). Multi-step flows (welcome) may draw again
+        after a finally, so a tap in any of their finallys dismisses them.
+
         Must be called on the event loop thread."""
         self._cancel_expansions()
 
@@ -728,6 +738,8 @@ class LeelooBrain:
 
         task = asyncio.ensure_future(_exclusive())
         self._expand_tasks.add(task)
+        if single_expansion:
+            self._expand_single.add(task)
         task.add_done_callback(self._on_expand_task_done)
         self._expand_task = task
         return task
@@ -736,6 +748,8 @@ class LeelooBrain:
         """Forget a finished expansion task and log unexpected errors"""
         self._expand_tasks.discard(task)
         self._expand_cancel_sent.discard(task)
+        self._expand_single.discard(task)
+        self._expand_finishing.discard(task)
         if task.cancelled():
             return
         exc = task.exception()
@@ -747,10 +761,10 @@ class LeelooBrain:
         Their finally blocks run on the next loop iterations; a new expansion
         waits for them via the expansion lock.
 
-        Each task is cancelled only once: a second cancel would land inside
-        its finally (e.g. a second tap while the collapse refresh is still
-        running) and abort the music refresh and re-render, leaving the old
-        expanded frame on screen until the next display tick."""
+        Each task is cancelled only once: the first cancel already makes it
+        wind down (a second one would only interrupt its finally again; the
+        post-collapse refresh + re-render is shielded, so it would still
+        complete)."""
         for task in list(self._expand_tasks):
             if not task.done() and task not in self._expand_cancel_sent:
                 self._expand_cancel_sent.add(task)
@@ -760,6 +774,51 @@ class LeelooBrain:
         """True while any expansion task (running, queued, or still in its
         finally) has not finished"""
         return any(not task.done() for task in self._expand_tasks)
+
+    def _has_running_expansion(self):
+        """True while any expansion task is running or queued — i.e. live
+        and NOT merely inside a single expansion's finally (post-collapse
+        music refresh + re-render, ui_state already NORMAL; whether that
+        expansion ended normally or was dismissed). A tap during
+        such a finally may start voice: the re-render re-checks ui_state
+        under the display lock and skips painting once voice owns the screen."""
+        return any(
+            not task.done() and task not in self._expand_finishing
+            for task in self._expand_tasks
+        )
+
+    def _refresh_and_render_after_collapse(self):
+        """Post-collapse music refresh + re-render as ONE blocking job
+        (executor). The render runs even if the Spotify refresh fails."""
+        try:
+            self._update_music()
+        except Exception as e:
+            print(f"[BRAIN] Music refresh after collapse failed: {e}")
+        self._render_normal()
+
+    async def _await_uncancellable(self, fut):
+        """Await fut to completion even if the calling task is cancelled
+        (once or repeatedly) meanwhile; then re-raise that CancelledError.
+        Keeps the caller (and so the expansion lock) busy until the job is
+        really done, so the next expansion can't start under it."""
+        cancelled = False
+        while True:
+            try:
+                result = await asyncio.shield(fut)
+                break
+            except asyncio.CancelledError:
+                if fut.done():
+                    # fut itself cancelled (nobody does that) or finished
+                    # in the same iteration as our cancel
+                    cancelled = True
+                    result = None
+                    break
+                cancelled = True
+        if cancelled:
+            if fut.done() and not fut.cancelled() and fut.exception() is not None:
+                print(f"[BRAIN] Re-render after collapse failed: {fut.exception()}")
+            raise asyncio.CancelledError()
+        return result
 
     async def expand_frame(self, frame_type: FrameType, content_lines, duration=EXPANDED_HOLD_DURATION):
         """
@@ -818,13 +877,26 @@ class LeelooBrain:
             self.expanded_frame = None
             self.message_view_active = False
             # Force data refresh before re-rendering (picks up new album art, etc.)
-            # Both block (network / PIL) — run them in the executor.
+            # Both block (network / PIL) — ONE executor job, awaited so that a
+            # cancel (tap, new expansion) can't skip the re-render: the job
+            # always completes, then the cancel propagates.
             self.last_music_fetch = 0
+            # Mark a single expansion as 'just finishing' (whether it ended
+            # normally or was dismissed/replaced): nothing more is drawn by
+            # it and ui_state is already NORMAL, so a tap now starts voice
+            # instead of being swallowed. A replacement queued behind it still
+            # counts as running, so that tap dismisses the queued one instead
+            # (see _has_running_expansion / _handle_single_tap).
+            task = asyncio.current_task()
+            if task is not None and task in self._expand_single:
+                self._expand_finishing.add(task)
             try:
-                await loop.run_in_executor(None, self._update_music)
-                await loop.run_in_executor(None, self._render_normal)
+                await self._await_uncancellable(loop.run_in_executor(
+                    None, self._refresh_and_render_after_collapse))
             except Exception as e:
                 print(f"[BRAIN] Re-render after collapse failed: {e}")
+            finally:
+                self._expand_finishing.discard(task)
 
     async def _typewriter(self, content_lines, box_right):
         """Typewriter effect — writes text character by character to framebuffer.
@@ -998,16 +1070,20 @@ class LeelooBrain:
     async def _handle_single_tap(self):
         """Single tap — activate voice (or cancel current expansion)"""
         if (self.ui_state in (UIState.EXPANDED, UIState.EXPANDING, UIState.COLLAPSING)
-                or self._has_live_expansion()):
+                or self._has_running_expansion()):
             # Cancel current (and any queued) expansion — tap to dismiss.
             # COLLAPSING too: starting voice mid-collapse would let the
             # collapse's finally reset ui_state to NORMAL during recording.
-            # Any live expansion task counts, whatever ui_state says: a
-            # cancelled one's finally sets NORMAL before its (slow) music
-            # refresh and re-render, a newer one may be queued on the lock
-            # behind it, and the welcome flow is NORMAL while it builds a QR.
+            # Any running or queued expansion task counts, whatever ui_state
+            # says: a newer one may be queued on the lock behind a finishing
+            # one, and the welcome flow is NORMAL while it builds a QR.
             # Starting voice there would let the queued expansion take over
             # the screen (and ui_state) mid-recording.
+            # Exception: a single expansion that is only in its finally
+            # (refresh + re-render, ended normally OR already dismissed, and
+            # nothing queued behind it) — that tap is a real 'tap to talk',
+            # so fall through to voice. The re-render then skips painting
+            # (ui_state != NORMAL).
             self._cancel_expansions()
             return
 

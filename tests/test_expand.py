@@ -415,8 +415,9 @@ async def test_tap_during_old_finally_with_queued_expansion_dismisses(env):
 
 
 async def test_second_tap_while_dismissed_expansion_finishes(env):
-    """A second tap during the dismissed expansion's slow refresh neither
-    starts voice nor aborts that expansion's re-render (cancel only once)."""
+    """A second tap during the dismissed expansion's slow refresh (nothing
+    queued behind it) is a real 'tap to talk': it starts voice, and it does
+    not abort that expansion's re-render (cancel only once, job shielded)."""
     brain, tracker = env
     sessions = _arm_voice(brain)
     _slow_refresh_and_record_renders(brain, tracker)
@@ -424,22 +425,17 @@ async def test_second_tap_while_dismissed_expansion_finishes(env):
     a = brain._start_expansion(FrameType.MESSAGES, lines("A"), duration=5.0)
     await wait_for(lambda: brain.ui_state == UIState.EXPANDED)
     await brain._handle_single_tap()  # dismiss
+    assert sessions == []
     await wait_for(lambda: brain.ui_state == UIState.NORMAL)
     await asyncio.sleep(0.05)
     assert not a.done()  # still in its finally (slow refresh)
 
     await brain._handle_single_tap()  # second tap
-    assert sessions == []
+    assert sessions == [UIState.NORMAL]
 
     await asyncio.wait_for(asyncio.gather(a, return_exceptions=True), timeout=3.0)
     assert a.cancelled()
-    assert ("render", UIState.NORMAL) in tracker.events
-    assert sessions == []
-
-    # Once nothing is alive any more, a tap starts voice as usual
-    await wait_for(lambda: brain._expand_tasks == set())
-    await brain._handle_single_tap()
-    assert sessions == [UIState.NORMAL]
+    assert [e for e in tracker.events if e[0] == "render"]  # re-render ran
 
 
 async def test_tap_while_welcome_builds_qr_dismisses(env):
