@@ -1214,6 +1214,7 @@ class LeelooBrain:
         3. Natural language mentions — use Claude Haiku to extract search query
         """
         import re
+        import threading
 
         # Case 1: Spotify track link  (e.g. https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC)
         link_match = re.search(r'open\.spotify\.com/track/([a-zA-Z0-9]+)', text)
@@ -1236,17 +1237,25 @@ class LeelooBrain:
             print("[BRAIN] No Anthropic key for music detection")
             return None
 
+        # Created here on the event loop thread (single-threaded, so no race);
+        # it guards client creation inside the executor threads below
+        if getattr(self, '_music_detect_lock', None) is None:
+            self._music_detect_lock = threading.Lock()
+
         try:
             loop = asyncio.get_running_loop()
 
             def _get_client():
                 # Runs in the executor: building an SDK client is too slow for the event loop
                 client = getattr(getattr(self, 'intent_router', None), 'client', None)
-                if client is None:
+                if client is not None:
+                    return client
+                # Lock so two messages classified at once don't each build (and leak) a client
+                with self._music_detect_lock:
                     client = getattr(self, '_music_detect_client', None)
-                if client is None:
-                    client = create_client(anthropic_key)
-                    self._music_detect_client = client
+                    if client is None:
+                        client = create_client(anthropic_key)
+                        self._music_detect_client = client
                 return client
 
             def _classify():
@@ -1255,7 +1264,9 @@ class LeelooBrain:
                     print("[BRAIN] anthropic not installed — music detection disabled")
                     return None
                 # Friend-written text goes in the user turn, wrapped as data; the system prompt is static
-                safe_text = str(text).replace("</message>", "").replace("<message>", "")
+                # Drop any <message>/</MESSAGE > variant so the text can't close the wrapper
+                # (case- and whitespace-insensitive, same as leeloo_intent._strip_wrapper_tags)
+                safe_text = re.sub(r'<\s*/?\s*message\s*>', '', str(text), flags=re.IGNORECASE)
                 resp = client.messages.create(
                     model=HAIKU_MODEL,
                     max_tokens=150,

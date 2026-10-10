@@ -113,9 +113,12 @@ _FENCE_RE = re.compile(r"```[A-Za-z]*[ \t]*\n?(.*?)```", re.DOTALL)
 def parse_json_object(raw):
     """Pull a JSON object out of a model reply. Returns a dict, or None.
 
-    1. Strip markdown code fences, then json.loads the whole text.
-    2. If that fails, take the first balanced {...} object in the text
-       (handles preamble like "sure! here you go: {...}").
+    1. json.loads the whole reply as-is (a plain JSON reply may itself hold
+       backticks inside a string value, so fences are not stripped first).
+    2. Strip markdown code fences and json.loads each fenced body.
+    3. If that fails, take the first balanced {...} object, searching the
+       fenced bodies first and then the original text (handles preamble like
+       "sure! here you go: {...}" and JSON that sits outside a fence).
     """
     if not isinstance(raw, str):
         return None
@@ -123,22 +126,43 @@ def parse_json_object(raw):
     if not text:
         return None
 
-    # Step 1: code fences (closed, or an opening fence that was never closed)
-    fence = _FENCE_RE.search(text)
-    if fence:
-        text = fence.group(1).strip()
-    elif text.startswith("```"):
-        text = text.split("\n", 1)[-1].strip()
+    # Step 1: the reply as-is
+    data = _loads_dict(text)
+    if data is not None:
+        return data
 
+    # Step 2: code fences (closed, or an opening fence that was never closed)
+    fenced = [m.group(1).strip() for m in _FENCE_RE.finditer(text)]
+    if not fenced and text.startswith("```"):
+        fenced = [text.split("\n", 1)[-1].strip()]
+    for body in fenced:
+        data = _loads_dict(body)
+        if data is not None:
+            return data
+
+    # Step 3: first balanced object, fence bodies first, then the original text
+    for candidate in fenced + [text]:
+        data = _first_balanced_object(candidate)
+        if data is not None:
+            return data
+    return None
+
+
+def _loads_dict(text):
+    """json.loads that returns the value only when it is a dict, else None."""
     try:
         data = json.loads(text)
-        if isinstance(data, dict):
-            return data
     except ValueError:
-        pass
+        return None
+    return data if isinstance(data, dict) else None
 
-    # Step 2: first balanced object. raw_decode stops at the matching brace and
-    # understands JSON strings, so braces inside values don't confuse it.
+
+def _first_balanced_object(text):
+    """Return the first {...} in text that decodes to a dict, or None.
+
+    raw_decode stops at the matching brace and understands JSON strings, so
+    braces inside values don't confuse it.
+    """
     decoder = json.JSONDecoder()
     start = text.find("{")
     while start != -1:

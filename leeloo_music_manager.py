@@ -14,7 +14,7 @@ import base64
 # Import centralized album art utility
 from leeloo_album_art import download_and_create_album_art
 
-LEELOO_HOME = "/home/pi/leeloo-ui"
+LEELOO_HOME = os.environ.get("LEELOO_HOME", "/home/pi/leeloo-ui")  # same override as leeloo_brain
 TOKENS_FILE = os.path.join(LEELOO_HOME, "spotify_tokens.json")
 CURRENT_MUSIC_FILE = os.path.join(LEELOO_HOME, "current_music.json")
 ALBUM_ART_DIR = os.path.join(LEELOO_HOME, "album_art")
@@ -25,7 +25,8 @@ ENV_FILE = os.path.join(LEELOO_HOME, ".env")
 
 def load_env_defaults(env_path=ENV_FILE):
     """Load KEY=VALUE pairs from .env into os.environ, never overriding a key
-    that is already set (same format/quote stripping as LeelooBrain._load_env).
+    that is already set, even to an empty string (an operator can export
+    KEY= to disable it). Same format/quote stripping as LeelooBrain._load_env.
 
     This module can be imported before leeloo_brain loads .env, or run
     standalone, so it reads the file itself. Returns the keys it set.
@@ -39,7 +40,7 @@ def load_env_defaults(env_path=ENV_FILE):
                     key, value = line.split('=', 1)
                     key = key.strip()
                     value = value.strip().strip('"').strip("'")
-                    if key and value and not os.environ.get(key):
+                    if key and value and key not in os.environ:
                         os.environ[key] = value
                         loaded.append(key)
     except FileNotFoundError:

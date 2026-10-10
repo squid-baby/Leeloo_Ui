@@ -61,6 +61,43 @@ def test_loader_does_not_override_existing_env(tmp_path, clean_test_keys, monkey
     assert loaded == ["LEELOO_TEST_B"]
 
 
+def test_loader_keeps_key_set_to_empty_string(tmp_path, clean_test_keys, monkeypatch):
+    """An operator can export KEY= on purpose (e.g. to disable Spotify); .env must not refill it"""
+    monkeypatch.setenv("LEELOO_TEST_A", "")
+    path = write_env(tmp_path, "LEELOO_TEST_A=from-file\n")
+    assert mm.load_env_defaults(path) == []
+    assert os.environ["LEELOO_TEST_A"] == ""
+
+
+def test_leeloo_home_env_var_is_honoured(tmp_path, monkeypatch):
+    """Like leeloo_brain, LEELOO_HOME overrides /home/pi/leeloo-ui, and the
+    module reads that home's .env when imported standalone."""
+    (tmp_path / ".env").write_text("SPOTIFY_CLIENT_ID=home-id\nSPOTIFY_CLIENT_SECRET='home-secret'\n")
+    monkeypatch.setenv("LEELOO_HOME", str(tmp_path))
+    monkeypatch.delenv("SPOTIFY_CLIENT_ID", raising=False)
+    monkeypatch.delenv("SPOTIFY_CLIENT_SECRET", raising=False)
+    try:
+        importlib.reload(mm)
+        assert mm.LEELOO_HOME == str(tmp_path)
+        assert mm.ENV_FILE == str(tmp_path / ".env")
+        assert mm.TOKENS_FILE == str(tmp_path / "spotify_tokens.json")
+        assert mm.SPOTIFY_CLIENT_ID == "home-id"
+        assert mm.SPOTIFY_CLIENT_SECRET == "home-secret"
+    finally:
+        monkeypatch.undo()
+        importlib.reload(mm)
+
+
+def test_leeloo_home_default(monkeypatch):
+    monkeypatch.delenv("LEELOO_HOME", raising=False)
+    try:
+        importlib.reload(mm)
+        assert mm.LEELOO_HOME == "/home/pi/leeloo-ui"
+    finally:
+        monkeypatch.undo()
+        importlib.reload(mm)
+
+
 def test_loader_missing_file_is_quiet(tmp_path):
     assert mm.load_env_defaults(str(tmp_path / "nope.env")) == []
 
