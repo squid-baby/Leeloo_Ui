@@ -31,6 +31,36 @@ except ImportError:
     print("[VOICE] websockets not installed — voice disabled")
 
 
+def _handshake_rejection_errors():
+    """Exception classes raised when Deepgram rejects the WebSocket handshake.
+
+    websockets>=14 (new client, needed for additional_headers) raises
+    InvalidStatus; the legacy client raised InvalidStatusCode. Look both up
+    with getattr so this module stays importable whichever names exist.
+    """
+    if not WEBSOCKETS_AVAILABLE:
+        return ()
+    import warnings
+    try:
+        # Import the submodule explicitly: websockets>=14 loads it lazily, so
+        # `websockets.exceptions` may not exist as an attribute yet
+        import websockets.exceptions as excs
+    except ImportError:
+        return ()
+    found = []
+    for name in ("InvalidStatus", "InvalidStatusCode"):
+        with warnings.catch_warnings():
+            # InvalidStatusCode is a deprecated alias on websockets>=14
+            warnings.simplefilter("ignore", DeprecationWarning)
+            cls = getattr(excs, name, None)
+        if isinstance(cls, type) and issubclass(cls, BaseException) and cls not in found:
+            found.append(cls)
+    return tuple(found)
+
+
+HANDSHAKE_REJECTED_ERRORS = _handshake_rejection_errors()
+
+
 # Recording parameters
 DEVICE = "plughw:0"
 SAMPLE_RATE = 16000
@@ -206,7 +236,7 @@ class VoiceManager:
                 if not transcript and interim_transcript:
                     transcript = interim_transcript.strip()
 
-        except websockets.exceptions.InvalidStatusCode as e:
+        except HANDSHAKE_REJECTED_ERRORS as e:
             print(f"[VOICE] Deepgram auth failed: {e}")
         except Exception as e:
             print(f"[VOICE] Error: {e}")

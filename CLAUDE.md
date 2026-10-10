@@ -208,13 +208,19 @@ await loop.run_in_executor(None, write_to_framebuffer, img)
 - **Physical Pin 32** = GPIO 12 (LED DIN) ← **Check this first if LEDs don't work!**
 
 ### 9. **Anthropic Model Names**
+All Claude calls use the `HAIKU_MODEL` constant from `leeloo_intent.py` (currently `claude-haiku-5-5`; `claude-3-haiku-20240307` was retired April 2026). Change the model in that one place only.
 ```python
-# ✅ Use explicit version
-model="claude-3-haiku-20240307"
+# ✅ Import the constant, disable thinking for short calls, read the first text block
+from leeloo_intent import HAIKU_MODEL, THINKING_DISABLED, extract_text
+resp = client.messages.create(model=HAIKU_MODEL, max_tokens=300,
+                              thinking=THINKING_DISABLED, messages=[...])
+text = extract_text(resp)  # None on refusal / no text block -> use fallback
 
-# ❌ Don't use -latest suffix
-model="claude-3-5-haiku-latest"  # 404 on Pi SDK
+# ❌ Don't use -latest aliases, hardcoded model strings, or response.content[0].text
+model="claude-3-5-haiku-latest"  # 404
+# ❌ Haiku 5.5 returns HTTP 400 for: temperature/top_p/top_k, budget_tokens, assistant prefill
 ```
+A 404 (`anthropic.NotFoundError`) logs a loud "model NOT FOUND" banner: the model ID is retired or wrong.
 
 ### 10. **OAuth State Parameter**
 ```python
@@ -296,8 +302,10 @@ ssh root@leeloobot.xyz "pm2 logs leeloo-relay --lines 20"
 DEEPGRAM_API_KEY=...           # Nova-2 STT
 ANTHROPIC_API_KEY=...          # Claude Haiku
 SPOTIFY_CLIENT_ID=...          # Web API
-SPOTIFY_CLIENT_SECRET=...      # Client credentials flow
+SPOTIFY_CLIENT_SECRET=...      # Client credentials flow + token refresh
 ```
+
+**Spotify secrets live in `.env` only.** Never hardcode `SPOTIFY_CLIENT_ID` / `SPOTIFY_CLIENT_SECRET` in source (this repo is public). `leeloo_music_manager.py` reads them from `os.environ`, loading `.env` itself for keys not already set; if they are missing it prints one warning and token refresh / artist lookups return `None`.
 
 ## Don't Do This
 
