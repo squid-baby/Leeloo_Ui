@@ -8,6 +8,8 @@ import json
 import time
 import sys
 
+from leeloo_fileutil import atomic_write_json
+
 DEVICE_CONFIG_PATH = "/home/pi/leeloo-ui/device_config.json"
 
 def geocode_zip_with_geonames(zip_code, username='leeloo_2255'):
@@ -150,8 +152,8 @@ def main():
         else:
             print("\n⚠️  No timezone data - time will use system timezone")
 
-        with open(DEVICE_CONFIG_PATH, 'w') as f:
-            json.dump(config, f, indent=2)
+        # device_config.json holds the WiFi password: power-safe, owner-only
+        atomic_write_json(DEVICE_CONFIG_PATH, config, indent=2, mode=0o600)
 
         print(f"\n✓ Updated {DEVICE_CONFIG_PATH}")
         print("✓ Weather and local time should now work!")

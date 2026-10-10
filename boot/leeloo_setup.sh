@@ -65,6 +65,7 @@ apt-get install -y \
     python3-pip \
     python3-dev \
     python3-smbus \
+    python3-flask \
     git \
     hostapd \
     dnsmasq \
@@ -81,6 +82,19 @@ ok "System packages installed"
 # =============================================================================
 log "[2/7] Installing Python packages..."
 
+# --break-system-packages is needed on Bookworm (PEP 668) but Bullseye's
+# pip 20.3 rejects it ("no such option"), which would fail every install.
+# Only pass it when this pip knows it.
+# >>> pip-flags
+PIP_FLAGS=()
+# Captured first (|| true) so neither set -e nor a grep -q SIGPIPE can bite
+PIP_INSTALL_HELP="$(pip3 install --help 2>/dev/null || true)"
+if grep -q -- '--break-system-packages' <<< "$PIP_INSTALL_HELP"; then
+    PIP_FLAGS+=(--break-system-packages)
+fi
+# <<< pip-flags
+log "pip flags: ${PIP_FLAGS[*]:-(none)}"
+
 # Install each package individually so one failure doesn't block the rest
 while IFS= read -r line; do
     # Skip comments and blank lines
@@ -89,14 +103,14 @@ while IFS= read -r line; do
     pkg=$(echo "$line" | sed 's/#.*//' | tr -d ' ')
     [ -z "$pkg" ] && continue
     echo "  Installing: $pkg"
-    if ! pip3 install --break-system-packages --ignore-installed typing_extensions "$pkg" --quiet 2>&1; then
+    if ! pip3 install "${PIP_FLAGS[@]}" --ignore-installed typing_extensions "$pkg" --quiet 2>&1; then
         warn "  Could not install $pkg — continuing"
     fi
 done < "$LEELOO_DIR/requirements.txt"
 
 # Verify critical imports
-python3 -c "import PIL; import numpy; import websockets; print('[OK] Core imports verified')" \
-    || fail "Core Python package import failed (PIL/numpy/websockets). Run pip3 install manually."
+python3 -c "import PIL; import numpy; import websockets; import flask; print('[OK] Core imports verified')" \
+    || fail "Core Python package import failed (PIL/numpy/websockets/flask). Run pip3 install manually."
 
 ok "Python packages installed"
 

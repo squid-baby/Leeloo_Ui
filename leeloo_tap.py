@@ -4,12 +4,19 @@ LEELOO Tap Manager — ADXL345 accelerometer tap detection
 
 Detects single, double, and triple taps via acceleration magnitude spikes.
 Uses software tap detection (delta magnitude threshold) which is more
-reliable than the ADXL345's hardware tap interrupt.
+reliable than the ADXL345's hardware tap interrupt. Only rising edges count:
+a reading must jump by more than TAP_THRESHOLD AND move further away from
+the resting magnitude than the previous reading. A spike's return to rest
+(falling edge) is never a tap, so every disturbance yields at most one hit.
 
-Timing:
-- Single tap:  1 tap, no follow-up within 400ms
-- Double tap:  2 taps within 400ms
-- Triple tap:  3 taps within 600ms
+Timing (see constants below for the reasoning):
+- Single tap:  1 tap, no follow-up within DOUBLE_TAP_WINDOW (0.55s)
+- Double tap:  2nd tap within 0.55s of the 1st, no 3rd within 0.55s of the 2nd
+- Triple tap:  3rd tap within 0.55s of the 2nd (resolves immediately)
+
+The tap callback runs in its own task, so a new raw tap (which restarts
+tap resolution) never cancels a callback that is still running — e.g. a
+voice interaction started by the previous tap.
 """
 
 import asyncio
@@ -28,15 +35,51 @@ except (ImportError, NotImplementedError):
 
 
 # Timing constants (seconds)
-DOUBLE_TAP_WINDOW = 0.50   # Max time between taps for double (increased for human speed)
-TRIPLE_TAP_WINDOW = 0.80   # Max time for triple tap sequence
-DEBOUNCE_TIME = 0.50       # Min time between raw tap events (must match settle)
+#
+# A human double tap lands its 2nd tap ~0.2-0.4s after the 1st. The old values
+# made that impossible: after every detected tap the loop was blind for
+# SETTLE 0.50 + 5 drain reads x 0.04 + 0.04 = 0.74s (and DEBOUNCE was 0.50s),
+# which is longer than the 0.50s double-tap window. Now:
+#
+#   blind time after a tap = SETTLE_TIME + SETTLE_DRAIN_READS*POLL + POLL
+#                          = 0.08 + 1*0.04 + 0.04 = 0.16s
+#   DEBOUNCE_TIME          = 0.18s  (> blind time: a rebound whose rising
+#                                    edge is still visible on the first read
+#                                    after the blind period is rejected, but a
+#                                    real 2nd tap at >= 0.2s is accepted)
+#   DOUBLE_TAP_WINDOW      = 0.55s  (2nd tap at 0.4s + up to one 0.04s poll of
+#                                    detection jitter still fits with margin)
+#
+# The physical rebound of a tap on the enclosure is a few tens of ms (one or
+# two 100Hz samples), so 0.08s settle + a drain read absorbs it. A rebound
+# that is still visible after the blind period is rejected in two ways:
+# its rising edge falls inside DEBOUNCE_TIME, and its return to rest one
+# poll later (past the debounce) is a falling edge, which _check_tap never
+# counts. The debounce alone could not cover that falling edge: it would
+# have to reach BLIND + 2 polls = 0.24s and swallow real 0.2s double taps.
+# Decaying ringing (each swing smaller than the last) is rejected by the
+# same rule, so a debounced rebound does not need to re-blind the loop.
+# Single-tap latency = DOUBLE_TAP_WINDOW = 0.55s (< 0.8s).
+DOUBLE_TAP_WINDOW = 0.55   # Max gap 1st→2nd tap (also single-tap resolve delay)
+TRIPLE_TAP_WINDOW = 0.55   # Max gap 2nd→3rd tap (double-tap resolve delay)
+DEBOUNCE_TIME = 0.18       # Min time between accepted raw taps (rejects rebound)
 POLL_INTERVAL = 0.04       # 25Hz polling
 
 # Acceleration tap detection
 TAP_THRESHOLD = 1.2        # Minimum delta magnitude (m/s²) to count as tap
-SETTLE_TIME = 0.50         # Time to wait after spike before accepting new tap (absorb rebound)
-SETTLE_DRAIN_READS = 5     # Number of readings to drain after settle (reset prev_magnitude)
+SETTLE_TIME = 0.08         # Time to wait after spike before reading again (absorb rebound)
+SETTLE_DRAIN_READS = 1     # Readings to drain after settle (reset prev_magnitude)
+
+# Total time the poll loop ignores the sensor after an accepted tap
+BLIND_TIME = SETTLE_TIME + SETTLE_DRAIN_READS * POLL_INTERVAL + POLL_INTERVAL
+
+# Resting magnitude (≈ |g|, the same in any orientation) used to tell a
+# rising edge (moving away from rest = tap) from a falling one (settling back)
+REST_ALPHA = 0.05          # EMA weight of a quiet reading (~0.8s time constant at 25Hz)
+REST_REANCHOR_READS = 25   # 1s of readings far from rest → re-anchor (sensor offset shift)
+
+# Log accelerometer read errors on the 1st and then every Nth occurrence
+READ_ERROR_LOG_EVERY = 100
 
 
 class TapManager:
@@ -53,8 +96,12 @@ class TapManager:
         self._tap_count = 0
         self._last_tap_time = 0
         self._pending_task = None
+        self._callback_tasks = set()  # strong refs so running callbacks aren't GC'd
         self.accel = None
         self._prev_magnitude = 0
+        self._rest_magnitude = None   # set from the first reading
+        self._unquiet_reads = 0
+        self._read_errors = 0
 
         # Initialize hardware
         if HARDWARE_AVAILABLE:
@@ -70,6 +117,7 @@ class TapManager:
                 # Prime with initial reading
                 x, y, z = self.accel.acceleration
                 self._prev_magnitude = math.sqrt(x*x + y*y + z*z)
+                self._rest_magnitude = self._prev_magnitude
 
                 print(f"[TAP] ADXL345 initialized (±16g, 400Hz, threshold={TAP_THRESHOLD} m/s²)")
             except Exception as e:
@@ -84,19 +132,63 @@ class TapManager:
         try:
             x, y, z = self.accel.acceleration
             magnitude = math.sqrt(x*x + y*y + z*z)
-            delta = abs(magnitude - self._prev_magnitude)
+            prev = self._prev_magnitude
+            delta = abs(magnitude - prev)
             self._prev_magnitude = magnitude
 
+            if self._rest_magnitude is None:
+                # Not primed in __init__ (no hardware at start) — use the
+                # previous reading if there is one
+                self._rest_magnitude = prev if prev else magnitude
+            rest = self._rest_magnitude
+            self._update_rest(magnitude)
+
             if delta > TAP_THRESHOLD:
-                print(f"[TAP] Hit! delta={delta:.2f} (threshold={TAP_THRESHOLD})")
-                return True
+                if abs(magnitude - rest) > abs(prev - rest):
+                    print(f"[TAP] Hit! delta={delta:.2f} (threshold={TAP_THRESHOLD})")
+                    return True
+                # Falling edge — the previous spike settling back toward rest
+                # (e.g. a rebound seen just after the blind period). Never a
+                # tap, or one rebound reading would become a false double tap.
+                print(f"[TAP] Settling delta={delta:.2f} (falling edge, ignored)")
             elif delta > 0.6:
                 # Log near-misses for tuning
                 print(f"[TAP] Near-miss delta={delta:.2f}")
-        except Exception:
-            pass
+        except Exception as e:
+            self._log_read_error(e)
 
         return False
+
+    def _update_rest(self, magnitude):
+        """Track the resting magnitude: follow quiet readings slowly, and
+        re-anchor if readings stay far from rest for REST_REANCHOR_READS
+        (otherwise a shifted sensor offset could hide every rising edge)"""
+        if abs(magnitude - self._rest_magnitude) <= TAP_THRESHOLD:
+            self._rest_magnitude += REST_ALPHA * (magnitude - self._rest_magnitude)
+            self._unquiet_reads = 0
+        else:
+            self._unquiet_reads += 1
+            if self._unquiet_reads >= REST_REANCHOR_READS:
+                print(f"[TAP] Rest level re-anchored {self._rest_magnitude:.2f} → {magnitude:.2f}")
+                self._rest_magnitude = magnitude
+                self._unquiet_reads = 0
+
+    def _log_read_error(self, e):
+        """Log accelerometer read errors without flooding the journal
+        (first error, then every READ_ERROR_LOG_EVERY-th)"""
+        self._read_errors += 1
+        if self._read_errors == 1 or self._read_errors % READ_ERROR_LOG_EVERY == 0:
+            print(f"[TAP] Accelerometer read error #{self._read_errors}: {e}")
+
+    def _drain_reading(self):
+        """Take one reading just to reset prev_magnitude (after a tap)"""
+        if not self.accel:
+            return
+        try:
+            x, y, z = self.accel.acceleration
+            self._prev_magnitude = math.sqrt(x*x + y*y + z*z)
+        except Exception as e:
+            self._log_read_error(e)
 
     async def _resolve_taps(self):
         """Wait for tap sequence to complete, then emit event"""
@@ -120,31 +212,47 @@ class TapManager:
 
         if self.callback:
             if asyncio.iscoroutinefunction(self.callback):
-                await self.callback(tap_type)
+                # Run in its own task: _pending_task is cancelled by every new
+                # raw tap, and awaiting the callback here would cancel e.g. a
+                # running voice interaction mid-recording (ui_state stuck).
+                task = asyncio.ensure_future(self.callback(tap_type))
+                self._callback_tasks.add(task)
+                task.add_done_callback(self._on_callback_done)
             else:
-                self.callback(tap_type)
+                try:
+                    self.callback(tap_type)
+                except Exception as e:
+                    print(f"[TAP] Callback error: {e}")
+
+    def _on_callback_done(self, task):
+        """Drop the reference and surface errors from a finished callback task"""
+        self._callback_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            print(f"[TAP] Callback error: {exc!r}")
 
     def _on_tap_detected(self):
-        """Called when a raw tap is detected"""
+        """Called when a raw tap is detected.
+        Returns True if the tap was accepted, False if debounced (rebound)."""
         now = time.time()
 
         # Debounce
         if now - self._last_tap_time < DEBOUNCE_TIME:
-            return
+            return False
         self._last_tap_time = now
 
         self._tap_count += 1
         print(f"[TAP] Raw tap #{self._tap_count}")
 
-        # Cancel pending resolution
+        # Cancel pending resolution (only the resolver — never a running callback)
         if self._pending_task and not self._pending_task.done():
             self._pending_task.cancel()
 
-        # If triple, resolve immediately
-        if self._tap_count >= 3:
-            self._pending_task = asyncio.ensure_future(self._resolve_taps())
-        else:
-            self._pending_task = asyncio.ensure_future(self._resolve_taps())
+        # _resolve_taps resolves a triple immediately, otherwise waits for more
+        self._pending_task = asyncio.ensure_future(self._resolve_taps())
+        return True
 
     async def start(self):
         """Start tap monitoring (async loop)"""
@@ -152,18 +260,15 @@ class TapManager:
         print("[TAP] Monitoring started (acceleration-based detection)")
 
         while self._running:
-            if self._check_tap():
-                self._on_tap_detected()
-                # Wait for physical rebound to fully dampen
+            if self._check_tap() and self._on_tap_detected():
+                # Wait for physical rebound to dampen (only after an accepted
+                # tap — a debounced rebound must not re-blind the loop, or a
+                # real 2nd tap right after it would be missed; its return to
+                # rest is a falling edge, which _check_tap ignores)
                 await asyncio.sleep(SETTLE_TIME)
                 # Drain residual rebound readings so prev_magnitude is stable
                 for _ in range(SETTLE_DRAIN_READS):
-                    if self.accel:
-                        try:
-                            x, y, z = self.accel.acceleration
-                            self._prev_magnitude = math.sqrt(x*x + y*y + z*z)
-                        except Exception:
-                            pass
+                    self._drain_reading()
                     await asyncio.sleep(POLL_INTERVAL)
 
             await asyncio.sleep(POLL_INTERVAL)

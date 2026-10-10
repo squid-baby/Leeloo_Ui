@@ -1,0 +1,4 @@
+# Test dependencies (run on a laptop or CI, not needed on the Pi)
+# Install with: pip install -r requirements-dev.txt
+pytest>=8.0
+pytest-asyncio>=0.23

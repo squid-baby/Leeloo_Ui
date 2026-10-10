@@ -15,20 +15,35 @@ Steps:
   5. Spotify  — optional OAuth teaser (connect now or skip)
   6. Done    — triggers WiFi switch, user can close page
 
+setup_complete is only written once nmcli confirms wlan0 joined the home
+WiFi. On a wrong password the AP comes back, the LCD says what to do, and
+the portal accepts new WiFi details (everything else is kept).
+
+Recovery mode (recovery=True): WiFi-only re-entry for an already set-up
+device whose saved WiFi stopped working (see leeloo_boot.py).
+
+The web server binds to the AP address and is shut down once setup succeeds,
+so nothing on the home LAN can reach these endpoints afterwards.
+
 Terminal aesthetic using LEELOO device color palette.
 """
 
 import os
 import json
 import sys
-import subprocess
+import html
+import socket
+import threading
+import time
 from flask import Flask, request, jsonify, redirect
+from werkzeug.serving import make_server
 
 from wifi_manager import (
-    start_ap_mode, stop_ap_mode, scan_wifi_networks,
-    get_device_id
+    start_ap_mode, scan_wifi_networks, release_wlan0_for_ap, AP_IP
 )
+from connect_saved_wifi import switch_to_wifi, stop_ap_mode as restore_client_mode
 from leeloo_device_id import get_device_crew_code
+from leeloo_fileutil import atomic_write_json
 
 app = Flask(__name__)
 
@@ -37,15 +52,53 @@ LEELOO_HOME = os.environ.get("LEELOO_HOME", "/home/pi/leeloo-ui")
 DEVICE_CONFIG_PATH = os.path.join(LEELOO_HOME, "device_config.json")
 CREW_CONFIG_PATH = os.path.join(LEELOO_HOME, "crew_config.json")
 
-# State
-setup_state = {
-    'step': 'wifi',
-    'ssid': None,
-    'dev_mode': False,
-}
+# Web server
+PORTAL_PORT = 80
+SERVER_BIND_RETRIES = 10       # ~10s for the AP address to appear on wlan0
+
+# Let the phone receive the /api/finish reply before the AP goes down
+FINISH_RESPONSE_GRACE_S = 2
+
+# How often the waiting boot thread checks the portal outcome
+PORTAL_POLL_S = 1.0
+
+# Only these POSTs are allowed in WiFi-only recovery mode
+RECOVERY_ALLOWED_POSTS = ('/api/wifi', '/api/finish')
+
+# State (one portal session; see reset_portal_state)
+setup_state = {}
+_state_lock = threading.Lock()
+_setup_done = threading.Event()   # Set once WiFi is confirmed connected
+_clock = time.monotonic           # Swappable in tests
 
 # Cached network list (scanned before AP mode starts)
 cached_networks = []
+
+
+def reset_portal_state(dev_mode=False, recovery=False):
+    """Start a fresh portal session"""
+    with _state_lock:
+        setup_state.clear()
+        setup_state.update({
+            'step': 'wifi',
+            'ssid': None,
+            'dev_mode': dev_mode,
+            'recovery': recovery,        # WiFi-only re-entry, device already set up
+            'error': None,               # Shown on the WiFi page after a failed attempt
+            'wifi_retry': False,         # An attempt failed: go straight to finish after WiFi
+            'pending_ssid': None,        # Credentials for the next connection attempt
+            'pending_password': None,
+            'connecting': False,         # Background connection attempt running
+            'finished': False,           # WiFi confirmed, setup done
+            'closed': False,             # Recovery window expired, portal closing
+            'fatal': None,               # AP could not be brought back
+            'ap_ssid': None,
+            'last_activity': _clock(),   # Start of the current "waiting for WiFi details" window
+        })
+    _setup_done.clear()
+
+
+reset_portal_state()
 
 # LCD update callback (set by boot sequence)
 lcd_callback = None
@@ -57,8 +110,16 @@ def set_lcd_callback(callback):
 
 
 def update_lcd(screen, **kwargs):
+    """
+    Ask the boot sequence to draw a portal state on the LCD.
+    Screens: ap_mode, recovery, connecting, success, wifi_failed.
+    Never raises: a display problem must not stop the WiFi flow.
+    """
     if lcd_callback:
-        lcd_callback(screen, **kwargs)
+        try:
+            lcd_callback(screen, **kwargs)
+        except Exception as e:
+            print(f"[PORTAL] LCD update error ({screen}): {e}")
 
 
 # ============================================
@@ -86,17 +147,50 @@ def load_device_config():
 
 
 def save_device_config(data):
+    # Atomic: a power cut mid-write must not wipe the config (that would send
+    # the device back to first-run setup). 0600: it holds the WiFi password.
     existing = load_device_config()
     existing.update(data)
-    os.makedirs(os.path.dirname(DEVICE_CONFIG_PATH), exist_ok=True)
-    with open(DEVICE_CONFIG_PATH, 'w') as f:
-        json.dump(existing, f, indent=2)
+    atomic_write_json(DEVICE_CONFIG_PATH, existing, indent=2, mode=0o600)
 
 
 def save_crew_config(data):
-    os.makedirs(os.path.dirname(CREW_CONFIG_PATH), exist_ok=True)
-    with open(CREW_CONFIG_PATH, 'w') as f:
-        json.dump(data, f, indent=2)
+    atomic_write_json(CREW_CONFIG_PATH, data, indent=2)
+
+
+# WPA2 passphrase: 8-63 characters (bytes, as NetworkManager counts them),
+# or the raw key as exactly 64 hex digits
+WIFI_PASSWORD_ERROR = 'wifi password must be 8-63 characters (or 64 hex digits)'
+_HEX_DIGITS = frozenset('0123456789abcdefABCDEF')
+
+
+def validate_wifi_credentials(ssid, password):
+    """
+    Error message for an unusable SSID/password, or None if they're fine.
+    The SSID can come from the scan list or be typed (hidden networks): either
+    way it must be 1-32 bytes of UTF-8. Open networks aren't supported (the
+    connect path always needs a password), so a password is required.
+    """
+    if not isinstance(ssid, str) or not isinstance(password, str):
+        return 'missing ssid or password'
+    if not ssid:
+        return 'pick a network or type its name'
+    if not password:
+        return 'enter the wifi password'
+    if '\x00' in ssid or '\x00' in password:
+        return 'invalid characters in network name or password'
+    try:
+        ssid_bytes = len(ssid.encode('utf-8'))
+        password_bytes = len(password.encode('utf-8'))
+    except UnicodeEncodeError:
+        return 'invalid characters in network name or password'
+    if ssid_bytes > 32:
+        return 'network name is too long (max 32 bytes)'
+    if len(password) == 64 and all(c in _HEX_DIGITS for c in password):
+        return None
+    if not 8 <= password_bytes <= 63:
+        return WIFI_PASSWORD_ERROR
+    return None
 
 
 # ============================================
@@ -455,8 +549,13 @@ def firefox_captive_portal():
 def setup_wifi():
     error_html = ''
     if setup_state.get('error'):
-        error_html = f'<div class="error-msg">{setup_state["error"]}</div>'
-        setup_state['error'] = None
+        # Escaped: the message contains the SSID. Kept until new WiFi details
+        # arrive, because captive-portal browsers often load this page twice.
+        error_html = f'<div class="error-msg">{html.escape(setup_state["error"])}</div>'
+
+    recovery_html = ''
+    if setup_state.get('recovery'):
+        recovery_html = '<div class="note">wifi only: your name, crew and location are kept.</div>'
 
     content = f"""
     <div class="term-box tan">
@@ -465,16 +564,25 @@ def setup_wifi():
         <h1>connect to your home wifi<span class="cursor">\u258a</span></h1>
 
         {error_html}
+        {recovery_html}
 
         <form id="wifiForm">
             <label>NETWORK</label>
-            <select name="ssid" id="ssid" required>
+            <select name="ssid" id="ssid">
                 <option value="">scanning...</option>
             </select>
 
+            <label>OR TYPE A NETWORK NAME</label>
+            <input type="text" name="ssid_other" id="ssidOther"
+                   placeholder="other / hidden network" maxlength="32"
+                   autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+            <div class="hint">a typed name is used instead of the list</div>
+
             <label>PASSWORD</label>
             <input type="password" name="password" id="password"
-                   placeholder="enter wifi password" required>
+                   placeholder="enter wifi password" required
+                   minlength="8" maxlength="64">
+            <div class="hint">8-63 characters</div>
 
             <button type="submit" class="btn" id="wifiBtn">CONNECT</button>
         </form>
@@ -483,31 +591,61 @@ def setup_wifi():
     </div>
 
     <script>
+        // SSIDs come from neighbours' routers: build options as DOM nodes
+        // (value/textContent), never as HTML strings.
+        function addOption(select, value, label) {{
+            const opt = document.createElement('option');
+            opt.value = value;
+            opt.textContent = label;
+            select.appendChild(opt);
+        }}
+
         async function loadNetworks() {{
             try {{
                 const data = await fetchJSON('/api/networks');
                 const select = document.getElementById('ssid');
-                if (data.networks && data.networks.length > 0) {{
-                    select.innerHTML = data.networks.map(n =>
-                        '<option value="' + n + '">' + n + '</option>'
-                    ).join('');
+                const networks = (data && Array.isArray(data.networks)) ? data.networks : [];
+                while (select.firstChild) {{
+                    select.removeChild(select.firstChild);
+                }}
+                if (networks.length > 0) {{
+                    networks.forEach(n => addOption(select, String(n), String(n)));
                 }} else {{
-                    select.innerHTML = '<option value="">no networks found</option>';
+                    addOption(select, '', 'no networks found: type the name below');
                 }}
             }} catch (e) {{
                 console.error('scan failed:', e);
+                const select = document.getElementById('ssid');
+                while (select.firstChild) {{
+                    select.removeChild(select.firstChild);
+                }}
+                addOption(select, '', 'scan failed: type the name below');
             }}
         }}
         loadNetworks();
 
+        // A typed network name (hidden or unlisted network) wins over the list
+        function chosenSsid() {{
+            const typed = document.getElementById('ssidOther').value;
+            if (typed.trim() !== '') {{
+                return typed;
+            }}
+            return document.getElementById('ssid').value;
+        }}
+
         document.getElementById('wifiForm').addEventListener('submit', async (e) => {{
             e.preventDefault();
             const btn = document.getElementById('wifiBtn');
+            const ssid = chosenSsid();
+            if (!ssid) {{
+                alert('pick a network or type its name');
+                return;
+            }}
             btn.disabled = true;
             btn.textContent = 'SAVING...';
 
             const data = {{
-                ssid: document.getElementById('ssid').value,
+                ssid: ssid,
                 password: document.getElementById('password').value
             }};
 
@@ -517,7 +655,7 @@ def setup_wifi():
                     body: JSON.stringify(data)
                 }});
                 if (result.success) {{
-                    window.location.href = '/setup/you';
+                    window.location.href = result.next || '/setup/you';
                 }} else {{
                     btn.disabled = false;
                     btn.textContent = 'CONNECT';
@@ -956,9 +1094,15 @@ def setup_done():
 
         <p style="text-align: center; color: #A7AFD4; font-size: 14px;
                   margin: 16px 0; line-height: 1.5;">
-            your LEELOO is booting up.<br>
+            your LEELOO is joining your wifi now.<br>
             you can close this page.
         </p>
+
+        <div class="note">
+            watch LEELOO's screen. if the wifi password was wrong,
+            it will ask you to join its setup wifi again and
+            re-enter the password.
+        </div>
 
         <div class="step-indicator">[step 6 of 6]</div>
     </div>
@@ -967,6 +1111,10 @@ def setup_done():
         // Trigger WiFi switch
         fetch('/api/finish', { method: 'POST' })
             .then(r => r.json())
+            .then(d => {
+                // Stale page after a failed attempt: re-enter the password first
+                if (d && d.retry) { window.location.href = '/setup/wifi'; }
+            })
             .catch(() => {});
     </script>
     """
@@ -977,13 +1125,47 @@ def setup_done():
 # API ENDPOINTS
 # ============================================
 
+def check_post_allowed(path, setup_complete, state):
+    """
+    Decide whether a state-changing POST to `path` may run.
+    Returns (allowed, http_status, error_message).
+
+    Defence in depth on top of shutting the server down: once the device is
+    set up, nobody (e.g. on the home LAN) may rewrite its config through the
+    portal, except for WiFi re-entry while in recovery mode.
+    """
+    if state.get('finished') or state.get('closed'):
+        return False, 409, 'setup is already finished'
+    if state.get('recovery'):
+        if path not in RECOVERY_ALLOWED_POSTS:
+            return False, 403, 'wifi-only recovery mode'
+    elif setup_complete:
+        return False, 403, 'setup is already complete'
+    if path == '/api/wifi' and state.get('connecting'):
+        return False, 409, 'connecting to wifi, please wait'
+    return True, 200, None
+
+
+@app.before_request
+def guard_state_changing_requests():
+    if request.method != 'POST' or not request.path.startswith('/api/'):
+        return None
+    setup_complete = bool(load_device_config().get('setup_complete', False))
+    allowed, status, error = check_post_allowed(request.path, setup_complete, setup_state)
+    if not allowed:
+        print(f"[PORTAL] Refused POST {request.path}: {error}")
+        return jsonify({'success': False, 'error': error}), status
+    return None
+
+
 @app.route('/api/networks', methods=['GET'])
 def api_networks():
-    # Use cached networks (scanned before AP mode started)
-    # because wlan0 is owned by hostapd and can't scan
+    # Use cached networks (scanned before NetworkManager was stopped for the
+    # AP) because hostapd owns wlan0 now and scans are often refused
     if cached_networks:
         return jsonify({'networks': cached_networks})
-    # Fallback: try scanning anyway (might work in dev mode)
+    # Fallback: try scanning anyway (might work in dev mode). The page also
+    # lets the user type a network name, so an empty list isn't a dead end.
     networks = scan_wifi_networks()
     return jsonify({'networks': networks})
 
@@ -991,23 +1173,45 @@ def api_networks():
 @app.route('/api/wifi', methods=['POST'])
 def api_wifi():
     """Save WiFi credentials (don't connect yet)"""
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     ssid = data.get('ssid')
     password = data.get('password')
 
-    if not ssid or not password:
-        return jsonify({'success': False, 'error': 'missing ssid or password'})
+    error = validate_wifi_credentials(ssid, password)
+    if error:
+        return jsonify({'success': False, 'error': error})
 
-    save_device_config({
-        'wifi_ssid': ssid,
-        'wifi_password': password,
-    })
+    with _state_lock:
+        # Check again under the lock: the before_request guard ran without it,
+        # and a /api/finish may have started a connection attempt since then.
+        # Changing the credentials now would race with that attempt.
+        if setup_state.get('closed') or setup_state.get('finished'):
+            return jsonify({'success': False, 'error': 'setup is already finished'}), 409
+        if setup_state.get('connecting'):
+            return jsonify({'success': False, 'error': 'connecting to wifi, please wait'}), 409
 
-    setup_state['ssid'] = ssid
-    setup_state['step'] = 'you'
+        recovery = setup_state.get('recovery', False)
+        if not recovery:
+            # First run: keep it on disk with the rest of the setup answers.
+            # (In recovery the working config is only replaced once the new
+            # WiFi is confirmed, so the boot retry still uses the old one.)
+            save_device_config({
+                'wifi_ssid': ssid,
+                'wifi_password': password,
+            })
+
+        setup_state['ssid'] = ssid
+        setup_state['pending_ssid'] = ssid
+        setup_state['pending_password'] = password
+        setup_state['error'] = None
+        setup_state['last_activity'] = _clock()  # New details: restart the recovery window
+        # After a failed attempt (or in recovery) everything else is already
+        # saved, so go straight to the finish step
+        skip_ahead = recovery or setup_state.get('wifi_retry', False)
+        setup_state['step'] = 'done' if skip_ahead else 'you'
     print(f"[PORTAL] WiFi credentials saved: {ssid}")
 
-    return jsonify({'success': True})
+    return jsonify({'success': True, 'next': '/setup/done' if skip_ahead else '/setup/you'})
 
 
 @app.route('/api/info', methods=['POST'])
@@ -1096,60 +1300,294 @@ def api_telegram_optin():
 
 @app.route('/api/finish', methods=['POST'])
 def api_finish():
-    """Mark setup complete and trigger WiFi connection"""
-    save_device_config({'setup_complete': True})
+    """Trigger the WiFi connection. setup_complete is written only once it's confirmed."""
+    if setup_state.get('dev_mode'):
+        print("[PORTAL] DEV MODE — skipping WiFi switch")
+        return jsonify({'success': True, 'dev_mode': True})
 
-    setup_state['step'] = 'done'
-    update_lcd('success')
+    config = load_device_config()
 
-    # Trigger WiFi connection in background
+    with _state_lock:
+        if setup_state.get('closed') or setup_state.get('finished'):
+            # Lost a race with the recovery window closing (or a late retry)
+            return jsonify({'success': False, 'error': 'setup is already finished'}), 409
+        if setup_state.get('connecting'):
+            # Page reloaded while an attempt is running: don't start a second one
+            return jsonify({'success': True, 'status': 'connecting'})
+        if setup_state.get('wifi_retry') and not setup_state.get('pending_password'):
+            # The last attempt failed and no new password arrived since (e.g. a
+            # stale /setup/done tab reloaded): don't retry the known-bad one
+            return jsonify({'success': False, 'retry': True,
+                            'error': 'enter the wifi password again'}), 409
+        ssid = setup_state.get('pending_ssid') or config.get('wifi_ssid')
+        password = setup_state.get('pending_password') or config.get('wifi_password')
+        if not ssid or not password:
+            return jsonify({'success': False, 'error': 'wifi not set, go back to step 1'}), 400
+        setup_state['connecting'] = True
+        setup_state['step'] = 'connecting'
+
+    # Connect in the background so this reply reaches the phone before the AP drops
+    worker = threading.Thread(target=_finish_worker, args=(ssid, password),
+                              name='portal-wifi-connect', daemon=True)
+    worker.start()
+    print(f"[PORTAL] WiFi switch triggered: {ssid}")
+    return jsonify({'success': True, 'status': 'connecting'})
+
+
+# ============================================
+# WIFI SWITCH (background worker)
+# ============================================
+
+def record_connection_result(connected, ssid, password, recovery):
+    """
+    Persist the outcome of a WiFi attempt. This is the only place that sets
+    setup_complete=True, and only after nmcli confirmed the connection.
+    """
+    if connected:
+        save_device_config({
+            'wifi_ssid': ssid,
+            'wifi_password': password,
+            'setup_complete': True,
+        })
+    elif not recovery:
+        # First run: make sure a failed attempt never leaves the device
+        # looking set up (it would skip the portal after a reboot)
+        save_device_config({'setup_complete': False})
+    # Recovery + failure: leave the saved config alone; boot keeps retrying it
+
+
+def _finish_worker(ssid, password):
+    """Leave AP mode, join the home WiFi, and handle success or failure"""
+    recovery = setup_state.get('recovery', False)
+    connected = False
     try:
-        connect_script = os.path.join(LEELOO_HOME, 'connect_saved_wifi.py')
-        if os.path.exists(connect_script):
-            subprocess.Popen(
-                ['sudo', 'python3', connect_script],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        print("[PORTAL] Setup complete, WiFi switch triggered")
-        return jsonify({'success': True})
+        time.sleep(FINISH_RESPONSE_GRACE_S)
+        update_lcd('connecting', ssid=ssid)
+        connected = bool(switch_to_wifi(ssid, password))
     except Exception as e:
         print(f"[PORTAL] WiFi switch error: {e}")
-        return jsonify({'success': True, 'wifi_note': 'manual reboot may be needed'})
+
+    try:
+        record_connection_result(connected, ssid, password, recovery)
+    except Exception as e:
+        print(f"[PORTAL] Could not save setup result: {e}")
+        connected = False
+
+    if connected:
+        _on_wifi_connected(ssid)
+    else:
+        _on_wifi_failed(ssid)
+
+
+def _on_wifi_connected(ssid):
+    with _state_lock:
+        setup_state['finished'] = True
+        setup_state['connecting'] = False
+        setup_state['step'] = 'done'
+        setup_state['pending_password'] = None
+    print(f"[PORTAL] Connected to {ssid}, setup complete")
+    update_lcd('success', ssid=ssid)
+    _setup_done.set()
+
+
+def _on_wifi_failed(ssid):
+    """Bring the setup AP back so the user can re-enter the password"""
+    global cached_networks
+    print(f"[PORTAL] Could not connect to {ssid}, bringing setup WiFi back")
+    with _state_lock:
+        setup_state['error'] = f"could not connect to {ssid}. check the password and try again."
+        setup_state['wifi_retry'] = True
+        setup_state['pending_password'] = None  # Known bad: /api/finish waits for a new one
+
+    try:
+        # NetworkManager is up right now: refresh the network list first
+        networks = scan_wifi_networks()
+        if networks:
+            cached_networks = networks
+        release_wlan0_for_ap()
+        ap_ssid = start_ap_mode()
+    except Exception as e:
+        print(f"[PORTAL] Could not restart setup WiFi: {e}")
+        with _state_lock:
+            setup_state['fatal'] = f"setup wifi restart failed: {e}"
+            setup_state['connecting'] = False
+        return
+
+    with _state_lock:
+        setup_state['ap_ssid'] = ap_ssid
+        setup_state['step'] = 'wifi'
+        setup_state['connecting'] = False
+        setup_state['last_activity'] = _clock()  # Fresh window to rejoin and retype
+    update_lcd('wifi_failed', ssid=ssid, ap_ssid=ap_ssid)
 
 
 # ============================================
 # MAIN
 # ============================================
 
-def run_captive_portal(lcd_update_callback=None, dev_mode=False):
+def probe_bind(host, port):
+    """
+    Raise OSError if host:port can't be bound right now (PermissionError for
+    port 80 without root). Same SO_REUSEADDR setting as werkzeug's server.
+    """
+    family = socket.AF_INET6 if ':' in host else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+    finally:
+        sock.close()
+
+
+def _build_server(factory, host, port):
+    """Call the server factory, turning werkzeug's sys.exit() on bind errors into OSError"""
+    try:
+        return factory(host, port, app, threaded=True)
+    except SystemExit as e:
+        # werkzeug >= 2.3 prints the bind error and calls sys.exit(1) instead
+        # of raising, which would skip our retry/fallback and kill the boot
+        raise OSError(f"web server could not bind {host}:{port} (exit {e.code})") from None
+
+
+def create_portal_server(port, host=AP_IP, retries=SERVER_BIND_RETRIES, delay_s=1.0,
+                         server_factory=None, sleep=time.sleep, bind_probe=None):
+    """
+    Create the portal web server bound to the AP address only, so it is not
+    reachable from the home LAN. The AP address can take a moment to appear
+    on wlan0, so retry briefly, then fall back to 0.0.0.0 (the server is
+    still shut down once setup completes). PermissionError (port 80 without
+    root) is raised for the caller to handle.
+
+    Each attempt probes the bind with a plain socket first: werkzeug >= 2.3
+    exits the process on a bind error instead of raising, so the probe is
+    what lets us see the real OSError and keep retrying.
+    """
+    factory = server_factory or make_server
+    probe = bind_probe or probe_bind
+    for attempt in range(1, retries + 1):
+        try:
+            probe(host, port)
+            server = _build_server(factory, host, port)
+            print(f"[PORTAL] Web server on {host}:{port}")
+            return server
+        except PermissionError:
+            raise
+        except OSError as e:
+            print(f"[PORTAL] Can't bind {host}:{port} yet ({e}), retry {attempt}/{retries}")
+            sleep(delay_s)
+    print(f"[PORTAL] Falling back to 0.0.0.0:{port} (still closed after setup)")
+    probe('0.0.0.0', port)
+    server = _build_server(factory, '0.0.0.0', port)
+    print(f"[PORTAL] Web server on 0.0.0.0:{port}")
+    return server
+
+
+def start_portal_server(port=PORTAL_PORT, host=AP_IP):
+    """Start serving in a background thread; returns the server (call stop_portal_server)"""
+    try:
+        server = create_portal_server(port, host)
+    except PermissionError:
+        print("[PORTAL] Port 80 requires root, falling back to 8080")
+        server = create_portal_server(8080, host)
+    thread = threading.Thread(target=server.serve_forever, name='captive-portal', daemon=True)
+    thread.start()
+    return server
+
+
+def stop_portal_server(server):
+    try:
+        server.shutdown()
+        server.server_close()
+        print("[PORTAL] Web server stopped")
+    except Exception as e:
+        print(f"[PORTAL] Web server stop error: {e}")
+
+
+def portal_window_expired(now, last_activity, idle_timeout_s, connecting):
+    """True when a recovery portal has waited long enough for new WiFi details"""
+    if idle_timeout_s is None or connecting:
+        return False
+    return now - last_activity >= idle_timeout_s
+
+
+def wait_for_portal_outcome(idle_timeout_s=None, poll_s=None):
+    """
+    Block until WiFi is confirmed (returns True) or, when idle_timeout_s is
+    set, until no new WiFi details arrived for that long (returns False).
+    """
+    if poll_s is None:
+        poll_s = PORTAL_POLL_S
+    while True:
+        if _setup_done.wait(timeout=poll_s):
+            return True
+        with _state_lock:
+            if setup_state.get('fatal'):
+                raise RuntimeError(setup_state['fatal'])
+            if portal_window_expired(_clock(), setup_state['last_activity'],
+                                     idle_timeout_s, setup_state['connecting']):
+                setup_state['closed'] = True  # Refuse late POSTs while we shut down
+                return False
+
+
+def run_captive_portal(lcd_update_callback=None, dev_mode=False, recovery=False,
+                       idle_timeout_s=None):
     """
     Run the captive portal setup flow.
-    Blocks until setup is complete.
+    Blocks until WiFi is confirmed connected and returns True; the web server
+    is shut down and the AP is already gone at that point.
+
+    recovery=True: WiFi-only mode for a device that is already set up.
+    idle_timeout_s: if no new WiFi details arrive for this long, stop the
+    server and the AP, restore NetworkManager, and return False so the
+    caller can retry the saved WiFi.
     """
     global lcd_callback, cached_networks
     lcd_callback = lcd_update_callback
-    setup_state['dev_mode'] = dev_mode
+    reset_portal_state(dev_mode=dev_mode, recovery=recovery)
 
     if dev_mode:
         print("[PORTAL] DEV MODE — http://localhost:8080")
-        app.run(host='0.0.0.0', port=8080, debug=False, threaded=True)
-    else:
-        # Pre-scan WiFi networks BEFORE starting AP mode
-        # (once hostapd owns wlan0, we can't scan anymore)
-        print("[PORTAL] Pre-scanning WiFi networks...")
-        cached_networks = scan_wifi_networks()
-        print(f"[PORTAL] Found {len(cached_networks)} networks: {cached_networks}")
-
-        print("[PORTAL] PRODUCTION MODE — starting AP...")
-        ssid = start_ap_mode()
-        update_lcd('ap_mode', ssid=ssid)
+        server = create_portal_server(8080, host='0.0.0.0', retries=1)
         try:
-            app.run(host='0.0.0.0', port=80, debug=False, threaded=True)
-        except PermissionError:
-            print("[PORTAL] Port 80 requires root, falling back to 8080")
-            app.run(host='0.0.0.0', port=8080, debug=False, threaded=True)
+            server.serve_forever()
+        finally:
+            server.server_close()
+        return False
+
+    # Pre-scan WiFi networks while NetworkManager still runs, BEFORE wlan0 is
+    # released for the AP (once NM is stopped and hostapd owns wlan0, scans
+    # come back empty or are refused)
+    print("[PORTAL] Pre-scanning WiFi networks...")
+    cached_networks = scan_wifi_networks()
+    print(f"[PORTAL] Found {len(cached_networks)} networks: {cached_networks}")
+
+    # Now stop NetworkManager so hostapd can have wlan0
+    release_wlan0_for_ap()
+
+    print(f"[PORTAL] PRODUCTION MODE{' (WiFi recovery)' if recovery else ''} — starting AP...")
+    ssid = start_ap_mode()
+    with _state_lock:
+        setup_state['ap_ssid'] = ssid
+        setup_state['last_activity'] = _clock()
+    if recovery:
+        minutes = int(round(idle_timeout_s / 60)) if idle_timeout_s else None
+        update_lcd('recovery', ap_ssid=ssid,
+                   ssid=load_device_config().get('wifi_ssid'), minutes=minutes)
+    else:
+        update_lcd('ap_mode', ap_ssid=ssid)
+
+    server = start_portal_server()
+    try:
+        completed = wait_for_portal_outcome(idle_timeout_s)
+    finally:
+        stop_portal_server(server)
+
+    if completed:
+        print("[PORTAL] Setup complete, portal closed")
+    else:
+        print("[PORTAL] No new WiFi details in time, closing setup WiFi")
+        restore_client_mode()
+    return completed
 
 
 if __name__ == "__main__":

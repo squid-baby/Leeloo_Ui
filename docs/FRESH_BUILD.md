@@ -100,8 +100,10 @@ sudo bash boot/leeloo_setup.sh
 ```
 
 **What it does:**
-1. Installs apt packages: `hostapd`, `dnsmasq`, `libopenblas0`, `libjpeg-dev`, `i2c-tools`, etc.
-2. Installs pip packages from `requirements.txt` (system-wide, no venv)
+1. Installs apt packages: `hostapd`, `dnsmasq`, `python3-flask` (captive portal), `libopenblas0`, `libjpeg-dev`, `i2c-tools`, etc.
+2. Installs pip packages from `requirements.txt` (system-wide, no venv; adds
+   `--break-system-packages` only when the installed pip supports it, so it
+   works on both Bookworm and Bullseye)
 3. Copies `boot/waveshare35a.dtbo` → `/boot/firmware/overlays/` (verified working version — **do not replace from LCD-show repo**)
 4. Patches `/boot/firmware/config.txt` with all required settings
 5. Patches `/boot/firmware/cmdline.txt` for clean headless boot
@@ -163,18 +165,49 @@ Once the device is shipped, the end user:
 3. **Connects phone to WiFi:** `LEELOO-SETUP` (no password)
 4. **Captive portal auto-opens** (or browse to `http://192.168.4.1`)
 5. Fills out the setup form:
-   - WiFi network + password (their home WiFi)
+   - WiFi network + password (their home WiFi). The network list is scanned
+     before the setup WiFi starts; a hidden or unlisted network can be typed
+     in the "or type a network name" field (a typed name wins over the list).
+     The password must be 8-63 characters (or a 64-digit hex key); the portal
+     says so if it isn't. Open networks (no password) aren't supported.
    - Name
    - ZIP code (for weather)
    - Telegram opt-in (optional)
    - Crew code (to join an existing crew) or creates a new one
-6. Device reboots, connects to their WiFi
+6. Device leaves setup mode and joins their WiFi (no reboot). Setup is only
+   marked complete (`"setup_complete": true`) once `nmcli` confirms `wlan0`
+   is connected to that network.
+   - **Wrong password:** the setup WiFi (`LEE-XXXX`) comes back and the LCD
+     says *"wifi failed — join LEE-XXXX again and re-enter the password"*.
+     Re-joining opens the WiFi page with an error; after re-entering the
+     password the portal skips straight to the finish step (name, ZIP and
+     crew are kept).
 7. Welcome screen shows:
    - **Phase 1 (60s):** Telegram QR code to connect `@Leeloo2259_bot`
    - **Phase 2 (60s):** Spotify OAuth QR if not already connected
 8. Device is fully operational
 
 > **Spotify auto-connect:** If the user's Spotify was previously linked (via another device on the same crew), tokens are auto-delivered by the relay server when the device joins the crew. Phase 2 is skipped.
+
+### WiFi Recovery (router changed or down)
+
+On every boot after setup, `leeloo_boot.py` waits up to ~3 minutes for the
+saved WiFi (NetworkManager autoconnect first, then an explicit connect). If it
+still isn't connected, the device starts the captive portal in **WiFi-only
+recovery mode**:
+
+- The LCD says it can't reach the saved network and to join `LEE-XXXX` to
+  enter a new password. Only the WiFi page works; user, crew and location
+  settings are kept.
+- If no new WiFi details arrive within ~10 minutes, the AP is stopped and the
+  saved WiFi is retried (LCD: *"retrying wifi"*). This repeats until one of
+  them works, so a temporary router outage doesn't strand the device.
+
+The portal web server only listens on the AP address (`192.168.4.1`; if that
+address isn't up after ~10s of retries it falls back to all interfaces) and is
+shut down as soon as setup succeeds; once `setup_complete` is true, its
+config-changing endpoints refuse requests (except WiFi re-entry in recovery
+mode).
 
 ---
 
@@ -301,7 +334,7 @@ sudo python3 -c "import board; import neopixel; p = neopixel.NeoPixel(board.D12,
 **Most common causes:**
 1. DIN wire on wrong pin — must be **Pin 32** (GPIO 12), not Pin 11 (GPIO 17)
 2. `dtparam=audio=off` missing from config.txt — audio and WS2812B share PWM0 DMA
-3. `adafruit-circuitpython-neopixel` not installed — run `sudo pip3 install adafruit-circuitpython-neopixel --break-system-packages`
+3. `adafruit-circuitpython-neopixel` not installed — run `sudo pip3 install adafruit-circuitpython-neopixel --break-system-packages` (leave out `--break-system-packages` on Bullseye, whose pip rejects it)
 4. Running without sudo — service must run as `User=root`
 
 ### Tap sensor not detecting
@@ -343,6 +376,14 @@ Add to service file (setup script handles this automatically):
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 -u /home/pi/leeloo-ui/leeloo_boot.py
 ```
+
+### Service keeps restarting
+
+`leeloo_boot.py` exits with code 1 on fatal errors and when the brain crashes,
+and `leeloo.service` uses `Restart=on-failure` (with `StartLimitIntervalSec=0`,
+so systemd never gives up). Check the cause with
+`sudo journalctl -u leeloo.service -n 100 --no-pager`. `systemctl stop`
+does not trigger a restart.
 
 ### `No module named 'neopixel'` in logs
 

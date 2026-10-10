@@ -18,6 +18,8 @@ import os
 import time
 from typing import Dict, List, Optional, Any
 
+from leeloo_fileutil import atomic_write_json
+
 
 # Default path on Pi
 MESSAGES_FILE = os.environ.get(
@@ -50,8 +52,9 @@ class MessageManager:
     def _save(self):
         """Save messages to JSON file"""
         try:
-            with open(self.storage_path, 'w') as f:
-                json.dump(self._messages, f, indent=2)
+            # durable=False: runs on the event loop (every incoming message); fsync
+            # on the SD card could block it for 100+ ms
+            atomic_write_json(self.storage_path, self._messages, indent=2, durable=False)
         except Exception as e:
             print(f"[MSG] Error saving messages: {e}")
 

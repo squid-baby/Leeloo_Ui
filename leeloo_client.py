@@ -11,6 +11,8 @@ import os
 from typing import Optional, Callable
 from dataclasses import dataclass
 
+from leeloo_fileutil import atomic_write_json
+
 try:
     import websockets
 except ImportError:
@@ -85,14 +87,13 @@ class LeelooClient:
     def _save_config(self):
         """Save configuration"""
         try:
-            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
-            with open(self.config_path, 'w') as f:
-                json.dump({
-                    'device_id': self.config.device_id,
-                    'crew_id': self.config.crew_id,
-                    'crew_code': self.config.crew_code,
-                    'display_name': self.config.display_name
-                }, f)
+            # Power-safe: a torn crew_config.json would drop the device out of its crew
+            atomic_write_json(self.config_path, {
+                'device_id': self.config.device_id,
+                'crew_id': self.config.crew_id,
+                'crew_code': self.config.crew_code,
+                'display_name': self.config.display_name
+            })
             print(f"[CLIENT] Saved config")
         except Exception as e:
             print(f"[CLIENT] Could not save config: {e}")
@@ -295,7 +296,12 @@ class LeelooClient:
         return True
 
     async def listen(self):
-        """Listen for incoming messages"""
+        """Listen for incoming messages.
+
+        Each frame is handled on its own: a malformed frame (non-JSON text,
+        null payload, ...) or an exception raised by a UI callback is logged
+        and skipped, so one bad frame never drops the connection. Only a
+        closed socket (or task cancellation) ends the loop."""
         if not self.websocket:
             return
 
@@ -303,8 +309,20 @@ class LeelooClient:
 
         try:
             async for message in self.websocket:
-                data = json.loads(message)
-                await self._handle_message(data)
+                try:
+                    data = json.loads(message)
+                except (ValueError, TypeError, RecursionError) as e:
+                    print(f"[CLIENT] Ignoring malformed frame (not JSON): {e}")
+                    continue
+                if not isinstance(data, dict):
+                    print(f"[CLIENT] Ignoring malformed frame (not an object): {type(data).__name__}")
+                    continue
+                try:
+                    await self._handle_message(data)
+                except websockets.exceptions.ConnectionClosed:
+                    raise
+                except Exception as e:
+                    print(f"[CLIENT] Error handling '{data.get('type')}' frame: {e}")
 
         except websockets.exceptions.ConnectionClosed:
             print("[CLIENT] Connection closed")
@@ -316,32 +334,48 @@ class LeelooClient:
             print(f"[CLIENT] Error: {e}")
             self.connected = False
 
-        self.running = False
+        finally:
+            self.running = False
+
+    @staticmethod
+    def _clean_str(value, default: str = "") -> str:
+        """Relay data is untrusted: return value if it is a non-blank string,
+        else default (None, numbers, lists, ... are replaced)."""
+        if isinstance(value, str) and value.strip():
+            return value
+        return default
 
     async def _handle_message(self, data: dict):
         """Handle incoming message from relay"""
         msg_type = data.get('type')
 
         if msg_type == 'message':
-            payload = data.get('payload', {})
+            payload = data.get('payload')
+            if not isinstance(payload, dict):
+                payload = {}
             inner_type = data.get('msg_type', 'text')
-            from_name = data.get('from_name', 'Someone')
+            from_name = self._clean_str(data.get('from_name'), 'Someone')
 
             if inner_type == 'text':
-                print(f"[MSG] {from_name}: {payload.get('text', '')}")
+                text = self._clean_str(payload.get('text'))
+                print(f"[MSG] {from_name}: {text}")
                 if self.on_message:
-                    self.on_message(from_name, payload.get('text', ''))
+                    self.on_message(from_name, text)
 
             elif inner_type == 'reaction':
-                reaction = payload.get('reaction', 'love')
+                reaction = self._clean_str(payload.get('reaction'), 'love')
                 print(f"[REACTION] {from_name} sent {reaction}!")
                 if self.on_reaction:
                     self.on_reaction(from_name, reaction)
 
             elif inner_type == 'song_push':
-                print(f"[SONG] {from_name} pushed: {payload.get('artist')} - {payload.get('track')}")
+                # Hand the UI a copy whose known fields are always strings
+                song = dict(payload)
+                for key in ('artist', 'track', 'album', 'spotify_uri', 'album_art_url', 'note'):
+                    song[key] = self._clean_str(payload.get(key))
+                print(f"[SONG] {from_name} pushed: {song['artist']} - {song['track']}")
                 if self.on_song_push:
-                    self.on_song_push(from_name, payload)
+                    self.on_song_push(from_name, song)
 
             elif inner_type == 'nudge':
                 print(f"[NUDGE] {from_name} sent a nudge!")
@@ -349,9 +383,11 @@ class LeelooClient:
                     self.on_nudge(from_name)
 
             elif inner_type == 'hang_propose':
-                print(f"[HANG] {from_name} proposed: {payload.get('datetime')}")
+                datetime_str = self._clean_str(payload.get('datetime'))
+                description = self._clean_str(payload.get('description'))
+                print(f"[HANG] {from_name} proposed: {datetime_str}")
                 if self.on_hang_propose:
-                    self.on_hang_propose(from_name, payload.get('datetime', ''), payload.get('description', ''))
+                    self.on_hang_propose(from_name, datetime_str, description)
 
             elif inner_type == 'hang_confirm':
                 print(f"[HANG] {from_name} confirmed!")
@@ -359,30 +395,31 @@ class LeelooClient:
                     self.on_hang_confirm(from_name)
 
         elif msg_type == 'member_joined':
-            name = data.get('display_name', 'Someone')
+            name = self._clean_str(data.get('display_name'), 'Someone')
             print(f"[CREW] {name} joined!")
             if self.on_member_joined:
                 self.on_member_joined(name)
 
         elif msg_type == 'member_offline':
-            name = data.get('display_name', 'Someone')
+            name = self._clean_str(data.get('display_name'), 'Someone')
             print(f"[CREW] {name} went offline")
             if self.on_member_offline:
                 self.on_member_offline(name)
 
         elif msg_type == 'spotify_auth_complete':
             # Spotify OAuth tokens received from relay server
-            tokens = data.get('tokens', {})
+            tokens = data.get('tokens')
+            if not isinstance(tokens, dict):
+                tokens = {}
             print(f"[CLIENT] Spotify auth complete! access_token={'yes' if tokens.get('access_token') else 'no'}")
             if tokens.get('access_token'):
-                # Save tokens to disk
+                # Save tokens to disk (atomic, owner-only: they are secrets)
                 tokens_path = os.path.join(
                     os.environ.get("LEELOO_HOME", "/home/pi/leeloo-ui"),
                     "spotify_tokens.json"
                 )
                 try:
-                    with open(tokens_path, 'w') as f:
-                        json.dump(tokens, f, indent=2)
+                    atomic_write_json(tokens_path, tokens, indent=2, mode=0o600)
                     print(f"[CLIENT] Spotify tokens saved to {tokens_path}")
                 except Exception as e:
                     print(f"[CLIENT] Error saving Spotify tokens: {e}")
@@ -405,10 +442,13 @@ class LeelooClient:
     async def disconnect(self):
         """Disconnect from relay"""
         self.running = False
-        if self.websocket:
-            await self.websocket.close()
-            self.websocket = None
+        ws, self.websocket = self.websocket, None
         self.connected = False
+        if ws:
+            try:
+                await ws.close()
+            except Exception as e:
+                print(f"[CLIENT] Error closing socket: {e}")
         print("[CLIENT] Disconnected")
 
     def is_configured(self) -> bool:

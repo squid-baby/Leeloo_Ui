@@ -136,19 +136,31 @@ def write_region_to_framebuffer_rowbyrow(
     This is the KEY FIX - matches the working GIF approach.
     Slower than memmap, but no tearing!
     """
+    with open(fb_path, 'r+b') as fb:
+        write_region_rows(fb, rgb565_array, x, y, screen_width)
+
+
+def write_region_rows(
+    fb,
+    rgb565_array: np.ndarray,
+    x: int,
+    y: int,
+    screen_width: int = SCREEN_WIDTH
+):
+    """Row-by-row write of an RGB565 array into an already-open framebuffer
+    file (lets an animation open /dev/fb1 once instead of once per frame)."""
     height, width = rgb565_array.shape
 
-    with open(fb_path, 'r+b') as fb:
-        for row in range(height):
-            # Calculate byte offset for this row
-            offset = ((y + row) * screen_width + x) * 2
+    for row in range(height):
+        # Calculate byte offset for this row
+        offset = ((y + row) * screen_width + x) * 2
 
-            # Get row data as bytes
-            row_data = rgb565_array[row, :].tobytes()
+        # Get row data as bytes
+        row_data = rgb565_array[row, :].tobytes()
 
-            # Seek and write
-            fb.seek(offset)
-            fb.write(row_data)
+        # Seek and write
+        fb.seek(offset)
+        fb.write(row_data)
 
 
 class FrameAnimator:
@@ -404,30 +416,44 @@ class FrameAnimator:
         region = (7, 10, self.box_right - 7, 296)
         region_x, region_y, region_width, region_height = region
 
-        # Pre-process all frames (CPU-bound, runs synchronously)
-        processed_frames = self._preprocess_frames(start_geom, end_geom, region, content_drawer)
+        # Pre-process all frames in a worker thread — 36 PIL frames + numpy
+        # conversion takes hundreds of ms on a Pi Zero and would otherwise
+        # block the event loop (taps, WebSocket, arecord reads).
+        loop = asyncio.get_running_loop()
+        processed_frames = await loop.run_in_executor(
+            None, self._preprocess_frames, start_geom, end_geom, region, content_drawer
+        )
 
-        # Play animation with async sleep between frames
-        frame_time = 1.0 / self.FPS
-        start_time = time.time()
+        # Open the framebuffer once for the whole animation (not once per frame)
+        fb = None
+        if not self.preview_mode:
+            try:
+                fb = open(self.fb_path, 'r+b')
+            except OSError as e:
+                print(f"[ANIM] Cannot open framebuffer {self.fb_path}: {e}")
 
-        for frame_idx in range(self.FRAME_COUNT):
-            frame_array = processed_frames[frame_idx]
+        try:
+            # Play animation with async sleep between frames
+            frame_time = 1.0 / self.FPS
+            start_time = time.time()
 
-            if not self.preview_mode:
-                write_region_to_framebuffer_rowbyrow(
-                    frame_array,
-                    region_x,
-                    region_y,
-                    self.fb_path
-                )
+            for frame_idx in range(self.FRAME_COUNT):
+                frame_array = processed_frames[frame_idx]
 
-            # Maintain timing with async sleep (yields to event loop!)
-            elapsed = time.time() - start_time
-            next_frame_time = (frame_idx + 1) * frame_time
-            sleep_time = next_frame_time - elapsed
-            if sleep_time > 0:
-                await asyncio.sleep(sleep_time)
+                if fb is not None:
+                    write_region_rows(fb, frame_array, region_x, region_y)
+
+                # Maintain timing with async sleep (yields to event loop!)
+                elapsed = time.time() - start_time
+                next_frame_time = (frame_idx + 1) * frame_time
+                sleep_time = next_frame_time - elapsed
+                if sleep_time > 0:
+                    await asyncio.sleep(sleep_time)
+                else:
+                    await asyncio.sleep(0)  # always yield (CLAUDE.md gotcha 13)
+        finally:
+            if fb is not None:
+                fb.close()
 
         if on_complete:
             on_complete()

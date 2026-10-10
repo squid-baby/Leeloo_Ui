@@ -106,19 +106,15 @@ state = str(uuid.uuid4())
 
 **Solution:** Show QR codes for out-of-band auth, not direct links
 
-### 9. **Anthropic Model Names Must Be Explicit Versions**
-**Problem:** 404 errors on Pi when using `-latest` suffix
-
-**Why:** Older SDK versions don't support `-latest` alias
+### 9. **Anthropic Model Names: One Constant, Watch Retirements**
+**Problem (2026-04):** Every voice command showed "something went wrong". `claude-3-haiku-20240307` was retired on 2026-04-20 and every call returned 404. The error was caught by a generic `except`, so nothing looked broken in the logs.
 
 **Solution:**
-```python
-# ✅ Explicit version
-model="claude-3-haiku-20240307"
-
-# ❌ Breaks on Pi
-model="claude-3-5-haiku-latest"
-```
+- One constant: `HAIKU_MODEL` in `leeloo_intent.py` (now `claude-haiku-5-5`). All three Claude calls import it.
+- `anthropic.NotFoundError` is caught separately and prints a loud "model NOT FOUND" banner.
+- Haiku 5.5 thinks by default: send `thinking={"type": "disabled"}` for short calls (lower latency). It rejects `temperature`, `budget_tokens` and assistant prefill with HTTP 400.
+- Read the first `type == "text"` block, never `content[0].text`.
+- Check the deprecations page when a model is more than a year old: https://platform.claude.com/docs/en/about-claude/model-deprecations
 
 ### 10. **Pin Numbering: Physical vs BCM GPIO**
 **Problem:** LEDs wired to Pin 11 (GPIO 17), code expects GPIO 12
@@ -317,3 +313,36 @@ img.save('LeeLoo_boot.png')  # 5.8KB vs 481KB!
 **Session Count:** Consolidated from 6+ debugging sessions
 **Last Updated:** February 15, 2026
 **Most Critical:** Items 1, 2, 3, 4 above (will save hours of debugging)
+
+## 2026-10 Full Review: Fixes and Lessons
+
+Tags: `#concurrency` `#security` `#wifi-setup`
+
+### Self-cancelling expansion task
+`self._expand_task = create_task(expand_frame(...))` and then, inside `expand_frame`, `self._expand_task.cancel()` cancels **the new task itself**, never the old one. Two messages within 20s drew on top of each other. Fix: `_start_expansion()` cancels all live expansions synchronously and runs the new one under an `asyncio.Lock`.
+
+### `ensure_future` from an executor thread
+`asyncio.ensure_future()` in a `run_in_executor` thread raises "There is no current event loop in thread". The display tick runs in a thread, so the ambient LED never changed between idle and playing. Fix: store `self._loop` in `run()` and use `asyncio.run_coroutine_threadsafe()`.
+
+### Tap timing made double tap impossible
+After a tap the loop was blind for ~0.74s (settle + drain) but the double-tap window was 0.5s. Always check: blind time + debounce < double-tap window. A fake accelerometer + fake clock test now proves double and triple taps resolve.
+
+### A new tap cancelled the voice session
+The tap callback ran inside the tap resolver task, and every new raw tap cancels that task. A tap during recording raised `CancelledError` and left `ui_state` stuck in LISTENING. Fix: run the callback in its own task; reset state in `finally`.
+
+### Incoming events broke recording (DMA, gotcha #11)
+Messages, nudges and song pushes started LED animations during `arecord`. Fix: `led.recording_started()` / `recording_finished()` guard.
+
+### Root shell injection in WiFi setup
+`subprocess.run(f"nmcli ... '{password}'", shell=True)` as root, with the password from an open WiFi portal. A password like `x'; cmd; '` ran commands as root, and a normal SSID with an apostrophe failed. Fix: argv lists only.
+
+### Wrong WiFi password bricked the device
+`setup_complete=True` was written before the connection was checked; after reboot the AP never came back. Fix: write it only after nmcli confirms the connection; recovery portal at boot if WiFi fails.
+
+### Secrets in a public repo
+The Spotify client secret was hardcoded and the repo is public. Fix: `.env` only. **Rotating the secret is still required** — removing it from the code does not remove it from git history.
+
+### Verification approach that worked
+- Every fix has a test that **fails on the old code** and passes after (check by reverting only the source file).
+- Run the suite on Python 3.9, 3.11 and 3.13 (`uv python install 3.9 3.11`), the versions across Pi OS releases.
+- Adversarial reviewers after each fix round found 13 more real issues after the first round passed its own tests.

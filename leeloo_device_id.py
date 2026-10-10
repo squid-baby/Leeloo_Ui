@@ -11,13 +11,14 @@ the same code.
 
 import hashlib
 import os
+from typing import Optional
 
 
 # 31 chars — no I, O, 0, 1 to avoid ambiguity
 ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
-def get_pi_serial() -> str | None:
+def get_pi_serial() -> Optional[str]:
     """Read unique Pi CPU serial from /proc/cpuinfo"""
     try:
         with open('/proc/cpuinfo') as f:
