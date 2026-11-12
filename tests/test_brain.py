@@ -981,7 +981,7 @@ def test_ack_in_flight_does_not_write_after_listening_starts():
     async def go():
         led = LEDManager()
         writes = []
-        led._set_color = lambda c: writes.append(c)
+        led._set_color = lambda c, force=False: writes.append(c)
         ack = asyncio.ensure_future(led.ack())
         await asyncio.sleep(0.02)
         await led.listening()

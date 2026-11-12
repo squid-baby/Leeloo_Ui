@@ -252,6 +252,11 @@ WS2812B (GPIO 12 PWM DMA) and INMP441 (I2S DMA) share the Pi Zero DMA controller
 await self.led._cancel_ambient()
 # ❌ Never run a continuous LED loop while arecord is active
 ```
+`LEDManager` enforces this: `led.listening()` sets `led.recording = True`, and
+`_set_color()` (the only function that writes to the LEDs) refuses every write
+until `off()` / `error()` / `start_processing()`. Start the "thinking" animation
+with `led.start_processing()`, never with `create_task(led.processing())`.
+`tests/test_led.py` checks this with 1,200 random call sequences.
 
 ### 12. **`current_music.json` `is_playing` is Stale**
 The JSON cache reflects playback state at write time — never trust it as live. Only treat `is_playing=True` as real if `spotify_tokens.json` exists (live OAuth connection).

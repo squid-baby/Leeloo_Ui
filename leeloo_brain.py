@@ -1407,8 +1407,7 @@ class LeelooBrain:
 
             self.ui_state = UIState.PROCESSING
             self._wake_display()
-            self._spawn(self.led.processing())
-            await asyncio.sleep(0)   # let the animation start, so led.off() can stop it
+            self.led.start_processing()   # stopped by led.off() / led.error()
 
             # Give Claude fresh music context if the data is old, but a person
             # is waiting: allow Spotify half a second at most.
