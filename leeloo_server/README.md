@@ -37,6 +37,24 @@ SPOTIFY_REDIRECT_URI=https://leeloobot.xyz/spotify/callback
 
 **⚠️ SECURITY: Never commit `.env` to Git!**
 
+## State, offline messages and tests
+
+- **State file**: crews (with the device roster and Telegram members), offline
+  message queues and pending Spotify tokens are saved as JSON in
+  `LEELOO_DATA_FILE` (default `./data/state.json` next to `server.js`). The
+  directory is created on first save. It is written about 1 s after a change
+  (temp file + rename) and on shutdown. Keep `data/` out of Git and back it up
+  if you care about crews surviving a server rebuild.
+- **Store-and-forward**: `text`, `song_push`, `hang_propose` and `hang_confirm`
+  messages are kept for crew devices that are offline (50 per device, 24 h) and
+  sent right after `crew_joined` with `queued: true`. `nudge` and `reaction`
+  are live only.
+- **Limits**: 10 failed crew-code attempts per client IP in 10 minutes
+  (`rate_limited` error / HTTP 429), 64 KB per WebSocket message, 30 s
+  WebSocket heartbeat. The client IP is the first address in
+  `X-Forwarded-For`, so nginx must set that header.
+- **Tests**: `npm install && npm test` (uses `node:test`, Node 18 or newer).
+
 ## Deployment
 
 ```bash

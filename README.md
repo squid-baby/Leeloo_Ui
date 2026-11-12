@@ -76,7 +76,7 @@ leeloo_brain.py         # Asyncio orchestrator — MAIN ENTRY POINT
 │   ├── _voice_interaction()   # tap → record → transcribe → classify → act
 │   ├── expand_frame()         # animate expand → typewriter → scroll → collapse
 │   ├── _scroll_content()      # smooth scroll for overflowed text
-│   └── _search_and_push_song() # Spotify search + album art + push to crew
+│   └── show_frame()            # The one way to open an expanded frame
 ├── Subsystems:
 │   ├── TapManager       (leeloo_tap.py)     # ADXL345 accelerometer tap detection
 │   ├── VoiceManager     (leeloo_voice.py)   # INMP441 mic → Deepgram Nova-2 STT

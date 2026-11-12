@@ -6,15 +6,21 @@ Detects single, double, and triple taps via acceleration magnitude spikes.
 Uses software tap detection (delta magnitude threshold) which is more
 reliable than the ADXL345's hardware tap interrupt.
 
-Timing:
-- Single tap:  1 tap, no follow-up within 400ms
-- Double tap:  2 taps within 400ms
-- Triple tap:  3 taps within 600ms
+How a tap sequence is resolved (all values are module constants below):
+- Every spike counts as one tap, then the sensor is ignored for
+  REFRACTORY_TIME so the mechanical rebound is not counted again.
+- After each tap a timer of MULTI_TAP_WINDOW starts. Another tap inside the
+  window extends the sequence; when the timer fires the sequence is emitted
+  as 'single_tap' or 'double_tap'.
+- The third tap emits 'triple_tap' immediately (no waiting).
+
+The user callback runs in its own asyncio task. Later taps never cancel it.
 """
 
 import asyncio
-import time
+import inspect
 import math
+import time
 
 # Hardware imports
 try:
@@ -27,16 +33,44 @@ except (ImportError, NotImplementedError):
     print("[TAP] ADXL345 hardware not available — running in mock mode")
 
 
-# Timing constants (seconds)
-DOUBLE_TAP_WINDOW = 0.50   # Max time between taps for double (increased for human speed)
-TRIPLE_TAP_WINDOW = 0.80   # Max time for triple tap sequence
-DEBOUNCE_TIME = 0.50       # Min time between raw tap events (must match settle)
-POLL_INTERVAL = 0.04       # 25Hz polling
+# -----------------------------------------------------------------------------
+# Tuning constants (seconds unless noted). Tune these on real hardware.
+# -----------------------------------------------------------------------------
 
-# Acceleration tap detection
-TAP_THRESHOLD = 1.2        # Minimum delta magnitude (m/s²) to count as tap
-SETTLE_TIME = 0.50         # Time to wait after spike before accepting new tap (absorb rebound)
-SETTLE_DRAIN_READS = 5     # Number of readings to drain after settle (reset prev_magnitude)
+# How often the accelerometer is read. 50 Hz: one I2C read is about 1 ms, so
+# the event loop stays free (the loop awaits on every iteration).
+POLL_INTERVAL = 0.02
+
+# Minimum change in acceleration magnitude (m/s²) between two consecutive
+# reads that counts as a tap. Lower = more sensitive.
+TAP_THRESHOLD = 1.2
+
+# Changes above this (but below TAP_THRESHOLD) are logged as near-misses,
+# to help tune TAP_THRESHOLD.
+NEAR_MISS_THRESHOLD = 0.6
+
+# After a spike, further spikes are ignored for this long so that the
+# mechanical rebound of ONE physical tap is not counted as a second tap.
+# The sensor is still read during this time to keep the baseline current.
+# Must stay clearly below the fastest double tap you want to detect
+# (0.15 s between taps), minus one POLL_INTERVAL of jitter.
+# Raise it if one tap is reported as a double; lower it if fast doubles are
+# reported as singles.
+REFRACTORY_TIME = 0.12
+
+# How long to wait after a tap for the next tap of the same sequence.
+# This is also the single-tap latency: a 'single_tap' is emitted this long
+# after the tap. Must be larger than the slowest double tap you want to
+# detect (0.45 s between taps) plus one POLL_INTERVAL of jitter.
+MULTI_TAP_WINDOW = 0.50
+
+# Number of taps that ends a sequence at once (emits 'triple_tap').
+MAX_TAPS = 3
+
+# Sensor read errors are printed at most once per this many seconds.
+READ_ERROR_LOG_INTERVAL = 10.0
+
+_TAP_TYPES = {1: 'single_tap', 2: 'double_tap', 3: 'triple_tap'}
 
 
 class TapManager:
@@ -51,8 +85,10 @@ class TapManager:
         self.callback = callback
         self._running = False
         self._tap_count = 0
-        self._last_tap_time = 0
-        self._pending_task = None
+        self._refractory_until = 0.0     # time.monotonic() value
+        self._pending_timer = None       # asyncio.TimerHandle for resolution
+        self._callback_tasks = set()     # strong refs to running callbacks
+        self._last_read_error_log = None
         self.accel = None
         self._prev_magnitude = 0
 
@@ -71,108 +107,135 @@ class TapManager:
                 x, y, z = self.accel.acceleration
                 self._prev_magnitude = math.sqrt(x*x + y*y + z*z)
 
-                print(f"[TAP] ADXL345 initialized (±16g, 400Hz, threshold={TAP_THRESHOLD} m/s²)")
+                print(f"[TAP] ADXL345 initialized (±16g, 100Hz, threshold={TAP_THRESHOLD} m/s²)")
             except Exception as e:
                 print(f"[TAP] Failed to initialize ADXL345: {e}")
                 self.accel = None
 
-    def _check_tap(self):
-        """Check for tap by monitoring acceleration magnitude delta"""
-        if not self.accel:
-            return False
+    # ------------------------------------------------------------------
+    # Sensor
+    # ------------------------------------------------------------------
 
+    def _read_magnitude(self):
+        """Read acceleration magnitude. Returns None if the read failed."""
         try:
             x, y, z = self.accel.acceleration
-            magnitude = math.sqrt(x*x + y*y + z*z)
-            delta = abs(magnitude - self._prev_magnitude)
-            self._prev_magnitude = magnitude
+            return math.sqrt(x*x + y*y + z*z)
+        except Exception as e:
+            now = time.monotonic()
+            if (self._last_read_error_log is None
+                    or now - self._last_read_error_log >= READ_ERROR_LOG_INTERVAL):
+                self._last_read_error_log = now
+                print(f"[TAP] Sensor read error: {e}")
+            return None
 
-            if delta > TAP_THRESHOLD:
-                print(f"[TAP] Hit! delta={delta:.2f} (threshold={TAP_THRESHOLD})")
-                return True
-            elif delta > 0.6:
-                # Log near-misses for tuning
-                print(f"[TAP] Near-miss delta={delta:.2f}")
-        except Exception:
-            pass
+    def _poll_once(self):
+        """One sensor poll: read, update baseline, count a tap on a spike."""
+        if not self.accel:
+            return
 
-        return False
+        magnitude = self._read_magnitude()
+        if magnitude is None:
+            return
 
-    async def _resolve_taps(self):
-        """Wait for tap sequence to complete, then emit event"""
-        if self._tap_count >= 3:
-            tap_type = 'triple_tap'
-        else:
-            wait_time = TRIPLE_TAP_WINDOW if self._tap_count >= 2 else DOUBLE_TAP_WINDOW
-            await asyncio.sleep(wait_time)
+        delta = abs(magnitude - self._prev_magnitude)
+        # Always follow the signal, also during the refractory period, so the
+        # baseline is already settled when the refractory period ends.
+        self._prev_magnitude = magnitude
 
-            if self._tap_count >= 3:
-                tap_type = 'triple_tap'
-            elif self._tap_count >= 2:
-                tap_type = 'double_tap'
-            else:
-                tap_type = 'single_tap'
+        now = time.monotonic()
+        if now < self._refractory_until:
+            return  # rebound of the tap we already counted
 
-        count = self._tap_count
-        self._tap_count = 0
+        if delta > TAP_THRESHOLD:
+            print(f"[TAP] Hit! delta={delta:.2f} (threshold={TAP_THRESHOLD})")
+            self._refractory_until = now + REFRACTORY_TIME
+            self._on_tap_detected()
+        elif delta > NEAR_MISS_THRESHOLD:
+            # Log near-misses for tuning
+            print(f"[TAP] Near-miss delta={delta:.2f}")
 
-        print(f"[TAP] Detected: {tap_type} (count={count})")
+    # ------------------------------------------------------------------
+    # Tap sequence resolution
+    # ------------------------------------------------------------------
 
-        if self.callback:
-            if asyncio.iscoroutinefunction(self.callback):
-                await self.callback(tap_type)
-            else:
-                self.callback(tap_type)
+    def _cancel_pending_timer(self):
+        if self._pending_timer is not None:
+            self._pending_timer.cancel()
+            self._pending_timer = None
 
     def _on_tap_detected(self):
-        """Called when a raw tap is detected"""
-        now = time.time()
-
-        # Debounce
-        if now - self._last_tap_time < DEBOUNCE_TIME:
-            return
-        self._last_tap_time = now
-
+        """Called once per physical tap (must run inside the event loop)."""
         self._tap_count += 1
         print(f"[TAP] Raw tap #{self._tap_count}")
 
-        # Cancel pending resolution
-        if self._pending_task and not self._pending_task.done():
-            self._pending_task.cancel()
+        # Only the resolution TIMER is restarted. Running callbacks are
+        # separate tasks and are never touched here.
+        self._cancel_pending_timer()
 
-        # If triple, resolve immediately
-        if self._tap_count >= 3:
-            self._pending_task = asyncio.ensure_future(self._resolve_taps())
+        if self._tap_count >= MAX_TAPS:
+            self._resolve_taps()
         else:
-            self._pending_task = asyncio.ensure_future(self._resolve_taps())
+            loop = asyncio.get_running_loop()
+            self._pending_timer = loop.call_later(MULTI_TAP_WINDOW, self._resolve_taps)
+
+    def _resolve_taps(self):
+        """Tap sequence is complete: emit the event."""
+        self._pending_timer = None
+        count = self._tap_count
+        self._tap_count = 0
+        if count <= 0:
+            return
+
+        tap_type = _TAP_TYPES[min(count, MAX_TAPS)]
+        print(f"[TAP] Detected: {tap_type} (count={count})")
+        self._dispatch(tap_type)
+
+    def _dispatch(self, tap_type):
+        """Run the user callback in its own task that taps cannot cancel."""
+        if not self.callback:
+            return
+        task = asyncio.get_running_loop().create_task(self._run_callback(tap_type))
+        # Keep a strong reference, otherwise the task can be garbage collected
+        # while it is still running.
+        self._callback_tasks.add(task)
+        task.add_done_callback(self._callback_tasks.discard)
+
+    async def _run_callback(self, tap_type):
+        try:
+            result = self.callback(tap_type)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as e:
+            print(f"[TAP] Callback error for {tap_type}: {type(e).__name__}: {e}")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     async def start(self):
-        """Start tap monitoring (async loop)"""
+        """Start tap monitoring (async loop). Returns after stop()."""
         self._running = True
         print("[TAP] Monitoring started (acceleration-based detection)")
 
         while self._running:
-            if self._check_tap():
-                self._on_tap_detected()
-                # Wait for physical rebound to fully dampen
-                await asyncio.sleep(SETTLE_TIME)
-                # Drain residual rebound readings so prev_magnitude is stable
-                for _ in range(SETTLE_DRAIN_READS):
-                    if self.accel:
-                        try:
-                            x, y, z = self.accel.acceleration
-                            self._prev_magnitude = math.sqrt(x*x + y*y + z*z)
-                        except Exception:
-                            pass
-                    await asyncio.sleep(POLL_INTERVAL)
-
+            try:
+                self._poll_once()
+            except Exception as e:
+                # Nothing in one poll may stop tap monitoring
+                print(f"[TAP] Poll error: {type(e).__name__}: {e}")
+            # Always yield, every iteration (never block the event loop)
             await asyncio.sleep(POLL_INTERVAL)
 
     def stop(self):
-        """Stop tap monitoring"""
+        """Stop tap monitoring.
+
+        Cancels the pending resolution timer only. Callbacks that are already
+        running are left alone.
+        """
         self._running = False
-        if self._pending_task and not self._pending_task.done():
-            self._pending_task.cancel()
+        self._cancel_pending_timer()
+        self._tap_count = 0
         print("[TAP] Monitoring stopped")
 
 

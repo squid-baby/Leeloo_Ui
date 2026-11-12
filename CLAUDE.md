@@ -8,8 +8,13 @@
 # SSH into Pi
 sshpass -p 'gadget' ssh pi@leeloo.local
 
-# Deploy code changes
-sshpass -p 'gadget' scp leeloo_brain.py pi@leeloo.local:/home/pi/leeloo-ui/
+# Run the automated tests first (no Pi needed)
+python3 -m pytest
+(cd leeloo_server && npm test)
+
+# Deploy code changes (all device code: *.py + display/ + boot/)
+sshpass -p 'gadget' scp *.py pi@leeloo.local:/home/pi/leeloo-ui/
+sshpass -p 'gadget' scp -r display boot pi@leeloo.local:/home/pi/leeloo-ui/
 sshpass -p 'gadget' ssh pi@leeloo.local "sudo systemctl restart leeloo.service"
 
 # View logs
@@ -29,10 +34,11 @@ leeloo_boot.py                  # Boot sequence, first-run portal
   → leeloo_brain.py             # Main brain
 
 LeelooBrain (asyncio):
-  ├── _display_loop()           # 1fps render (thread executor)
-  ├── _voice_interaction()      # Tap→STT→Claude→action
-  ├── _update_music()           # Spotify polling (tiered: 20s/60s/120s)
-  └── expand_frame()            # Typewriter + smooth scroll
+  ├── _display_loop()           # Repaints ONLY when content changed (thread executor)
+  ├── _data_loop()              # Weather + Spotify polling in a worker thread
+  ├── _voice_interaction()      # Tap→STT→Claude→action (always returns UI to NORMAL)
+  ├── show_frame()              # The ONE way to open an expanded frame (replaces the open one)
+  └── expand_frame()            # Typewriter + smooth scroll (holds the frame lock)
 
 Subsystems:
   ├── TapManager                # ADXL345 tap detection
@@ -193,9 +199,11 @@ if os.path.exists(cached_path):
 - Saves 54% API calls (~2,000/day vs 4,320/day)
 
 ### 6. **Display Render Latency**
-PIL rendering takes 200-500ms on Pi Zero. Always use `run_in_executor()`:
+PIL rendering takes 200-500ms on Pi Zero. Always render in a worker thread.
+`_render_normal()` skips the work when nothing on the screen changed:
 ```python
-await loop.run_in_executor(None, write_to_framebuffer, img)
+await self._in_thread(self._render_normal)        # repaint if changed
+await self._in_thread(self._render_normal, True)  # force (after a frame closed)
 ```
 
 ### 7. **Scroll Timing**
@@ -207,14 +215,20 @@ await loop.run_in_executor(None, write_to_framebuffer, img)
 - **Physical Pin 11** = GPIO 17 (LCD touch IRQ)
 - **Physical Pin 32** = GPIO 12 (LED DIN) ← **Check this first if LEDs don't work!**
 
-### 9. **Anthropic Model Names**
+### 9. **Anthropic Model Name — one place only**
+The model name is `CLAUDE_MODEL` in `leeloo_intent.py` (override: `LEELOO_CLAUDE_MODEL` in `.env`).
+All Claude calls go through `ask_claude()`. Old models get retired (Claude 3 Haiku
+stopped working in April 2026), so never copy a model name into another file.
 ```python
-# ✅ Use explicit version
-model="claude-3-haiku-20240307"
+# ✅ Current Haiku, no date suffix
+CLAUDE_MODEL = "claude-haiku-5-5"
 
-# ❌ Don't use -latest suffix
-model="claude-3-5-haiku-latest"  # 404 on Pi SDK
+# ❌ Retired / wrong
+model="claude-3-haiku-20240307"   # retired, every call fails
+model="claude-3-5-haiku-latest"   # -latest suffix: 404
 ```
+Prompt caching: the `system` prompt is STATIC and cached. Changing data
+(device state, date, transcript) goes in the user message only.
 
 ### 10. **OAuth State Parameter**
 ```python
@@ -253,6 +267,14 @@ sshpass -p 'gadget' scp new_image.png pi@leeloo.local:/home/pi/leeloo-ui/LeeLoo_
 
 ## Testing
 
+### Automated tests (run before every deploy)
+```bash
+python3 -m pytest                 # device code, fake hardware, ~25 s
+(cd leeloo_server && npm test)    # relay server
+```
+- `tests/test_brain.py` drives the whole brain with fake voice/relay/framebuffer.
+- Every new feature gets a test. Tests use plain `asyncio.run()` (no pytest-asyncio).
+
 ### Without Hardware
 ```python
 display = LeelooDisplay(preview_mode=True)
@@ -285,8 +307,11 @@ ssh root@leeloobot.xyz "pm2 restart leeloo-relay"
 ssh root@leeloobot.xyz "pm2 logs leeloo-relay --lines 20"
 ```
 
-**Telegram Bot:** Integrated in `server.js`
-- Webhook: `https://leeloobot.xyz/api/telegram/webhook`
+**Relay state** is saved in `/root/leeloo-relay/data/state.json` (crews, members,
+Telegram users, messages queued for offline devices). Do not delete it on deploy.
+Messages sent while a device is offline are delivered when it reconnects (max 50, 24 h).
+
+**Telegram Bot:** `leeloo_server/telegram_bot.py` (separate process, calls `/api/telegram/*`)
 - Bot: `@Leeloo2259_bot`
 
 ## Environment Variables
@@ -296,7 +321,8 @@ ssh root@leeloobot.xyz "pm2 logs leeloo-relay --lines 20"
 DEEPGRAM_API_KEY=...           # Nova-2 STT
 ANTHROPIC_API_KEY=...          # Claude Haiku
 SPOTIFY_CLIENT_ID=...          # Web API
-SPOTIFY_CLIENT_SECRET=...      # Client credentials flow
+SPOTIFY_CLIENT_SECRET=...      # REQUIRED for Spotify. Never put it in source code.
+LEELOO_CLAUDE_MODEL=...        # Optional: override the Claude model
 ```
 
 ## Don't Do This
@@ -314,18 +340,27 @@ SPOTIFY_CLIENT_SECRET=...      # Client credentials flow
 - ❌ Run continuous LED animations (ambient breathe) while voice recording — DMA conflict kills audio
 - ❌ Trust `is_playing` from `current_music.json` without checking `spotify_tokens.json` exists
 - ❌ Write off-screen content in a tight loop without `await asyncio.sleep(0)` — blocks I2S reads
+- ❌ Call `expand_frame()` / `asyncio.create_task(self.expand_frame(...))` directly — use `show_frame()`
+- ❌ Call `asyncio.ensure_future()` or touch LEDs from a worker thread — only on the event loop
+- ❌ Start an LED animation from a callback without `_led_notify()` (it checks for voice recording)
+- ❌ Say "sent" before the send call returned True — show "not sent" when offline
+- ❌ Show invented data (weather fallback values, random charts) — show "offline" instead
+- ❌ Put secrets or model names in more than one place
+- ❌ Put changing data in a Claude `system` prompt (breaks the prompt cache)
 
 ## Tuning Values
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
 | `TAP_THRESHOLD` | 1.2 m/s² | Lower = more sensitive |
+| `REFRACTORY_TIME` | 0.12 s | `leeloo_tap.py`. Raise it if ONE tap is seen as a double tap |
+| `MULTI_TAP_WINDOW` | 0.50 s | `leeloo_tap.py`. Wait for a 2nd/3rd tap (= single-tap delay) |
 | Music polling (active) | 20s | When is_playing=true |
 | Music polling (recent) | 60s | Last played <5min |
 | Music polling (idle) | 120s | Idle state |
 | Typewriter delay | 25ms/char | Character animation |
 | Expanded hold | 20s | Info frame display |
-| Shared music timeout | 30min | Priority over now-playing |
+| Weather refresh | 10 min (retry 1 min) | Data older than 2 h shows "weather offline" |
 | Ambient LED peak brightness | 50% | `AMBIENT_PEAK` in `leeloo_led.py` |
 | Ambient LED cycle | 8s | `AMBIENT_CYCLE_S` in `leeloo_led.py` |
 | Ambient LED framerate | 10fps (0.1s sleep) | Safe on Pi Zero, visually smooth |

@@ -6,100 +6,113 @@ Fetches real weather data from Open-Meteo API (free, no API key needed)
 
 import requests
 
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+NOWCAST_STEPS = 24          # 24 x 15 min = next 6 hours
+REQUEST_TIMEOUT = 10        # seconds
+
+_WMO_CODES = {
+    0: "clear sky", 1: "mostly clear", 2: "partly cloudy", 3: "overcast",
+    45: "foggy", 48: "freezing fog",
+    51: "light drizzle", 53: "drizzle", 55: "heavy drizzle",
+    56: "light freezing drizzle", 57: "freezing drizzle",
+    61: "light rain", 63: "rain", 65: "heavy rain",
+    66: "light freezing rain", 67: "freezing rain",
+    71: "light snow", 73: "snow", 75: "heavy snow",
+    77: "snow grains",
+    80: "light rain showers", 81: "rain showers", 82: "heavy rain showers",
+    85: "light snow showers", 86: "heavy snow showers",
+    95: "thunderstorm", 96: "thunderstorm with hail", 99: "severe thunderstorm",
+}
+
+
 def _weather_code_to_desc(code):
     """Convert WMO weather code to human-readable description"""
-    codes = {
-        0: "clear sky", 1: "mostly clear", 2: "partly cloudy", 3: "overcast",
-        45: "foggy", 48: "freezing fog",
-        51: "light drizzle", 53: "drizzle", 55: "heavy drizzle",
-        56: "light freezing drizzle", 57: "freezing drizzle",
-        61: "light rain", 63: "rain", 65: "heavy rain",
-        66: "light freezing rain", 67: "freezing rain",
-        71: "light snow", 73: "snow", 75: "heavy snow",
-        77: "snow grains",
-        80: "light rain showers", 81: "rain showers", 82: "heavy rain showers",
-        85: "light snow showers", 86: "heavy snow showers",
-        95: "thunderstorm", 96: "thunderstorm with hail", 99: "severe thunderstorm",
+    return _WMO_CODES.get(code, f"code {code}")
+
+
+def parse_weather(data):
+    """Convert an Open-Meteo forecast response into the LEELOO weather dict.
+
+    Raises KeyError/TypeError/ValueError if the response has no usable
+    current temperature. All other fields are optional.
+    """
+    current = data['current']
+    temp = int(round(float(current['temperature_2m'])))
+    uv_index = current.get('uv_index') or 0
+    current_precip_mm = current.get('precipitation') or 0
+    weather_code = current.get('weather_code') or 0
+
+    # Calendar-day precipitation total (forecast)
+    daily_sums = (data.get('daily') or {}).get('precipitation_sum') or [0]
+    rain_inches = (daily_sums[0] or 0) / 25.4
+    current_precip_inches = current_precip_mm / 25.4
+
+    # Use the HIGHER of current precip rate or daily total for the rain slider
+    # so active rain always shows up prominently
+    effective_rain = max(rain_inches, current_precip_inches * 4)
+
+    # WMO codes: 51-67 drizzle/rain, 80-82 showers, 95-99 thunderstorm
+    is_raining = (51 <= weather_code <= 67) or (80 <= weather_code <= 82) or (95 <= weather_code <= 99)
+
+    # Real 15-minute precipitation forecast (mm per 15 min) for the rain chart
+    minutely = (data.get('minutely_15') or {}).get('precipitation') or []
+    nowcast = [float(v or 0) for v in minutely[:NOWCAST_STEPS]]
+
+    return {
+        'temp_f': temp,
+        'uv_raw': uv_index,                       # Raw UV index (0-11+)
+        'rain_24h_inches': effective_rain,        # Effective rain for slider
+        'current_precip_inches': current_precip_inches,
+        'is_raining': is_raining,
+        'weather_code': weather_code,
+        'weather_desc': _weather_code_to_desc(weather_code),
+        'precip_15min_mm': nowcast,               # next 6 h, 15-min steps
     }
-    return codes.get(code, f"code {code}")
 
 
 def get_weather(lat=35.9101, lon=-79.0753, timezone=None):
     """
-    Fetch current weather from Open-Meteo API
+    Fetch current weather from Open-Meteo API.
 
     Args:
-        lat: Latitude (default: Carrboro, NC)
-        lon: Longitude (default: Carrboro, NC)
-        timezone: IANA timezone string (e.g. 'America/New_York'). Uses 'auto' if not set.
+        lat, lon: Location (default: Carrboro, NC)
+        timezone: IANA timezone string. Uses 'auto' if not set.
 
     Returns:
-        dict with temp_f, uv, rain, temp_slider (all 0-10 scale for sliders)
+        Weather dict (see parse_weather), or None if the fetch failed.
+        The caller decides what to show on failure. This function never
+        returns invented values.
     """
     try:
-        tz = timezone or "auto"
-        url = (
-            f"https://api.open-meteo.com/v1/forecast?"
-            f"latitude={lat}&longitude={lon}"
-            f"&current=temperature_2m,uv_index,precipitation,weather_code"
-            f"&daily=precipitation_sum"
-            f"&temperature_unit=fahrenheit"
-            f"&timezone={tz}"
-            f"&forecast_days=1"
+        resp = requests.get(
+            OPEN_METEO_URL,
+            params={
+                'latitude': lat,
+                'longitude': lon,
+                'current': 'temperature_2m,uv_index,precipitation,weather_code',
+                'daily': 'precipitation_sum',
+                'minutely_15': 'precipitation',
+                'forecast_minutely_15': NOWCAST_STEPS,
+                'temperature_unit': 'fahrenheit',
+                'timezone': timezone or 'auto',
+                'forecast_days': 1,
+            },
+            timeout=REQUEST_TIMEOUT,
         )
-
-        resp = requests.get(url, timeout=10)
         resp.raise_for_status()
-        data = resp.json()
-
-        # Extract values
-        temp = int(data['current']['temperature_2m'])
-        uv_index = data['current'].get('uv_index', 0)  # 0-11+ scale
-        current_precip_mm = data['current'].get('precipitation', 0) or 0
-        weather_code = data['current'].get('weather_code', 0)
-
-        # 24-hour precipitation total (forecast)
-        rain_mm = data['daily']['precipitation_sum'][0] if data['daily']['precipitation_sum'][0] else 0
-        rain_inches = rain_mm / 25.4
-
-        # Current precipitation rate (mm -> inches)
-        current_precip_inches = current_precip_mm / 25.4
-
-        # Use the HIGHER of current precip rate or daily total for the rain slider
-        # so active rain always shows up prominently
-        effective_rain = max(rain_inches, current_precip_inches * 4)  # weight current rain heavily
-
-        # WMO weather codes: 0=clear, 1-3=partly cloudy, 45-48=fog,
-        # 51-55=drizzle, 56-57=freezing drizzle, 61-65=rain, 66-67=freezing rain,
-        # 71-77=snow, 80-82=rain showers, 85-86=snow showers, 95-99=thunderstorm
-        is_raining = weather_code in range(51, 68) or weather_code in range(80, 83) or weather_code in range(95, 100)
-        weather_desc = _weather_code_to_desc(weather_code)
-
-        # Return raw values - display handles scaling
-        return {
-            'temp_f': temp,
-            'uv_raw': uv_index,  # Raw UV index (0-11+)
-            'rain_24h_inches': effective_rain,  # Effective rain for slider
-            'current_precip_inches': current_precip_inches,
-            'is_raining': is_raining,
-            'weather_code': weather_code,
-            'weather_desc': weather_desc,
-        }
-
+        return parse_weather(resp.json())
     except Exception as e:
         print(f"⚠️  Weather API error: {e}")
-        # Return fallback values
-        return {
-            'temp_f': 72,
-            'uv_raw': 5,
-            'rain_24h_inches': 0.5,
-        }
+        return None
 
 
 if __name__ == "__main__":
-    # Test the API
     print("Fetching weather for Carrboro, NC...")
     weather = get_weather()
-    print(f"Temperature: {weather['temp_f']}°F")
-    print(f"UV Index: {weather['uv_raw']}")
-    print(f"Rain (24hr): {weather['rain_24h_inches']:.2f} inches")
+    if weather:
+        print(f"Temperature: {weather['temp_f']}°F ({weather['weather_desc']})")
+        print(f"UV Index: {weather['uv_raw']}")
+        print(f"Rain (24hr): {weather['rain_24h_inches']:.2f} inches")
+        print(f"Next 6 h (mm/15min): {weather['precip_15min_mm']}")
+    else:
+        print("Weather not available")

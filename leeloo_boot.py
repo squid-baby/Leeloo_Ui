@@ -249,66 +249,19 @@ def do_crew_registration():
 # ============================================
 
 def run_main_ui():
+    """Start the main UI. Any failure exits with code 1 so that systemd
+    (Restart=on-failure) starts LEELOO again after 5 seconds."""
     show_splash("Loading UI...", 90)
-    time.sleep(0.5)
     try:
         from leeloo_brain import main as brain_main
         brain_main()
-    except ImportError:
-        try:
-            from gadget_main import main as gadget_main
-            gadget_main()
-        except ImportError:
-            print("No main UI available, running static display")
-            run_static_display()
     except Exception as e:
         print(f"Main UI error: {e}")
+        import traceback
+        traceback.print_exc()
         show_splash(f"UI error: {str(e)[:40]}", 90)
         time.sleep(5)
-
-
-def run_static_display():
-    from gadget_display import LeelooDisplay
-    from datetime import datetime
-    import numpy as np
-
-    display = LeelooDisplay(preview_mode=False)
-    weather_data = {'temp_f': 72, 'uv_raw': 5, 'rain_24h_inches': 0}
-    now = datetime.now()
-    time_data = {
-        'time_str': now.strftime('%-I:%M %p'),
-        'date_str': now.strftime('%b %-d'),
-        'seconds': now.second
-    }
-    contacts = []
-    album_data = {
-        'artist': 'LEELOO',
-        'track': 'Setup Complete',
-    }
-
-    img = display.render(weather_data, time_data, contacts, album_data)
-
-    def rgb_to_rgb565(img):
-        arr = np.array(img)
-        r = (arr[:, :, 0] >> 3).astype(np.uint16)
-        g = (arr[:, :, 1] >> 2).astype(np.uint16)
-        b = (arr[:, :, 2] >> 3).astype(np.uint16)
-        return (r << 11) | (g << 5) | b
-
-    rgb565 = rgb_to_rgb565(img)
-    with open('/dev/fb1', 'wb') as fb:
-        fb.write(rgb565.tobytes())
-
-    while True:
-        time.sleep(60)
-        now = datetime.now()
-        time_data['time_str'] = now.strftime('%-I:%M %p')
-        time_data['date_str'] = now.strftime('%b %-d')
-        time_data['seconds'] = now.second
-        img = display.render(weather_data, time_data, contacts, album_data)
-        rgb565 = rgb_to_rgb565(img)
-        with open('/dev/fb1', 'wb') as fb:
-            fb.write(rgb565.tobytes())
+        sys.exit(1)
 
 
 def main():
@@ -318,7 +271,6 @@ def main():
 
     # Step 1: Splash
     show_splash("Initializing...", 10)
-    time.sleep(0.5)
 
     # Step 2: Check first run
     first_run = is_first_run()
@@ -329,7 +281,6 @@ def main():
         # name, crew, etc. even if WiFi happens to be connected.
         print("First run - disconnecting WiFi for captive portal setup")
         show_splash("Starting setup...", 20)
-        time.sleep(0.5)
 
         # Disconnect any existing WiFi so AP mode can take over wlan0
         disconnect_wifi_for_setup()
@@ -368,7 +319,6 @@ def main():
     if wifi_connected and wifi_ssid:
         print(f"WiFi connected: {wifi_ssid}")
         show_splash(f"Connected to {wifi_ssid}", 50)
-        time.sleep(1)
 
         # Step 3a: Deferred geocoding (if needed)
         show_splash("Setting up location...", 55)
@@ -395,22 +345,18 @@ def main():
 
     # Step 4: Crew status
     show_splash("Checking crew...", 70)
-    time.sleep(0.5)
 
     if os.path.exists(CREW_CONFIG_PATH):
         crew = load_json(CREW_CONFIG_PATH)
         crew_code = crew.get('invite_code', crew.get('crew_code', ''))
         print(f"Crew configured: {crew_code}")
         show_splash(f"Crew: {crew_code}", 80)
-        time.sleep(0.5)
     else:
         print("No crew configured")
         show_splash("No crew (setup later)", 80)
-        time.sleep(1)
 
     # Step 5: Launch main UI
     show_splash("Starting LEELOO...", 95)
-    time.sleep(0.5)
 
     print("Launching main UI...")
     run_main_ui()
@@ -428,3 +374,4 @@ if __name__ == '__main__':
         traceback.print_exc()
         show_splash(f"Error: {str(e)[:40]}", 0)
         time.sleep(10)
+        sys.exit(1)

@@ -113,12 +113,15 @@ state = str(uuid.uuid4())
 
 **Solution:**
 ```python
-# ✅ Explicit version
-model="claude-3-haiku-20240307"
+# ✅ One constant in leeloo_intent.py, current Haiku, no date suffix
+CLAUDE_MODEL = "claude-haiku-5-5"
 
 # ❌ Breaks on Pi
 model="claude-3-5-haiku-latest"
 ```
+
+**Update (Nov 2026):** `claude-3-haiku-20240307` was retired in April 2026 and
+every call failed. The model name now lives in ONE place (`leeloo_intent.CLAUDE_MODEL`).
 
 ### 10. **Pin Numbering: Physical vs BCM GPIO**
 **Problem:** LEDs wired to Pin 11 (GPIO 17), code expects GPIO 12
