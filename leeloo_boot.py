@@ -16,13 +16,13 @@ import subprocess
 import asyncio
 
 # Add boot directory to path
-sys.path.insert(0, '/home/pi/leeloo-ui/boot')
-sys.path.insert(0, '/home/pi/leeloo-ui')
+LEELOO_HOME = os.environ.get("LEELOO_HOME", "/home/pi/leeloo-ui")
+sys.path.insert(0, os.path.join(LEELOO_HOME, 'boot'))
+sys.path.insert(0, LEELOO_HOME)
 
 from boot.leeloo_splash import show_splash, clear_screen
 
 # Configuration
-LEELOO_HOME = '/home/pi/leeloo-ui'
 DEVICE_CONFIG_PATH = os.path.join(LEELOO_HOME, 'device_config.json')
 CREW_CONFIG_PATH = os.path.join(LEELOO_HOME, 'crew_config.json')
 FIRST_RUN_COMPLETE = os.path.join(LEELOO_HOME, '.first_run_complete')
@@ -292,24 +292,37 @@ def main():
         portal_thread.start()
         print("Captive portal started in background")
 
-        # Wait for WiFi (up to 10 minutes)
+        # Wait for the user to finish the portal and for WiFi to connect.
+        # Setup is complete ONLY when WiFi really works. A wrong password or
+        # a timeout exits with code 1: systemd starts this script again and
+        # the setup portal comes back (no dead end without WiFi).
         print("Waiting for WiFi setup via captive portal...")
-        MAX_WIFI_RETRIES = 120
-        wifi_retry_count = 0
-        while wifi_retry_count < MAX_WIFI_RETRIES:
-            wifi_connected = check_wifi_connected()
+        waited = 0
+        while True:
+            config = load_json(DEVICE_CONFIG_PATH)
+            if config.get('wifi_error'):
+                print(f"WiFi setup failed: {config['wifi_error']} - restarting setup")
+                show_splash("WiFi failed - check password", 20)
+                config.pop('wifi_error', None)
+                save_json(DEVICE_CONFIG_PATH, config)
+                time.sleep(6)
+                sys.exit(1)
             wifi_ssid = get_wifi_ssid()
-            if wifi_connected and wifi_ssid and not wifi_ssid.startswith('LEE-'):
+            if (config.get('setup_complete') and wifi_ssid
+                    and not wifi_ssid.startswith('LEE-') and check_wifi_connected()):
                 print(f"WiFi connected: {wifi_ssid}")
                 mark_first_run_complete()
-                break
-            wifi_retry_count += 1
-            if wifi_retry_count % 12 == 0:
-                print(f"Still waiting for WiFi... ({wifi_retry_count * 5}s)")
-            time.sleep(5)
-        else:
-            print("WiFi connection timeout - continuing anyway")
-            mark_first_run_complete()
+                # Start again in a fresh process: this stops the setup web
+                # server (it must not stay reachable on the home network).
+                sys.stdout.flush()
+                os.execv(sys.executable, [sys.executable, '-u', os.path.abspath(__file__)])
+            waited += 3
+            if waited % 60 == 0:
+                print(f"Still waiting for WiFi setup... ({waited}s)")
+            if waited >= 1800:   # 30 minutes: restart the portal cleanly
+                print("Setup timeout - restarting setup")
+                sys.exit(1)
+            time.sleep(3)
 
     # Step 3: Verify WiFi
     show_splash("Checking WiFi...", 30)
@@ -329,17 +342,15 @@ def main():
         do_crew_registration()
 
     else:
-        print("WiFi not connected, showing setup screen...")
-        run_first_run_screen()
-        MAX_WIFI_RETRIES = 60
-        wifi_retry_count = 0
-        while wifi_retry_count < MAX_WIFI_RETRIES:
+        # Normal boot, WiFi not up yet (the Pi is often faster than the router)
+        print("WiFi not connected yet, waiting...")
+        show_splash("Waiting for WiFi...", 40)
+        for _ in range(300):
             if check_wifi_connected():
                 do_deferred_geocoding()
                 do_crew_registration()
                 break
-            wifi_retry_count += 1
-            time.sleep(5)
+            time.sleep(1)
         else:
             print("WiFi reconnect timeout - continuing to UI anyway")
 

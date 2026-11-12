@@ -74,10 +74,10 @@ def test_api_error_and_refusal_do_not_raise():
     assert intent.action == "UNKNOWN"
 
 
-def test_old_sdk_without_thinking_argument_still_works():
-    fake = FakeMessages('{"action":"NUDGE"}', reject_thinking=True)
+def test_one_api_call_per_command_with_thinking_disabled():
+    fake = FakeMessages('{"action":"NUDGE"}')
     assert asyncio.run(router_with(fake).route("x")).action == "NUDGE"
-    assert len(fake.calls) == 2
+    assert len(fake.calls) == 1 and fake.calls[0]['thinking'] == {"type": "disabled"}
 
 
 def test_empty_transcript_and_missing_client():

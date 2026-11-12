@@ -1,6 +1,7 @@
 [Unit]
 Description=LEELOO Main Service
 After=network.target
+# Not network-online.target: the first-run setup must start WITHOUT a network.
 
 [Service]
 Type=simple

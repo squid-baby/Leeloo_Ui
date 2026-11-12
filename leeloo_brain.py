@@ -338,6 +338,7 @@ class LeelooBrain:
         self.ws_client = LeelooClient(relay_url=RELAY_URL, config_path=CREW_CONFIG_PATH)
         self._setup_ws_callbacks()
         self._ws_down_since = None
+        self._crew_error_shown = False
         self._queued_count = 0
         print(f"[BRAIN] WebSocket: {'configured' if self.ws_client.is_configured() else 'no crew'}")
 
@@ -355,6 +356,7 @@ class LeelooBrain:
         self.contacts = contact_names(self.crew_config.get('members', []))
         self.last_weather_fetch = 0
         self.last_music_fetch = 0
+        self._last_playing_at = 0         # last time Spotify reported "playing"
         self._refresh_lock = threading.Lock()
 
         # Timezone
@@ -371,8 +373,8 @@ class LeelooBrain:
         self.longitude = self.device_config.get('longitude')
         self.location_configured = self.latitude is not None and self.longitude is not None
 
-        # Hang scheduling: ISO datetime of a proposed hang that waits for confirmation
-        self._pending_hang_dt = None
+        # Hang scheduling: a proposed hang waits for confirmation. Stored on
+        # disk (see _pending_hang_dt) so a restart does not lose it.
 
         # Fonts for typewriter
         try:
@@ -397,6 +399,28 @@ class LeelooBrain:
         """Current device-local time (timezone-aware when a timezone is configured)."""
         return datetime.now(tz=self.local_tz) if self.local_tz else datetime.now()
 
+    @property
+    def _pending_hang_dt(self):
+        """ISO datetime of the hang proposal that waits for confirmation (or None)."""
+        try:
+            return gadget_data.load_data().get('pending_hang') or None
+        except Exception:
+            return None
+
+    @_pending_hang_dt.setter
+    def _pending_hang_dt(self, value):
+        try:
+            data = gadget_data.load_data()
+            if value:
+                data['pending_hang'] = value
+            elif 'pending_hang' in data:
+                del data['pending_hang']
+            else:
+                return
+            gadget_data.save_data(data)
+        except Exception as e:
+            print(f"[BRAIN] Could not store pending hang: {e}")
+
     def _spawn(self, coro):
         """Start a background task and keep a reference so it is not garbage-collected.
         Exceptions are printed instead of being lost."""
@@ -418,7 +442,7 @@ class LeelooBrain:
     def _led_notify(self, make_coro):
         """Start an LED notification — but never while the microphone records
         (WS2812B and I2S share the DMA controller; LED activity kills the audio)."""
-        if self._voice_busy:
+        if self.ui_state == UIState.LISTENING or self.led.recording:
             return
         self._spawn(make_coro())
 
@@ -469,18 +493,20 @@ class LeelooBrain:
         if self._voice_busy and not from_voice:
             self._deferred_frame = (frame_type, lines, duration)
             return None
+        return self._start_frame_task(lambda: self.expand_frame(frame_type, lines, duration))
+
+    def _start_frame_task(self, make_coro):
+        """Make `make_coro()` the current frame task. The frame that is open
+        now is cancelled and has finished its cleanup before the new one starts."""
         previous = self._expand_task
-        self._expand_task = asyncio.ensure_future(
-            self._replace_frame(previous, frame_type, lines, duration)
-        )
+        self._expand_task = asyncio.ensure_future(self._replace_frame(previous, make_coro))
         return self._expand_task
 
-    async def _replace_frame(self, previous, frame_type, lines, duration):
+    async def _replace_frame(self, previous, make_coro):
         if previous is not None and not previous.done():
             previous.cancel()
-        # expand_frame() waits on the frame lock until the old frame has
-        # finished its cleanup, so two frames never draw at the same time.
-        await self.expand_frame(frame_type, lines, duration)
+            await asyncio.gather(previous, return_exceptions=True)
+        await make_coro()
 
     def dismiss_frame(self):
         if self._expand_task is not None and not self._expand_task.done():
@@ -622,14 +648,14 @@ class LeelooBrain:
             return
 
         try:
+            # Convert the whole content ONCE; each scroll step only copies rows
+            rgb565 = rgb_to_rgb565_fast(content_img)
+            rows = [rgb565[r, :].tobytes() for r in range(rgb565.shape[0])]
+            visible_rows = min(visible_h, SCREEN_HEIGHT - content_y)
             for scroll_offset in range(0, max_scroll + 1):
-                crop = content_img.crop((0, scroll_offset, content_img.width, scroll_offset + visible_h))
-                rgb565 = rgb_to_rgb565_fast(crop)
-                for row in range(rgb565.shape[0]):
-                    screen_y = content_y + row
-                    if screen_y < SCREEN_HEIGHT:
-                        fb.seek((screen_y * SCREEN_WIDTH + content_x) * 2)
-                        fb.write(rgb565[row, :].tobytes())
+                for row in range(visible_rows):
+                    fb.seek(((content_y + row) * SCREEN_WIDTH + content_x) * 2)
+                    fb.write(rows[scroll_offset + row])
                 await asyncio.sleep(frame_delay)
 
             elapsed_scroll = max_scroll * frame_delay
@@ -803,11 +829,12 @@ class LeelooBrain:
         """Incoming hang confirmation — proposer side: lock in the hang time"""
         print(f"[BRAIN] Hang confirmed by {sender}!")
         self._led_notify(self.led.ack)
-        self._save_pending_hang()
+        saved = self._save_pending_hang()
+        # Say "confirmed" only when a hang time was really saved on this device
         self.show_frame(FrameType.MESSAGES, [
-            ("hang confirmed!", "large", COLORS['lavender']),
+            ("hang confirmed!" if saved else f"{sender.lower()} is in!", "large", COLORS['lavender']),
             ("", None, None),
-            (f"{sender.lower()} is in", "normal", COLORS['white']),
+            (f"{sender.lower()} is in" if saved else "for the hang", "normal", COLORS['white']),
         ], duration=10.0)
 
     def _on_ws_queued(self, sender, msg_type, payload, timestamp):
@@ -815,6 +842,8 @@ class LeelooBrain:
         Stored silently; one summary frame is shown for the whole batch."""
         payload = payload if isinstance(payload, dict) else {}
         self._remember_contact(sender)
+        if time.time() - (timestamp or 0) > 86400:
+            return   # older than the 24 h message history
         if msg_type == 'text':
             self.message_mgr.add_message(sender, payload.get('text', ''), timestamp)
         elif msg_type == 'song_push':
@@ -828,11 +857,12 @@ class LeelooBrain:
             self._spawn(_fetch_art())
         elif msg_type == 'hang_propose':
             dt = self._parse_hang(payload.get('datetime', ''))
-            if dt is not None and dt > self._now():
-                self._pending_hang_dt = dt.isoformat()
-                self.message_mgr.add_message(
-                    sender, f"wants to hang {self._hang_label(dt)} {payload.get('description', '')}".strip(),
-                    timestamp)
+            if dt is None or dt <= self._now():
+                return   # the proposed time has passed
+            self._pending_hang_dt = dt.isoformat()
+            self.message_mgr.add_message(
+                sender, f"wants to hang {self._hang_label(dt)} {payload.get('description', '')}".strip(),
+                timestamp)
         elif msg_type == 'hang_confirm':
             self._save_pending_hang()
             self.message_mgr.add_message(sender, "confirmed the hang", timestamp)
@@ -913,12 +943,11 @@ class LeelooBrain:
 
     def _music_interval(self, now):
         """Tiered polling: 20s playing, 60s recently played, 120s idle."""
-        music = self.music_data
-        if music is None:
-            return 120 if self.last_music_fetch else 0
-        if music.get('is_playing'):
+        if not self.last_music_fetch:
+            return 0
+        if self.music_data and self.music_data.get('is_playing'):
             return MUSIC_REFRESH_INTERVAL
-        if (now - music.get('last_updated', 0)) < 300:
+        if now - self._last_playing_at < 300:
             return 60
         return 120
 
@@ -953,6 +982,8 @@ class LeelooBrain:
             'is_playing': bool(live and result.get('is_playing', False)),
             'last_updated': now if live else result.get('timestamp', now),
         }
+        if self.music_data['is_playing']:
+            self._last_playing_at = now
         art = result.get('album_art_cached')
         self.album_art_path = art if art and os.path.exists(art) else None
 
@@ -1098,24 +1129,24 @@ class LeelooBrain:
         ok = await self.ws_client.send_reaction('fire')
         await (self.led.ack() if ok else self.led.error())
 
-    async def _send_nudge(self):
+    async def _send_nudge(self, from_voice=False):
         ok = self._connected() and await self.ws_client.send_nudge()
         if ok:
             self._led_notify(lambda: self.led.nudge(duration=3))
             self.show_frame(FrameType.MESSAGES, [
                 ("nudge sent", "large", COLORS['lavender']),
-            ], duration=4.0, from_voice=True)
+            ], duration=4.0, from_voice=from_voice)
         else:
             self._led_notify(self.led.error)
-            self._show_offline("nudge not sent")
+            self._show_offline("nudge not sent", from_voice=from_voice)
 
-    def _show_offline(self, title):
+    def _show_offline(self, title, from_voice=True):
         self.show_frame(FrameType.MESSAGES, [
             (title, "large", COLORS['rose']),
             ("", None, None),
             *format_display_text("no link to your crew right now. check wifi and try again.",
                                  COLORS['white']),
-        ], duration=10.0, from_voice=True)
+        ], duration=10.0, from_voice=from_voice)
 
     # =========================================================================
     # VOICE INTERACTION
@@ -1177,16 +1208,15 @@ class LeelooBrain:
             if not transcript:
                 led_released = True
                 await self.led.error()
-                self.ui_state = UIState.NORMAL
-                self._voice_busy = False
                 lines = self._voice_failure_lines()
                 if lines:
-                    self.show_frame(FrameType.WEATHER, lines, duration=10.0)
+                    self.show_frame(FrameType.WEATHER, lines, duration=10.0, from_voice=True)
                 return
 
             self.ui_state = UIState.PROCESSING
             self._wake_display()
             self._spawn(self.led.processing())
+            await asyncio.sleep(0)   # let the animation start, so led.off() can stop it
 
             # Give Claude fresh music context, but do not wait long for Spotify
             if time.time() - self.last_music_fetch > 30:
@@ -1201,8 +1231,9 @@ class LeelooBrain:
 
             led_released = True
             await self.led.off()
-            self.ui_state = UIState.NORMAL
-            self._voice_busy = False
+            # The session stays "busy" (header: "thinking...") until the result
+            # is on the screen. A tap in this time must not start a second
+            # session, and frames from other sources stay deferred.
             await self._execute_intent(intent)
 
         except Exception as e:
@@ -1272,7 +1303,7 @@ class LeelooBrain:
             self.message_mgr.mark_all_read()
 
         elif action == "NUDGE":
-            await self._send_nudge()
+            await self._send_nudge(from_voice=True)
 
         elif action == "SONG_PUSH":
             await self._intent_song_push(params, show)
@@ -1312,6 +1343,9 @@ class LeelooBrain:
                 lines.append((self._crew_code(), "large", COLORS['green']))
             show(FrameType.MESSAGES, lines)
 
+        elif action == "SPOTIFY_SETUP":
+            self._show_spotify_qr()
+
         elif action == "TIME_QUERY":
             time_text = await self._generate_cosmic_time()
             show(FrameType.TIME, format_display_text(time_text, COLORS['purple']))
@@ -1337,6 +1371,14 @@ class LeelooBrain:
             print(f"[BRAIN] Song push search: '{query}'")
             result = await self._in_thread(music_manager.search_and_save_shared, query, 'You') \
                 if query else None
+            if not result and not music_manager.spotify_client_secret():
+                show(FrameType.ALBUM, [
+                    ("spotify is off", "large", COLORS['rose']),
+                    ("", None, None),
+                    *format_display_text("SPOTIFY_CLIENT_SECRET is missing in the .env file.",
+                                         COLORS['white']),
+                ], 12.0)
+                return
             if not result:
                 show(FrameType.ALBUM, [
                     ("couldn't find it", "large", COLORS['green']),
@@ -1471,6 +1513,11 @@ class LeelooBrain:
                 print(f"[BRAIN] Data loop error: {e}")
             await asyncio.sleep(1.0)
 
+    def _may_create_crew(self):
+        """May this device register its crew code on the server?
+        Yes if it created the crew, or if it was a member before."""
+        return bool(self.crew_config.get('is_creator') or self.ws_client.config.crew_id)
+
     async def _ws_connection_loop(self):
         """WebSocket connection with auto-reconnect"""
         retry_delay = 5
@@ -1483,12 +1530,26 @@ class LeelooBrain:
                 if await self.ws_client.connect():
                     joined = await self.ws_client.rejoin_crew()
                     if not joined and self.ws_client.connected:
-                        # Crew unknown to the server — register it with the same code
-                        display_name = self.user_name or 'LEELOO'
-                        joined = bool(await self.ws_client.create_crew(display_name))
+                        if self._may_create_crew():
+                            # Our crew is unknown to the server (for example after
+                            # the server lost its state) — register the same code.
+                            display_name = self.user_name or 'LEELOO'
+                            joined = bool(await self.ws_client.create_crew(display_name))
+                        elif not self._crew_error_shown:
+                            # A crew code typed at setup that the server does not
+                            # know. Do NOT create it: the user would sit alone in
+                            # a new crew and never know.
+                            self._crew_error_shown = True
+                            self.show_frame(FrameType.MESSAGES, [
+                                ("crew not found", "large", COLORS['rose']),
+                                ("", None, None),
+                                *format_display_text(
+                                    f"no crew with the code {self._crew_code()}. check the code "
+                                    "with your friend, then run setup again.", COLORS['white']),
+                            ], duration=30.0)
                     if joined:
                         print("[BRAIN] WebSocket connected and crew joined!")
-                        retry_delay = 5
+                        session_start = time.time()
                         self._ws_down_since = None
                         self._wake_display()
 
@@ -1502,6 +1563,11 @@ class LeelooBrain:
                             for task in (listen_task, keepalive_task):
                                 task.cancel()
                         print("[BRAIN] WebSocket disconnected")
+                        # Reset the backoff only after a stable session. Two
+                        # devices with the same id replace each other at once;
+                        # without this they would reconnect every 5 s forever.
+                        if time.time() - session_start >= 60:
+                            retry_delay = 5
                     else:
                         print("[BRAIN] Could not join crew")
                 else:
@@ -1609,59 +1675,18 @@ class LeelooBrain:
             print(f"[BRAIN] QR image generation failed: {e}")
             return None
 
-    async def _show_welcome_with_qr(self):
-        """First-boot welcome in two phases:
-        Phase 1: Telegram QR (if opted in) — 60s
-        Phase 2: Spotify OAuth QR (if Telegram opted in and Spotify not connected) — 60s
-        The caller sets _welcome_qr_active BEFORE it creates this task."""
-        crew_code = self._crew_code()
-        telegram_opted = self.device_config.get('telegram_opted_in', False)
-        show_spotify = telegram_opted and not self._has_live_spotify()
+    async def _qr_frame(self, make_qr_args, lines, duration=60.0):
+        """Show a QR code in the album art box together with an expanded frame.
+        The album art is restored when the frame closes (or is dismissed).
+        Must run inside the current frame task."""
+        self._welcome_qr_active = True      # the music refresh must not replace the QR
         original_art_path = self.album_art_path
-
         try:
-            if telegram_opted and crew_code:
-                qr_path = await self._in_thread(
-                    self._generate_qr_image,
-                    f"https://t.me/Leeloo2259_bot?start={crew_code.replace('-', '')}",
-                    "scan for Telegram", crew_code, COLORS['lavender'])
-                if qr_path:
-                    self.album_art_path = qr_path
-                    await self._in_thread(self._render_normal, True)
-
-                await self.expand_frame(FrameType.MESSAGES, [
-                    (f"welcome {self.user_name}!", "large", COLORS['lavender']),
-                    ("", None, None),
-                    (f"crew: {crew_code}", "normal", COLORS['green']),
-                    ("share with friends", "small", COLORS['white']),
-                    ("", None, None),
-                    ("scan QR to connect", "normal", COLORS['tan']),
-                    ("Telegram", "large", COLORS['tan']),
-                    ("", None, None),
-                    ('ask leeloo "setup help"', "small", COLORS['lavender']),
-                    ("anytime you forget", "small", COLORS['lavender']),
-                ], duration=60.0)
-
-            if show_spotify and not self._has_live_spotify():
-                qr_path = await self._in_thread(
-                    self._generate_qr_image, self._generate_spotify_oauth_url(),
-                    "scan to sync", "your Spotify", COLORS['green'], "(optional)")
-                if qr_path:
-                    self.album_art_path = qr_path
-                    await self._in_thread(self._render_normal, True)
-
-                await self.expand_frame(FrameType.MESSAGES, [
-                    ("one more thing...", "large", COLORS['green']),
-                    ("", None, None),
-                    ("scan QR to sync", "normal", COLORS['green']),
-                    ("your Spotify", "large", COLORS['green']),
-                    ("", None, None),
-                    ("shows what you're", "small", COLORS['white']),
-                    ("currently listening to", "small", COLORS['white']),
-                    ("", None, None),
-                    ("tap device to skip", "small", HINT_COLOR),
-                ], duration=60.0)
-
+            qr_path = await self._in_thread(self._generate_qr_image, *make_qr_args)
+            if qr_path:
+                self.album_art_path = qr_path
+                await self._in_thread(self._render_normal, True)
+            await self.expand_frame(FrameType.MESSAGES, lines, duration=duration)
         finally:
             self._welcome_qr_active = False
             sharing_img = os.path.join(LEELOO_HOME, 'leeloo_for_sharing.png')
@@ -1677,6 +1702,73 @@ class LeelooBrain:
             except OSError:
                 pass
             self._wake_display()
+
+    async def _spotify_qr_frame(self, intro="connect spotify"):
+        """QR code that links the user's Spotify account (60 s, tap to skip)."""
+        if not self.ws_client.config.device_id:
+            # The server routes the tokens by device id. Without it the QR
+            # would send the tokens nowhere.
+            await self.expand_frame(FrameType.MESSAGES, [
+                ("not ready yet", "large", COLORS['rose']),
+                ("", None, None),
+                *format_display_text("no link to the leeloo server. check wifi, then say "
+                                     '"connect spotify".', COLORS['white']),
+            ], duration=10.0)
+            return
+        await self._qr_frame(
+            (self._generate_spotify_oauth_url(), "scan to sync", "your Spotify", COLORS['green']),
+            [
+                (intro, "large", COLORS['green']),
+                ("", None, None),
+                ("scan QR to sync", "normal", COLORS['green']),
+                ("your Spotify", "large", COLORS['green']),
+                ("", None, None),
+                ("shows what you're", "small", COLORS['white']),
+                ("listening to now", "small", COLORS['white']),
+                ("", None, None),
+                ("tap device to skip", "small", HINT_COLOR),
+            ])
+
+    def _show_spotify_qr(self):
+        """Voice command "connect spotify"."""
+        if self._has_live_spotify():
+            self.show_frame(FrameType.ALBUM, [
+                ("spotify is connected", "large", COLORS['green']),
+            ], duration=6.0, from_voice=True)
+        else:
+            self._start_frame_task(self._spotify_qr_frame)
+
+    async def _show_welcome_with_qr(self):
+        """First-boot welcome:
+        Phase 1: Telegram QR (if the user chose Telegram at setup) — 60s
+        Phase 2: Spotify QR (if Spotify is not connected) — 60s
+        Later: say "connect spotify" or "telegram setup" to see them again."""
+        crew_code = self._crew_code()
+        if self.device_config.get('telegram_opted_in', False) and crew_code:
+            await self._qr_frame(
+                (f"https://t.me/Leeloo2259_bot?start={crew_code.replace('-', '')}",
+                 "scan for Telegram", crew_code, COLORS['lavender']),
+                [
+                    (f"welcome {self.user_name}!", "large", COLORS['lavender']),
+                    ("", None, None),
+                    (f"crew: {crew_code}", "normal", COLORS['green']),
+                    ("share with friends", "small", COLORS['white']),
+                    ("", None, None),
+                    ("scan QR to connect", "normal", COLORS['tan']),
+                    ("Telegram", "large", COLORS['tan']),
+                    ("", None, None),
+                    ('say "telegram setup"', "small", COLORS['lavender']),
+                    ("to see this again", "small", COLORS['lavender']),
+                ])
+
+        if not self._has_live_spotify():
+            # The relay connection supplies the device id for the QR. Wait a little.
+            for _ in range(20):
+                if self.ws_client.config.device_id:
+                    break
+                await asyncio.sleep(0.5)
+            if self.ws_client.config.device_id:
+                await self._spotify_qr_frame(intro="one more thing...")
 
     # =========================================================================
     # RUN
@@ -1710,8 +1802,7 @@ class LeelooBrain:
         print("[BRAIN] All subsystems started. LEELOO is alive!")
 
         if is_first_boot:
-            self._welcome_qr_active = True  # BEFORE the task starts
-            self._expand_task = asyncio.create_task(self._show_welcome_with_qr())
+            self._start_frame_task(self._show_welcome_with_qr)
 
         try:
             await asyncio.gather(*tasks)

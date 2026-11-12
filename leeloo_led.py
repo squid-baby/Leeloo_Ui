@@ -58,6 +58,11 @@ class LEDManager:
         self._ambient_state = None      # "idle" | "playing" | None
         self._ambient_task = None       # asyncio task for ambient breathe
 
+        # True while the microphone records. WS2812B (PWM DMA) and the I2S
+        # mic share the DMA controller: ANY LED write during recording kills
+        # the audio. While this is True no animation can start.
+        self.recording = False
+
         # Hardware
         if HARDWARE_AVAILABLE:
             led_pin = pin or board.D12
@@ -105,6 +110,9 @@ class LEDManager:
     async def _run_animation(self, name, coro):
         """Run a transient animation, cancelling any existing one.
         Ambient breathe is suspended during the animation and resumes after."""
+        if self.recording:
+            coro.close()      # never animate while the microphone records
+            return
         await self._cancel_ambient()
         await self._cancel_current()
         self._current_animation = name
@@ -134,7 +142,15 @@ class LEDManager:
     def _start_ambient_task(self):
         """Spawn the ambient breathe coroutine as a background task.
         Reads _ambient_state dynamically each tick so color changes don't
-        require a cancel/restart (avoids the OFF-flash flicker)."""
+        require a cancel/restart (avoids the OFF-flash flicker).
+
+        Idempotent: there is never more than ONE ambient task. (Two callers
+        used to start one each; the first lost its reference, could not be
+        cancelled, and kept the LEDs active during every later recording.)"""
+        if self.recording:
+            return
+        if self._ambient_task and not self._ambient_task.done():
+            return
 
         async def _breathe():
             start = time.time()
@@ -168,6 +184,10 @@ class LEDManager:
             self._ambient_task and not self._ambient_task.done()
         )
 
+        if self.recording:
+            self._ambient_state = state   # applied when recording ends
+            return
+
         if state and ambient_already_running:
             # Just update color — running _breathe() picks it up next tick
             if state != self._ambient_state:
@@ -189,6 +209,8 @@ class LEDManager:
 
     async def ack(self):
         """Quick green flash — tap acknowledgment (100ms)"""
+        if self.recording:
+            return
         print("[LED] ack (green flash)")
         await self._cancel_ambient()
         await self._cancel_current()
@@ -202,14 +224,16 @@ class LEDManager:
     async def listening(self):
         """Solid green — mic is recording (suspends ambient until off() is called)"""
         print("[LED] listening (solid green)")
+        self.recording = True      # blocks every animation until off()/processing()/error()
         await self._cancel_ambient()
         await self._cancel_current()
         self._current_animation = "listening"
-        self._set_color(GREEN)
+        self._set_color(GREEN)     # one write, before the microphone starts
 
     async def processing(self):
         """Pulsing green breathe — waiting for STT/LLM response"""
         print("[LED] processing (green breathe)")
+        self.recording = False
 
         async def _breathe():
             while True:
@@ -270,6 +294,7 @@ class LEDManager:
     async def error(self):
         """Red flash — something went wrong"""
         print("[LED] error (red flash)")
+        self.recording = False
 
         async def _flash():
             for _ in range(2):
@@ -287,6 +312,7 @@ class LEDManager:
         # ambient after cancellation — don't also restart here or we get two
         # concurrent ambient tasks and the orphaned one can't be cancelled,
         # leaving DMA active and killing I2S audio on the next tap.
+        self.recording = False
         has_run_animation_task = bool(
             self._animation_task and not self._animation_task.done()
         )
@@ -297,6 +323,7 @@ class LEDManager:
 
     async def off_all(self):
         """Turn off everything including ambient (e.g. for shutdown)"""
+        self.recording = False
         self._ambient_state = None
         await self._cancel_ambient()
         await self._cancel_current()

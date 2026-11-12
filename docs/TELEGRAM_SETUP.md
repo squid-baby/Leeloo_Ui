@@ -89,7 +89,7 @@ To make the bot actually send messages to your devices, you need:
 
 ### Missing Pieces:
 
-- [ ] Relay server implementation (`leeloo_server/relay_server.py` exists but incomplete)
+- [x] Relay server (`leeloo_server/server.js`)
 - [ ] WebSocket client on Pi devices
 - [ ] Bot → Server → Device message flow
 
@@ -99,7 +99,7 @@ To make the bot actually send messages to your devices, you need:
 ```bash
 # On a cloud server (not the Pi)
 cd leeloo_server
-python3 relay_server.py
+npm install && npm start
 ```
 
 ### Phase 2: Update Pi Devices

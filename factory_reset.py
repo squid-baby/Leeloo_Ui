@@ -11,7 +11,7 @@ import subprocess
 import shutil
 
 # Paths to wipe
-LEELOO_HOME = "/home/pi/leeloo-ui"
+LEELOO_HOME = os.environ.get("LEELOO_HOME", "/home/pi/leeloo-ui")
 DATA_FILES = [
     ".first_run_complete",
     "wifi_config.json",
@@ -19,12 +19,19 @@ DATA_FILES = [
     "device_config.json",
     "hang_data.json",
     "leeloo_config.json",
+    # Personal data of the previous owner
+    "spotify_tokens.json",     # Spotify login
+    "messages.json",           # crew messages
+    "current_music.json",
+    ".welcome_sent",
+    ".welcome_qr.png",
 ]
 
 ALBUM_ART_DIR = os.path.join(LEELOO_HOME, "album_art")
 
 # Files to remove from home dir
 HOME_FILES = [
+    "/home/pi/leeloo_data.json",          # next hang
     "/home/pi/doorways-album.jpg",
     "/home/pi/leeloo_config.json",
 ]

@@ -488,9 +488,14 @@ def setup_wifi():
                 const data = await fetchJSON('/api/networks');
                 const select = document.getElementById('ssid');
                 if (data.networks && data.networks.length > 0) {{
-                    select.innerHTML = data.networks.map(n =>
-                        '<option value="' + n + '">' + n + '</option>'
-                    ).join('');
+                    // SSIDs are untrusted text: never build HTML from them
+                    select.innerHTML = '';
+                    data.networks.forEach(n => {{
+                        const opt = document.createElement('option');
+                        opt.value = n;
+                        opt.textContent = n;
+                        select.appendChild(opt);
+                    }});
                 }} else {{
                     select.innerHTML = '<option value="">no networks found</option>';
                 }}
@@ -1097,7 +1102,7 @@ def api_telegram_optin():
 @app.route('/api/finish', methods=['POST'])
 def api_finish():
     """Mark setup complete and trigger WiFi connection"""
-    save_device_config({'setup_complete': True})
+    save_device_config({'setup_complete': True, 'wifi_error': None})
 
     setup_state['step'] = 'done'
     update_lcd('success')

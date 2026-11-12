@@ -34,7 +34,7 @@ API_TIMEOUT_S = 15.0
 ACTIONS = (
     "WEATHER_EXPAND", "MESSAGE_SEND", "MESSAGE_READOUT", "ALBUM_INFO",
     "SONG_PUSH", "HANG_PROPOSE", "HANG_CONFIRM", "NUDGE", "TELEGRAM_SETUP",
-    "TIME_QUERY", "UNKNOWN",
+    "SPOTIFY_SETUP", "TIME_QUERY", "UNKNOWN",
 )
 
 # STATIC. No .format(), no dates, no device state. Any change to this text
@@ -43,7 +43,7 @@ SYSTEM_PROMPT = """You are LEELOO's brain — a retro music-sharing gadget share
 
 Respond with one JSON object only (no markdown, no code fences, no other text):
 {
-  "action": "WEATHER_EXPAND|MESSAGE_SEND|MESSAGE_READOUT|ALBUM_INFO|SONG_PUSH|HANG_PROPOSE|HANG_CONFIRM|NUDGE|TELEGRAM_SETUP|TIME_QUERY|UNKNOWN",
+  "action": "WEATHER_EXPAND|MESSAGE_SEND|MESSAGE_READOUT|ALBUM_INFO|SONG_PUSH|HANG_PROPOSE|HANG_CONFIRM|NUDGE|TELEGRAM_SETUP|SPOTIFY_SETUP|TIME_QUERY|UNKNOWN",
   "params": { },
   "display_text": "text to show on the retro LCD screen (keep under 200 chars)"
 }
@@ -57,7 +57,8 @@ Action details:
 - HANG_PROPOSE: User wants to schedule hanging out. Extract params.datetime as ISO 8601 local time without a timezone (example: 2026-03-27T19:00:00). Resolve relative dates ("saturday", "tomorrow") from the "Now" line of the device state. The date must be in the future. Extract params.description. If vague like "this weekend", make reasonable assumptions. display_text = short confirmation of what was proposed, from the proposer's POV, e.g. "saturday 8pm – your place?" — NOT "let me know if that works".
 - HANG_CONFIRM: User confirms/agrees to a hang ("I'm in", "yes", "sounds good", "confirmed", etc.). Set params.confirm=true. display_text = short enthusiastic confirmation, e.g. "you're in!" or "locked in."
 - NUDGE: User wants to nudge/wink/poke friends. Set params.nudge=true.
-- TELEGRAM_SETUP: User asks about Telegram setup, how to message from phone, or how to connect Telegram. Set params.telegram=true.
+- TELEGRAM_SETUP: User asks about Telegram setup, how to message from phone, how to connect Telegram, or says "setup help". Set params.telegram=true.
+- SPOTIFY_SETUP: User wants to connect, link, or sync their Spotify account ("connect spotify", "spotify setup", "show my music"). Set params.spotify=true.
 - TIME_QUERY: User asks about the time, date, or "what time is it". Set params.time=true. display_text is NOT used for this action (will be generated separately).
 - UNKNOWN: Can't determine intent. display_text = a brief confused but friendly response that suggests one thing the user can say.
 
@@ -94,12 +95,9 @@ def ask_claude(client, system: str, user: str, max_tokens: int = 400) -> str:
         }],
         messages=[{"role": "user", "content": user}],
     )
-    try:
-        # These are short classification/copy tasks: skip thinking for speed.
-        response = client.messages.create(thinking={"type": "disabled"}, **kwargs)
-    except TypeError:
-        # Very old SDK without the `thinking` argument
-        response = client.messages.create(**kwargs)
+    # Short classification/copy tasks: skip thinking for speed.
+    # (Needs anthropic >= 0.79, see requirements.txt.)
+    response = client.messages.create(thinking={"type": "disabled"}, **kwargs)
 
     if getattr(response, "stop_reason", None) == "refusal":
         print("[INTENT] Claude declined the request")

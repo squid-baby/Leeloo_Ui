@@ -219,6 +219,19 @@ class _Session:
         self.interim = ""
 
 
+async def _read_with_timeout(stream, n, timeout):
+    """Read up to n bytes or raise asyncio.TimeoutError.
+
+    Uses asyncio.timeout() where it exists (Python 3.11+, the Pi). On
+    Python <= 3.11, asyncio.wait_for() can swallow a task cancellation that
+    arrives in the same loop step as the data, and the recording then runs
+    on after it was cancelled."""
+    if hasattr(asyncio, "timeout"):
+        async with asyncio.timeout(timeout):
+            return await stream.read(n)
+    return await asyncio.wait_for(stream.read(n), timeout=timeout)
+
+
 class VoiceManager:
     """Async voice recording + Deepgram streaming STT"""
 
@@ -349,10 +362,7 @@ class VoiceManager:
                 break
 
             try:
-                chunk = await asyncio.wait_for(
-                    process.stdout.read(CHUNK_BYTES),
-                    timeout=READ_TIMEOUT
-                )
+                chunk = await _read_with_timeout(process.stdout, CHUNK_BYTES, READ_TIMEOUT)
             except asyncio.TimeoutError:
                 print("[VOICE] Read timeout")
                 break

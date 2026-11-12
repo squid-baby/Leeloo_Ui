@@ -151,8 +151,8 @@ sudo systemctl stop gadget.service
 # Run the weather expansion demo
 python3 demo_weather_typewriter.py
 
-# Run the UI manager demo
-python3 leeloo_ui_manager.py
+# Run the automated tests (no Pi needed)
+python3 -m pytest
 
 # Run the reaction GIF demo
 python3 demo_message_expand.py
@@ -206,8 +206,7 @@ TipTop UI/
 ├── leeloo_client.py         # WebSocket relay client
 ├── leeloo_music_manager.py  # Spotify currently playing + listeners
 ├── leeloo_album_art.py      # Centralized album art (243x304)
-├── leeloo_spotify.py        # Spotify scancode generation
-├── gadget_main.py           # Legacy main loop (replaced by brain)
+├── tests/                   # Automated tests (python3 -m pytest)
 ├── gadget_display.py        # LeelooDisplay renderer
 ├── gadget_weather.py        # Open-Meteo weather API
 ├── text_scroller.py         # Text truncation utilities

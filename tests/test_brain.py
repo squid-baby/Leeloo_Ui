@@ -458,3 +458,226 @@ def test_fatal_error_exits_with_code_1(monkeypatch):
     with pytest.raises(SystemExit) as e:
         brain_mod.main()
     assert e.value.code == 1
+
+
+# =============================================================================
+# Review round 2: defects found by independent review
+# =============================================================================
+
+def ambient_tasks():
+    return [t for t in asyncio.all_tasks()
+            if not t.done() and "_breathe" in repr(t.get_coro()) and "_start_ambient_task" in repr(t.get_coro())]
+
+
+def test_no_led_task_survives_into_a_recording(brain):
+    """A nudge animation + tap used to leave an ambient task that nobody could cancel."""
+    brain.voice = FakeVoice(transcript="", delay=0.3)
+    seen = {}
+
+    async def go():
+        await brain.led.set_ambient("idle")
+        brain._on_ws_nudge("Amy")                  # 30 s LED animation + frame
+        await asyncio.sleep(0.1)
+        brain.dismiss_frame()
+        await asyncio.sleep(0.2)
+        tap = asyncio.ensure_future(brain._on_tap('single_tap'))
+        await asyncio.sleep(0.25)
+        seen['state'] = brain.ui_state
+        seen['recording'] = brain.led.recording
+        seen['ambient_during'] = len(ambient_tasks())
+        brain._on_ws_message("Ben", "hi")          # LED blink must not start now
+        await asyncio.sleep(0.02)
+        seen['anim_during'] = brain.led._current_animation
+        await tap
+        await settle(brain)
+        await asyncio.sleep(1.5)                   # message blink animation ends
+        seen['ambient_after'] = len(ambient_tasks())
+        await brain.led.off_all()
+    asyncio.run(go())
+    assert seen['state'] == UIState.LISTENING and seen['recording'] is True
+    assert seen['ambient_during'] == 0
+    assert seen['anim_during'] == "listening"
+    assert seen['ambient_after'] == 1              # exactly one, never two
+
+
+def test_led_manager_blocks_animations_while_recording():
+    from leeloo_led import LEDManager
+
+    async def go():
+        led = LEDManager()
+        await led.set_ambient("idle")
+        led._start_ambient_task(); led._start_ambient_task()
+        assert len(ambient_tasks()) == 1
+        await led.listening()
+        await led.ack(); await led.message_received(); await led.nudge(duration=1)
+        await led.set_ambient("playing")
+        assert led._current_animation == "listening" and len(ambient_tasks()) == 0
+        await led.off()
+        assert led.recording is False and len(ambient_tasks()) == 1
+        assert led._ambient_state == "playing"     # change made during recording is kept
+        await led.off_all()
+    asyncio.run(go())
+
+
+def test_tap_during_slow_intent_does_not_start_second_session(brain, monkeypatch):
+    async def slow_time():
+        await asyncio.sleep(0.4)
+        return "the hour is late"
+    monkeypatch.setattr(brain, "_generate_cosmic_time", slow_time)
+    brain.intent_router = FakeRouter(Intent("TIME_QUERY", {}, ""))
+
+    async def go():
+        first = asyncio.ensure_future(brain._on_tap('single_tap'))
+        await asyncio.sleep(0.25)                  # voice done, intent still running
+        assert brain._voice_busy and brain.ui_state == UIState.PROCESSING
+        await brain._on_tap('single_tap')
+        await first
+        await settle(brain)
+    asyncio.run(go())
+    assert brain.voice.calls == 1
+    assert "the hour is late" in frame_text(brain)
+
+
+def test_double_tap_nudge_frame_is_deferred_during_recording(brain):
+    brain.voice = FakeVoice(transcript="", delay=0.4)
+    real_send = brain.ws_client.send_nudge
+
+    async def slow_send():
+        await asyncio.sleep(0.2)
+        return await real_send()
+    brain.ws_client.send_nudge = slow_send
+
+    async def go():
+        double = asyncio.ensure_future(brain._on_tap('double_tap'))
+        await asyncio.sleep(0.05)
+        single = asyncio.ensure_future(brain._on_tap('single_tap'))
+        await asyncio.sleep(0.3)                   # nudge sent while recording
+        assert brain.ui_state == UIState.LISTENING and not brain.frames
+        await asyncio.gather(double, single)
+        await settle(brain)
+    asyncio.run(go())
+    assert "nudge sent" in frame_text(brain)
+
+
+def test_remote_confirm_without_a_proposal_does_not_claim_confirmed(brain):
+    async def go():
+        brain._on_ws_hang_confirm("Amy")
+        await settle(brain)
+    asyncio.run(go())
+    assert "hang confirmed!" not in frame_text(brain)
+    assert brain_mod.gadget_data.get_next_hang() is None
+
+
+def test_pending_hang_survives_restart(brain):
+    when = (datetime.now() + timedelta(days=3)).replace(microsecond=0)
+    run_voice(brain, Intent("HANG_PROPOSE", {"datetime": when.isoformat()}, "sat?"))
+    assert brain._pending_hang_dt
+    second = LeelooBrain()                         # simulated restart
+    assert second._pending_hang_dt == brain._pending_hang_dt
+    second._pending_hang_dt = None
+    assert brain._pending_hang_dt is None
+
+
+def test_queued_old_or_expired_items_are_not_counted(brain):
+    async def go():
+        brain._on_ws_queued("Amy", "text", {"text": "old"}, time.time() - 90000)
+        brain._on_ws_queued("Amy", "hang_propose", {"datetime": "2020-01-01T10:00:00"}, time.time())
+        await asyncio.sleep(0.05)
+    asyncio.run(go())
+    assert brain._queued_count == 0 and not brain.message_mgr.get_unread_counts()
+
+
+def test_music_polling_tiers(brain):
+    now = time.time()
+    brain.last_music_fetch = 0
+    assert brain._music_interval(now) == 0                       # first fetch at once
+    brain.last_music_fetch = now
+    brain.music_data = {'is_playing': True}
+    assert brain._music_interval(now) == brain_mod.MUSIC_REFRESH_INTERVAL
+    brain.music_data = {'is_playing': False, 'last_updated': now}  # paused track, polled just now
+    brain._last_playing_at = now - 100
+    assert brain._music_interval(now) == 60
+    brain._last_playing_at = now - 400
+    assert brain._music_interval(now) == 120                     # reaches the idle tier
+    brain.music_data = None
+    assert brain._music_interval(now) == 120
+
+
+class JoinClient(FakeClient):
+    def __init__(self, crew_id=""):
+        super().__init__()
+        self.config.crew_id = crew_id
+        self.created = 0
+    async def connect(self): self.connected = True; return True
+    async def rejoin_crew(self): return False
+    async def create_crew(self, name): self.created += 1; return None
+    async def listen(self): await asyncio.sleep(10)
+    async def keepalive(self): await asyncio.sleep(10)
+
+
+def run_ws_loop(brain, seconds=0.4):
+    async def go():
+        task = asyncio.ensure_future(brain._ws_connection_loop())
+        await asyncio.sleep(seconds)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        brain.dismiss_frame()
+        await settle(brain)
+    asyncio.run(go())
+
+
+def test_wrong_join_code_does_not_create_a_crew(brain):
+    brain.ws_client = JoinClient()
+    brain.crew_config = {'invite_code': 'LEELOO-ABCD', 'is_creator': False}
+    run_ws_loop(brain)
+    assert brain.ws_client.created == 0
+    assert "crew not found" in frame_text(brain)
+
+
+@pytest.mark.parametrize("config,crew_id", [({'is_creator': True}, ""), ({'is_creator': False}, "LEELOO-ABCD")])
+def test_creator_or_former_member_recreates_crew_after_server_reset(brain, config, crew_id):
+    brain.ws_client = JoinClient(crew_id=crew_id)
+    brain.crew_config = config
+    run_ws_loop(brain)
+    assert brain.ws_client.created == 1
+    assert "crew not found" not in frame_text(brain)
+
+
+def test_spotify_setup_intent_shows_qr_and_restores_art(brain, monkeypatch):
+    monkeypatch.setattr(brain, "_generate_qr_image", lambda *a: None)
+    brain.album_art_path = None
+    run_voice(brain, Intent("SPOTIFY_SETUP", {}, ""))
+    assert "connect spotify" in frame_text(brain)
+    assert brain._welcome_qr_active is False
+
+    brain.frames.clear()
+    brain.ws_client.config.device_id = ""
+    run_voice(brain, Intent("SPOTIFY_SETUP", {}, ""))
+    assert "not ready yet" in frame_text(brain)
+
+    brain.frames.clear()
+    monkeypatch.setattr(brain, "_has_live_spotify", lambda: True)
+    run_voice(brain, Intent("SPOTIFY_SETUP", {}, ""))
+    assert "spotify is connected" in frame_text(brain)
+
+
+def test_missing_spotify_secret_is_explained(brain, monkeypatch):
+    monkeypatch.delenv("SPOTIFY_CLIENT_SECRET", raising=False)
+    monkeypatch.setattr(brain_mod.music_manager, "search_and_save_shared", lambda q, by: None)
+    run_voice(brain, Intent("SONG_PUSH", {"query": "a song"}, ""))
+    assert "spotify is off" in frame_text(brain)
+
+
+def test_first_boot_welcome_runs_and_cleans_up(brain, monkeypatch):
+    monkeypatch.setattr(brain, "_generate_qr_image", lambda *a: None)
+    brain.device_config = {'telegram_opted_in': True}
+    brain.crew_config = {'invite_code': 'LEELOO-ABCD'}
+    brain.user_name = "nat"
+
+    async def go():
+        brain._start_frame_task(brain._show_welcome_with_qr)
+        await settle(brain, timeout=15)
+    asyncio.run(go())
+    text = frame_text(brain)
+    assert "welcome nat!" in text and "one more thing..." in text
+    assert brain._welcome_qr_active is False
