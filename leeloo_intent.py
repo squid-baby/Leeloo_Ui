@@ -29,7 +29,7 @@ except ImportError:
 # Do not add a date suffix. Override with LEELOO_CLAUDE_MODEL in .env.
 CLAUDE_MODEL = os.environ.get("LEELOO_CLAUDE_MODEL", "claude-haiku-5-5")
 
-API_TIMEOUT_S = 15.0
+API_TIMEOUT_S = 12.0
 
 ACTIONS = (
     "WEATHER_EXPAND", "MESSAGE_SEND", "MESSAGE_READOUT", "ALBUM_INFO",
@@ -50,17 +50,20 @@ Respond with one JSON object only (no markdown, no code fences, no other text):
 
 Action details:
 - WEATHER_EXPAND: User asks about weather. display_text = friendly weather summary that uses ONLY the weather data in the device state (temp, conditions, UV, rain). Include outfit/umbrella advice if relevant. If the device state says weather is not available, say that you can't reach the weather right now. Never invent numbers.
-- MESSAGE_SEND: User wants to send a message to friends. Extract the actual message in params.message (just the content, not "tell them" etc).
+- MESSAGE_SEND: User wants to send a text message to friends. Every message goes to the whole crew. Extract the actual message in params.message (just the content, not "tell them" etc). If the user addressed one person ("tell Jen I'm late"), keep the name in the message ("Jen: I'm late").
 - MESSAGE_READOUT: User asks "what did I miss" or "any messages" or "read messages". Set params.readout=true.
 - ALBUM_INFO: User asks about current song/artist. display_text = 2-3 fun sentences about the artist/track named in the device state. Be conversational and interesting. If the device state says nothing is playing, say so.
-- SONG_PUSH: User wants to share/send a specific song. Extract params.query (search terms for Spotify: artist and title). If they say "send this song" with no specifics, set params.current=true.
+- SONG_PUSH: User wants to share/send a song to the crew (words like share, send, push). "play <song>" is NOT a share. Extract params.query (search terms for Spotify: artist and title). If they say "send this song" / "share this" with no specifics, set params.current=true.
 - HANG_PROPOSE: User wants to schedule hanging out. Extract params.datetime as ISO 8601 local time without a timezone (example: 2026-03-27T19:00:00). Resolve relative dates ("saturday", "tomorrow") from the "Now" line of the device state. The date must be in the future. Extract params.description. If vague like "this weekend", make reasonable assumptions. display_text = short confirmation of what was proposed, from the proposer's POV, e.g. "saturday 8pm – your place?" — NOT "let me know if that works".
-- HANG_CONFIRM: User confirms/agrees to a hang ("I'm in", "yes", "sounds good", "confirmed", etc.). Set params.confirm=true. display_text = short enthusiastic confirmation, e.g. "you're in!" or "locked in."
+- HANG_CONFIRM: User confirms/agrees to a hang ("I'm in", "yes", "sounds good", "confirmed", etc.). Use it ONLY when the device state shows a pending hang proposal or a next confirmed hang; with neither, a bare "yes" or "sounds good" is UNKNOWN. Set params.confirm=true.
 - NUDGE: User wants to nudge/wink/poke friends. Set params.nudge=true.
 - TELEGRAM_SETUP: User asks about Telegram setup, how to message from phone, how to connect Telegram, or says "setup help". Set params.telegram=true.
 - SPOTIFY_SETUP: User wants to connect, link, or sync their Spotify account ("connect spotify", "spotify setup", "show my music"). Set params.spotify=true.
 - TIME_QUERY: User asks about the time, date, or "what time is it". Set params.time=true. display_text is NOT used for this action (will be generated separately).
-- UNKNOWN: Can't determine intent. display_text = a brief confused but friendly response that suggests one thing the user can say.
+- UNKNOWN: Everything else. display_text = a brief friendly answer. Rules:
+  - If the user asks when the next hang is, answer from "Next confirmed hang" / "Pending hang proposal" in the device state.
+  - LEELOO cannot play music, cancel a hang, give a weather forecast for other days, or message one person only (messages go to the whole crew). If asked for one of these, say so in a few words and suggest what works instead (e.g. 'i can't play music. say "share" and the song to send it to your crew').
+  - If you can't determine the intent, give a brief confused but friendly response that suggests one thing the user can say.
 
 Keep display_text concise — this shows on a small 480x320 retro LCD. Use lowercase, casual tone. No emojis.
 If the user just says something conversational like "hey" or "thanks", treat as UNKNOWN with a friendly response."""
@@ -204,7 +207,19 @@ class IntentRouter:
             print(f"[INTENT] Error: {e}")
             import traceback
             traceback.print_exc()
-            return Intent(action="UNKNOWN", response_text="can't reach my brain right now. check wifi and try again")
+            return Intent(action="UNKNOWN", response_text=api_error_text(e))
+
+
+def api_error_text(error) -> str:
+    """Screen text for a failed Claude call. Tells the user what to check."""
+    name = type(error).__name__
+    if name in ("AuthenticationError", "PermissionDeniedError"):
+        return "my brain key was refused. check ANTHROPIC_API_KEY in the .env file."
+    if name == "NotFoundError":
+        return f"my brain model ({CLAUDE_MODEL}) was not found. check LEELOO_CLAUDE_MODEL."
+    if name == "RateLimitError":
+        return "my brain is busy right now. try again in a minute."
+    return "can't reach my brain right now. check wifi and try again."
 
 
 def _contact_name(contact) -> str:
@@ -215,7 +230,8 @@ def _contact_name(contact) -> str:
 
 
 def build_context(weather_data=None, music_data=None, contacts=None, messages=None,
-                  now: Optional[datetime] = None, pending_hang: Optional[str] = None):
+                  now: Optional[datetime] = None, pending_hang: Optional[str] = None,
+                  next_hang: Optional[str] = None):
     """
     Build the device-state text for the intent router.
 
@@ -279,8 +295,8 @@ def build_context(weather_data=None, music_data=None, contacts=None, messages=No
         parts.append(f"Crew members: {', '.join(names)}")
 
     # Hang proposal waiting for an answer
-    if pending_hang:
-        parts.append(f"Pending hang proposal: {pending_hang}")
+    parts.append(f"Pending hang proposal: {pending_hang or 'none'}")
+    parts.append(f"Next confirmed hang: {next_hang or 'none'}")
 
     # Recent messages (input is newest first; show oldest -> newest)
     if messages:

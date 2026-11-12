@@ -53,6 +53,7 @@ class LEDManager:
         self._current_animation = None  # name of current transient animation
         self._animation_task = None     # asyncio task for current transient animation
         self._running = False
+        self._animations_active = 0     # _run_animation calls in progress
 
         # Ambient background state (persists across transient animations)
         self._ambient_state = None      # "idle" | "playing" | None
@@ -113,8 +114,18 @@ class LEDManager:
         if self.recording:
             coro.close()      # never animate while the microphone records
             return
-        await self._cancel_ambient()
-        await self._cancel_current()
+        self._animations_active += 1
+        try:
+            await self._cancel_ambient()
+            await self._cancel_current()
+        except BaseException:
+            self._animations_active -= 1
+            coro.close()
+            raise
+        if self.recording:    # recording started while we waited
+            self._animations_active -= 1
+            coro.close()
+            return
         self._current_animation = name
         self._animation_task = asyncio.create_task(coro)
         try:
@@ -125,8 +136,10 @@ class LEDManager:
             if self._current_animation == name:
                 self._set_color(OFF)
                 self._current_animation = None
-            # Resume ambient breathe if one was active
-            if self._ambient_state:
+            self._animations_active -= 1
+            # Resume ambient breathe if one was active — but not when another
+            # animation replaced this one (ambient would write over it).
+            if self._ambient_state and self._animations_active == 0:
                 self._start_ambient_task()
 
     async def _cancel_ambient(self):
@@ -198,9 +211,11 @@ class LEDManager:
         # Starting fresh or turning off — cancel everything cleanly
         await self._cancel_current()
         await self._cancel_ambient()
+        self._ambient_state = state
+        if self.recording:    # recording started while we waited
+            return
         self._set_color(OFF)
 
-        self._ambient_state = state
         if state:
             print(f"[LED] ambient → {state}")
             self._start_ambient_task()
@@ -214,8 +229,12 @@ class LEDManager:
         print("[LED] ack (green flash)")
         await self._cancel_ambient()
         await self._cancel_current()
+        if self.recording:    # recording started while we waited
+            return
         self._set_color(GREEN)
         await asyncio.sleep(0.1)
+        if self.recording:    # do not write over the solid "listening" green
+            return
         self._set_color(OFF)
         # Resume ambient after the flash
         if self._ambient_state:

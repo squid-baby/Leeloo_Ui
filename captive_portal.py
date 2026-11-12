@@ -1102,6 +1102,12 @@ def api_telegram_optin():
 @app.route('/api/finish', methods=['POST'])
 def api_finish():
     """Mark setup complete and trigger WiFi connection"""
+    # The "done" page calls this on every load. Start the WiFi switch ONCE:
+    # a second run would tear down the connection that the first one makes.
+    if setup_state.get('finish_started'):
+        return jsonify({'success': True})
+    setup_state['finish_started'] = True
+
     save_device_config({'setup_complete': True, 'wifi_error': None})
 
     setup_state['step'] = 'done'

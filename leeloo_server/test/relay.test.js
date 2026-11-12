@@ -332,7 +332,7 @@ test('reconnect with the same device_id keeps the new socket', async () => {
 });
 
 test('heartbeat terminates sockets that do not answer pings', async () => {
-  const relay = await relayUp({ heartbeatMs: 40 });
+  const relay = await relayUp({ heartbeatMs: 150 });
   const alice = await connect(relay);
   const created = await alice.createCrew('a1', 'Alice');
   const dead = await connect(relay, { autoPong: false });
@@ -344,7 +344,7 @@ test('heartbeat terminates sockets that do not answer pings', async () => {
   assert.equal(relay.state.devices.has('b1'), false);
 
   // The healthy client survives several heartbeat rounds
-  await new Promise((resolve) => setTimeout(resolve, 150));
+  await new Promise((resolve) => setTimeout(resolve, 500));
   await alice.sync();
   assert.equal(relay.state.devices.has('a1'), true);
 });

@@ -24,6 +24,7 @@ DATA_FILES = [
     "messages.json",           # crew messages
     "current_music.json",
     ".welcome_sent",
+    ".spotify_offered",
     ".welcome_qr.png",
 ]
 

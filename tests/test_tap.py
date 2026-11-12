@@ -127,7 +127,7 @@ SCENARIOS = {
     "double_015": lambda: _run([0.1, 0.25], 1.0),
     "double_02": lambda: _run([0.1, 0.3], 1.1),
     "double_04": lambda: _run([0.1, 0.5], 1.3),
-    "double_045": lambda: _run([0.1, 0.55], 1.3),
+    "double_045": lambda: _run([0.1, 0.52], 1.3),   # 0.42 s gap: margin for slow machines
     "triple": lambda: _run([0.1, 0.3, 0.5], 1.3),
     "four_fast": lambda: _run([0.1, 0.3, 0.5, 0.7], 1.5),
     "two_singles": lambda: _run([0.1, 1.6], 2.4),

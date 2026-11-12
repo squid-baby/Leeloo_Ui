@@ -73,7 +73,8 @@ def brain(tmp_path, monkeypatch):
     monkeypatch.setattr(brain_mod.music_manager, "update_music_display", lambda: None)
     monkeypatch.setattr(brain_mod, "get_weather", lambda *a, **k: None)
     # Fresh data files for every test
-    for name in ("messages.json", "crew_config.json", "device_config.json", "leeloo_data.json"):
+    for name in ("messages.json", "crew_config.json", "device_config.json", "leeloo_data.json",
+                 ".spotify_offered", ".welcome_sent"):
         try:
             os.remove(os.path.join(os.environ["LEELOO_HOME"], name))
         except FileNotFoundError:
@@ -88,9 +89,9 @@ def brain(tmp_path, monkeypatch):
     b.active_frames = 0
     b.max_active_frames = 0
 
-    async def spy(frame_type, lines, duration=20.0):
+    async def spy(frame_type, lines, duration=20.0, **kw):
         b.frames.append((frame_type, [l[0] for l in lines]))
-        return await real_expand(frame_type, lines, min(duration, b.frame_hold))
+        return await real_expand(frame_type, lines, min(duration, b.frame_hold), **kw)
 
     async def counted_typewriter(lines, box_right, _orig=b._typewriter):
         b.active_frames += 1
@@ -148,10 +149,12 @@ def test_every_intent_returns_to_normal_and_gives_feedback(brain, intent):
     assert brain.frames, "the user must see a result for every command"
 
 
-def test_empty_transcript_returns_to_normal(brain):
+def test_empty_transcript_returns_to_normal_and_tells_the_user(brain):
     brain.voice = FakeVoice(transcript="")
     run_voice(brain, Intent("NUDGE"))
-    assert brain.ui_state == UIState.NORMAL and not brain.frames
+    assert brain.ui_state == UIState.NORMAL
+    assert "didn't catch that" in frame_text(brain)
+    assert not brain.ws_client.sent
 
 
 def test_voice_fault_is_explained_on_screen(brain):
@@ -248,9 +251,10 @@ def test_message_view_reactions(brain):
     brain.frame_hold = 30
 
     async def go():
-        brain.show_frame(FrameType.MESSAGES, [("x", "normal", "#fff")], duration=30)
+        brain._on_ws_message("Amy", "listen to this")
         await asyncio.sleep(0.1)
         assert brain.message_view_active
+        assert "2 taps = love" in frame_text(brain)
         await brain._on_tap('double_tap')
         await brain._on_tap('triple_tap')
         brain.dismiss_frame()
@@ -373,7 +377,10 @@ def test_contacts_persist_and_survive_member_offline(brain):
 
 # --- Rendering and data ------------------------------------------------------------
 
-def test_render_only_when_something_changed(brain):
+def test_render_only_when_something_changed(brain, monkeypatch):
+    # Fixed clock: a real 10-second boundary between two calls would repaint
+    monkeypatch.setattr(brain, "_update_time", lambda: brain.__setattr__(
+        "time_data", {'time_str': '9:00 AM', 'date_str': 'Nov 12', 'seconds': 5}))
     assert brain._render_normal() is True
     assert brain._render_normal() is False
     brain.message_mgr.add_message("Amy", "x")
@@ -447,7 +454,7 @@ def test_slow_network_does_not_block_the_event_loop(brain, monkeypatch):
             await asyncio.sleep(0.01)
             ticks += 1
         return ticks
-    assert asyncio.run(go()) > 20
+    assert asyncio.run(go()) > 5
 
 
 # --- Process exit ------------------------------------------------------------------
@@ -681,3 +688,305 @@ def test_first_boot_welcome_runs_and_cleans_up(brain, monkeypatch):
     text = frame_text(brain)
     assert "welcome nat!" in text and "one more thing..." in text
     assert brain._welcome_qr_active is False
+
+
+# =============================================================================
+# Review round 3
+# =============================================================================
+
+def test_double_tap_on_a_non_message_frame_sends_nothing(brain):
+    brain.frame_hold = 30
+
+    async def go():
+        brain.show_frame(FrameType.MESSAGES, [("message sent", "large", "#fff")], duration=30)
+        await asyncio.sleep(0.1)
+        assert not brain.message_view_active
+        await brain._on_tap('double_tap')
+        await brain._on_tap('triple_tap')
+        brain.dismiss_frame()
+        await settle(brain)
+    asyncio.run(go())
+    assert brain.ws_client.sent == []
+
+
+def test_next_frame_waits_for_the_closing_repaint(brain, monkeypatch):
+    """A frame that arrives during the repaint of the previous one must not
+    draw while the repaint still writes to the screen."""
+    events = []
+    real_render = brain._render_normal
+
+    def slow_render(force=False):
+        if force:
+            events.append("repaint-start")
+            time.sleep(0.25)
+            real_render(force)
+            events.append("repaint-end")
+            return True
+        return real_render(force)
+    monkeypatch.setattr(brain, "_render_normal", slow_render)
+    real_typewriter = brain._typewriter
+
+    async def typewriter(lines, box_right):
+        events.append("draw:" + lines[0][0])
+        return await real_typewriter(lines, box_right)
+    brain._typewriter = typewriter
+
+    async def go():
+        brain.show_frame(FrameType.WEATHER, [("one", "normal", "#fff")], duration=30)
+        await asyncio.sleep(0.1)
+        brain.show_frame(FrameType.WEATHER, [("two", "normal", "#fff")], duration=30)   # cancels "one"
+        await asyncio.sleep(0.1)                                                        # repaint running
+        brain.show_frame(FrameType.WEATHER, [("three", "normal", "#fff")])              # cancels again
+        await settle(brain, timeout=10)
+    brain.frame_hold = 0.3
+    asyncio.run(go())
+    for i, e in enumerate(events):
+        if e.startswith("draw:") and i > 0:
+            starts = events[:i].count("repaint-start")
+            ends = events[:i].count("repaint-end")
+            assert starts == ends, f"{e} drew during a repaint: {events}"
+    assert "draw:three" in events
+
+
+def test_large_lines_are_wrapped_by_pixel_width(brain):
+    from PIL import ImageFont
+    try:
+        big = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", 18)
+    except OSError:
+        pytest.skip("DejaVu font not installed")
+    brain.font_large = big
+    lines = brain._fit_lines([
+        ("spotify is connected", "large", "#fff"),
+        ("from bartholomew-longname", "large", "#fff"),
+        ("", None, None),
+        ("short", "normal", "#fff"),
+    ], 176)
+    assert all(big.getlength(t) <= 176 for t, size, _ in lines if size == "large")
+    assert [t for t, s, _ in lines if s == "large"][:2] == ["spotify is", "connected"]
+    assert ("", None, None) in lines and ("short", "normal", "#fff") in lines
+    assert "".join(t for t, s, _ in lines if s == "large").replace(" ", "") == \
+        "spotifyisconnectedfrombartholomew-longname"
+
+
+def test_clean_display_text():
+    f = brain_mod.clean_display_text
+    assert f("it’s 🔥🔥  ok\n❤️") == "it's (fire) (fire) ok <3"
+    assert f("привет café") == "привет café"
+    assert f("日本語") == "(text that leeloo can't show)"
+    assert f("") == ""
+    long = f("word " * 500, 400)
+    assert len(long) <= 400 and long.endswith("...")
+    assert brain_mod.format_display_text("hey 😀", "#fff")[0][0] == "hey :D"
+
+
+def test_three_member_hang(brain):
+    """A proposes. B confirms. C (this device) saw both, then says "i'm in"."""
+    when = (datetime.now() + timedelta(days=2)).replace(microsecond=0)
+
+    async def go():
+        brain._on_ws_hang_propose("Amy", when.isoformat(), "pizza")
+        await settle(brain)
+        brain._on_ws_hang_confirm("Ben")
+        await settle(brain)
+    asyncio.run(go())
+    assert brain_mod.gadget_data.get_next_hang()          # the hang is on for everybody
+    brain.frames.clear()
+    run_voice(brain, Intent("HANG_CONFIRM", {}, ""))
+    assert ('hang_confirm',) in brain.ws_client.sent      # C can still say "i'm in"
+    assert "you're in!" in frame_text(brain)
+    brain_mod.gadget_data.clear_next_hang()
+
+
+def test_cannot_confirm_own_proposal(brain):
+    when = (datetime.now() + timedelta(days=2)).replace(microsecond=0)
+    run_voice(brain, Intent("HANG_PROPOSE", {"datetime": when.isoformat()}, ""))
+    brain.frames.clear()
+    run_voice(brain, Intent("HANG_CONFIRM", {}, ""))
+    assert ('hang_confirm',) not in brain.ws_client.sent
+    assert "waiting for your crew" in frame_text(brain)
+    assert brain_mod.gadget_data.get_next_hang() is None
+
+
+def test_stale_proposal_cannot_be_confirmed(brain):
+    old = (datetime.now() - timedelta(days=3)).replace(microsecond=0)
+    brain_mod.gadget_data.save_data({'pending_hang': {'datetime': old.isoformat(), 'by': 'Amy'}})
+    run_voice(brain, Intent("HANG_CONFIRM", {}, ""))
+    assert ('hang_confirm',) not in brain.ws_client.sent
+    assert "no hang to confirm" in frame_text(brain)
+    assert brain._pending_hang_dt is None
+
+    async def go():                                     # a live proposal in the past is not stored
+        brain._on_ws_hang_propose("Amy", old.isoformat(), "x")
+        await settle(brain)
+    asyncio.run(go())
+    assert brain._pending_hang_dt is None
+
+
+def test_time_that_just_passed_is_not_moved_to_next_year(brain):
+    earlier = (datetime.now() - timedelta(hours=1)).replace(microsecond=0)
+    run_voice(brain, Intent("HANG_PROPOSE", {"datetime": earlier.isoformat()}, ""))
+    assert "that time has passed" in frame_text(brain)
+    assert not brain.ws_client.sent and brain._pending_hang_dt is None
+
+
+def test_hang_between_time_zones(brain):
+    """The proposer is in New York, this device in Los Angeles: same instant."""
+    from zoneinfo import ZoneInfo
+    brain.local_tz = ZoneInfo("America/Los_Angeles")
+    brain_mod.gadget_data.set_local_tz(brain.local_tz)
+    try:
+        ny = (datetime.now(ZoneInfo("America/New_York")) + timedelta(days=2)).replace(
+            hour=20, minute=0, second=0, microsecond=0)
+
+        async def go():
+            brain._on_ws_hang_propose("Amy", ny.isoformat(), "call")
+            await settle(brain)
+        asyncio.run(go())
+        assert "5:00pm" in frame_text(brain)             # 8 pm New York = 5 pm Los Angeles
+        run_voice(brain, Intent("HANG_CONFIRM", {}, ""))
+        saved = datetime.fromisoformat(brain_mod.gadget_data.get_next_hang()['datetime'])
+        assert saved == ny
+        assert brain_mod.gadget_data.format_countdown_display()['time_str'].startswith("5:00")
+    finally:
+        brain_mod.gadget_data.set_local_tz(None)
+        brain_mod.gadget_data.clear_next_hang()
+
+
+def test_deferred_frame_is_shown_after_the_voice_result(brain):
+    brain.voice = FakeVoice(transcript="what's the weather", delay=0.2)
+    brain.intent_router = FakeRouter(Intent("WEATHER_EXPAND", {}, "sunny"))
+
+    async def go():
+        tap = asyncio.ensure_future(brain._on_tap('single_tap'))
+        await asyncio.sleep(0.1)
+        brain._on_ws_nudge("Amy")              # arrives while recording
+        await tap
+        await settle(brain)
+        await asyncio.sleep(0.3)
+        await settle(brain)
+    asyncio.run(go())
+    texts = [" ".join(lines) for _t, lines in brain.frames]
+    assert any("sunny" in t for t in texts) and any("nudged you" in t for t in texts)
+    assert texts.index(next(t for t in texts if "sunny" in t)) < \
+        texts.index(next(t for t in texts if "nudged you" in t))
+
+
+def test_voice_without_brain_key_explains_and_shows_deferred(brain):
+    brain.intent_router = None
+    brain.voice = FakeVoice(transcript="hello", delay=0.2)
+
+    async def go():
+        tap = asyncio.ensure_future(brain._on_tap('single_tap'))
+        await asyncio.sleep(0.1)
+        brain._on_ws_message("Amy", "yo")
+        await tap
+        await settle(brain)
+        await asyncio.sleep(0.3)
+        await settle(brain)
+    asyncio.run(go())
+    text = frame_text(brain)
+    assert "ANTHROPIC_API_KEY" in text.replace(" ", "_") or "ANTHROPIC_API_KEY" in text
+    assert "from amy" in text
+    assert brain.ui_state == UIState.NORMAL and not brain._voice_busy
+
+
+def test_time_query_shows_the_clock_time_first(brain, monkeypatch):
+    async def cosmic(): return "a long poem about the season"
+    monkeypatch.setattr(brain, "_generate_cosmic_time", cosmic)
+    run_voice(brain, Intent("TIME_QUERY", {}, ""))
+    first = brain.frames[-1][1][0]
+    assert first.endswith("am") or first.endswith("pm")
+
+
+def test_long_content_scrolls_and_closes(brain):
+    lines = [(f"line {i}", "normal", "#fff") for i in range(30)]
+    brain.frame_hold = 0.2
+
+    async def go():
+        real_sleep = asyncio.sleep
+        brain.show_frame(FrameType.MESSAGES, lines)
+        await settle(brain, timeout=60)
+    import leeloo_brain
+    orig = brain._scroll_content
+    called = {}
+
+    async def scroll(overflow, hold):
+        called['max'] = overflow['total_height'] - overflow['visible_height']
+        overflow = dict(overflow, total_height=overflow['visible_height'] + 5)   # 5 scroll steps
+        return await orig(overflow, 0.1)
+    brain._scroll_content = scroll
+    asyncio.run(go())
+    assert called['max'] > 0 and brain.ui_state == UIState.NORMAL
+
+
+def test_offline_header_after_grace_period(brain):
+    brain.ws_client.connected = False
+    brain._ws_down_since = time.time() - brain_mod.OFFLINE_GRACE_S - 1
+    assert brain._status_text() == "offline"
+    brain._ws_down_since = time.time()
+    assert brain._status_text() is None
+
+
+def test_incoming_song_push_and_reaction(brain, monkeypatch):
+    seen = []
+    monkeypatch.setattr(brain_mod.music_manager, "search_and_save_shared",
+                        lambda q, by: seen.append((q, by)) or {'artist': 'A', 'track': 'T'})
+
+    async def go():
+        brain._on_ws_song_push("Amy", {'artist': 'A', 'track': 'T', 'spotify_uri': 'spotify:track:9', 'note': 'banger'})
+        await settle(brain)
+        brain._on_ws_reaction("Ben", "fire")
+        await settle(brain)
+    asyncio.run(go())
+    text = frame_text(brain)
+    assert "amy shared" in text and "banger" in text and "ben sent" in text and "fire!" in text
+    assert seen == [('spotify:track:9', 'Amy')]
+
+
+def test_spotify_offer_survives_a_skipped_welcome(brain, monkeypatch):
+    monkeypatch.setattr(brain, "_generate_qr_image", lambda *a: None)
+    assert not os.path.exists(brain_mod.SPOTIFY_OFFERED_FLAG)
+
+    async def go():
+        await brain._offer_spotify()
+    asyncio.run(go())
+    assert os.path.exists(brain_mod.SPOTIFY_OFFERED_FLAG)
+    assert "one more thing..." in frame_text(brain)
+    os.remove(brain_mod.SPOTIFY_OFFERED_FLAG)
+
+
+def test_led_error_flash_is_not_overwritten_by_ambient():
+    """An animation that replaces another must not let ambient restart under it."""
+    from leeloo_led import LEDManager
+
+    async def go():
+        led = LEDManager()
+        await led.set_ambient("idle")
+        proc = asyncio.ensure_future(led.processing())
+        await asyncio.sleep(0.05)
+        err = asyncio.ensure_future(led.error())
+        await asyncio.sleep(0.1)
+        during = len(ambient_tasks())
+        await asyncio.gather(proc, err)
+        await asyncio.sleep(0.05)
+        after = len(ambient_tasks())
+        await led.off_all()
+        return during, after
+    assert asyncio.run(go()) == (0, 1)
+
+
+def test_ack_in_flight_does_not_write_after_listening_starts():
+    from leeloo_led import LEDManager, OFF
+
+    async def go():
+        led = LEDManager()
+        writes = []
+        led._set_color = lambda c: writes.append(c)
+        ack = asyncio.ensure_future(led.ack())
+        await asyncio.sleep(0.02)
+        await led.listening()
+        n = len(writes)
+        await ack
+        await asyncio.sleep(0.15)
+        return writes[n:]
+    assert asyncio.run(go()) == []

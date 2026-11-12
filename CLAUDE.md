@@ -72,6 +72,14 @@ Tap device → speak → Haiku classifies:
 | `MESSAGE_READOUT` | "what did I miss" | Read messages |
 | `TIME_QUERY` | "what time is it" | Tolkien-style cosmic time (65 words) |
 | `NUDGE` | "send a nudge" | Cyan LED ping |
+| `HANG_PROPOSE` | "let's hang saturday at 8" | Sends a proposal to the crew |
+| `HANG_CONFIRM` | "i'm in" | Confirms a friend's proposal (you cannot confirm your own) |
+| `SPOTIFY_SETUP` | "connect spotify" | Shows the Spotify QR code again |
+| `TELEGRAM_SETUP` | "telegram setup" | Shows the bot name and crew code |
+
+Taps: single = talk (or close the open frame). Double = nudge when idle, love on a crew
+message. Triple = fire on a crew message. Reactions work ONLY on frames opened with
+`show_frame(..., reactable=True)`.
 
 ## Key Conventions
 
@@ -347,6 +355,9 @@ LEELOO_CLAUDE_MODEL=...        # Optional: override the Claude model
 - ❌ Show invented data (weather fallback values, random charts) — show "offline" instead
 - ❌ Put secrets or model names in more than one place
 - ❌ Put changing data in a Claude `system` prompt (breaks the prompt cache)
+- ❌ Build a shell command string from user input (WiFi name/password): pass an argument list
+- ❌ Hard-code line breaks by character count for "large" text: `_fit_lines()` wraps by pixel width
+- ❌ Show raw message text: `format_display_text()` cleans emoji and characters the font lacks
 
 ## Tuning Values
 

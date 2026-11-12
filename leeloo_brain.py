@@ -80,6 +80,7 @@ from leeloo_client import LeelooClient
 DEVICE_CONFIG_PATH = os.path.join(LEELOO_HOME, "device_config.json")
 CREW_CONFIG_PATH = os.path.join(LEELOO_HOME, "crew_config.json")
 SPOTIFY_TOKENS_PATH = os.path.join(LEELOO_HOME, "spotify_tokens.json")
+SPOTIFY_OFFERED_FLAG = os.path.join(LEELOO_HOME, ".spotify_offered")
 FB_PATH = "/dev/fb1"
 SCREEN_WIDTH = 480
 SCREEN_HEIGHT = 320
@@ -207,9 +208,44 @@ def wrap_text(text, width=WRAP_CHARS):
     return lines
 
 
+# The LCD font (DejaVu Sans Mono) has Latin, Greek and Cyrillic letters only.
+_EMOJI_WORDS = {
+    '❤': '<3', '♥': '<3', '💜': '<3', '💙': '<3', '💚': '<3', '🧡': '<3', '💛': '<3', '🖤': '<3',
+    '😍': '(love)', '🥰': '(love)', '😘': '(kiss)', '🔥': '(fire)', '😂': '(lol)', '🤣': '(lol)',
+    '😭': '(cry)', '😢': ':(', '😊': ':)', '🙂': ':)', '😀': ':D', '😁': ':D', '😎': 'B)',
+    '👍': '(+1)', '👎': '(-1)', '🙏': '(thanks)', '🎉': '(party)', '💯': '100', '✨': '*',
+    '👀': '(eyes)', '💀': '(dead)', '🤔': '(hmm)', '🎵': '(music)', '🎶': '(music)', '🎧': '(music)',
+    '’': "'", '‘': "'", '“': '"', '”': '"', '–': '-', '—': '-', '…': '...', '•': '-',
+}
+MAX_MESSAGE_CHARS = 400
+
+
+def clean_display_text(text, limit=None):
+    """Make text safe for the LCD font: common emoji become short words,
+    characters without a glyph are removed, whitespace is collapsed.
+    `limit` cuts very long text (a 4000-character message would scroll for minutes)."""
+    out = []
+    dropped = False
+    for ch in str(text or ""):
+        if ch in _EMOJI_WORDS:
+            out.append(f" {_EMOJI_WORDS[ch]} " if len(_EMOJI_WORDS[ch]) > 1 and ord(ch) > 0x2100 else _EMOJI_WORDS[ch])
+        elif ch.isspace():
+            out.append(" ")
+        elif ord(ch) < 0x0530 and ch.isprintable():
+            out.append(ch)
+        elif ch not in ('\ufe0f', '\u200d'):
+            dropped = True
+    cleaned = " ".join("".join(out).split())
+    if not cleaned and dropped:
+        return "(text that leeloo can't show)"
+    if limit and len(cleaned) > limit:
+        cleaned = cleaned[:limit - 3].rstrip() + "..."
+    return cleaned
+
+
 def format_display_text(text, color, size="normal"):
     """Format a block of text into typewriter content lines (text, size, color)."""
-    lines = wrap_text(text)
+    lines = wrap_text(clean_display_text(text))
     if not lines:
         return [("no response", size, color)]
     return [(line, size, color) for line in lines]
@@ -403,16 +439,19 @@ class LeelooBrain:
     def _pending_hang_dt(self):
         """ISO datetime of the hang proposal that waits for confirmation (or None)."""
         try:
-            return gadget_data.load_data().get('pending_hang') or None
+            stored = gadget_data.load_data().get('pending_hang')
         except Exception:
             return None
+        if isinstance(stored, dict):
+            return stored.get('datetime') or None
+        return stored or None
 
     @_pending_hang_dt.setter
     def _pending_hang_dt(self, value):
         try:
             data = gadget_data.load_data()
             if value:
-                data['pending_hang'] = value
+                data['pending_hang'] = {'datetime': value, 'by': 'crew'}
             elif 'pending_hang' in data:
                 del data['pending_hang']
             else:
@@ -476,14 +515,23 @@ class LeelooBrain:
             contacts=self.contacts,
             messages=messages,
             now=now.replace(tzinfo=None),
-            pending_hang=self._pending_hang_dt,
+            pending_hang=self._hang_context(),
+            next_hang=(self._hang_label(self._next_hang()) if self._next_hang() else None),
         )
+
+    def _hang_context(self):
+        pending_dt, by = self._pending_hang()
+        if pending_dt is not None:
+            who = "this user" if by == 'me' else by
+            return f"{pending_dt.strftime('%A %Y-%m-%d %H:%M')}, proposed by {who}, not confirmed yet"
+        return None
 
     # =========================================================================
     # FRAMES — the only way to show an expanded frame
     # =========================================================================
 
-    def show_frame(self, frame_type, lines, duration=EXPANDED_HOLD_DURATION, from_voice=False):
+    def show_frame(self, frame_type, lines, duration=EXPANDED_HOLD_DURATION, from_voice=False,
+                   reactable=False):
         """Show an expanded frame. Replaces any frame that is open now.
 
         Safe to call from sync callbacks on the event loop. A frame that
@@ -491,9 +539,10 @@ class LeelooBrain:
         (drawing during recording disturbs the audio and the UI state).
         """
         if self._voice_busy and not from_voice:
-            self._deferred_frame = (frame_type, lines, duration)
+            self._deferred_frame = (frame_type, lines, duration, False, reactable)
             return None
-        return self._start_frame_task(lambda: self.expand_frame(frame_type, lines, duration))
+        return self._start_frame_task(
+            lambda: self.expand_frame(frame_type, lines, duration, reactable=reactable))
 
     def _start_frame_task(self, make_coro):
         """Make `make_coro()` the current frame task. The frame that is open
@@ -512,13 +561,15 @@ class LeelooBrain:
         if self._expand_task is not None and not self._expand_task.done():
             self._expand_task.cancel()
 
-    async def expand_frame(self, frame_type: FrameType, content_lines, duration=EXPANDED_HOLD_DURATION):
+    async def expand_frame(self, frame_type: FrameType, content_lines, duration=EXPANDED_HOLD_DURATION,
+                           reactable=False):
         """Expand a frame, typewriter the content, hold, then collapse.
-        Use show_frame() unless you are already inside the current frame task."""
+        Use show_frame() unless you are already inside the current frame task.
+        reactable: the frame shows a crew message; double/triple tap send love/fire."""
         async with self._frame_lock:
             self.ui_state = UIState.EXPANDING
             self.expanded_frame = frame_type
-            self.message_view_active = (frame_type == FrameType.MESSAGES)
+            self.message_view_active = bool(reactable)
             try:
                 album_x = await self._in_thread(self.display.album_frame_x, self.album_art_path)
                 box_right = album_x - 10  # 5px gap + 5px padding
@@ -528,6 +579,7 @@ class LeelooBrain:
                 await animator.async_expand(frame_type)
 
                 self.ui_state = UIState.EXPANDED
+                content_lines = self._fit_lines(content_lines, box_right - 7 - 25)
                 overflow = await self._typewriter(content_lines, box_right)
 
                 if overflow:
@@ -546,12 +598,56 @@ class LeelooBrain:
                 self.expanded_frame = None
                 self.message_view_active = False
                 self.last_music_fetch = 0   # pick up new album art on the next refresh
-                # Repaint the normal screen now (in a thread). shield(): a second
-                # cancel must not leave half an animation on the screen.
-                try:
-                    await asyncio.shield(self._in_thread(self._render_normal, True))
-                except Exception as e:
-                    print(f"[BRAIN] Render after frame failed: {e}")
+                # Repaint the normal screen now (in a thread) and WAIT until it
+                # is complete, also when this task is cancelled again meanwhile.
+                # Otherwise the next frame would start to draw while the repaint
+                # still writes to the screen.
+                repaint = asyncio.ensure_future(self._in_thread(self._render_normal, True))
+                cancelled_again = False
+                while not repaint.done():
+                    try:
+                        await asyncio.shield(repaint)
+                    except asyncio.CancelledError:
+                        cancelled_again = True
+                    except Exception as e:
+                        print(f"[BRAIN] Render after frame failed: {e}")
+                if cancelled_again:
+                    raise asyncio.CancelledError()
+
+    @staticmethod
+    def _text_width(font, text):
+        try:
+            return font.getlength(text)
+        except AttributeError:
+            return len(text) * 8
+
+    def _fit_lines(self, lines, width):
+        """Re-wrap every line that is wider than the frame in PIXELS for its font.
+        (A "large" line holds about 16 characters, a "normal" line about 21.)"""
+        fitted = []
+        for text, size, color in lines:
+            font = self._line_font(size)
+            if not text or self._text_width(font, text) <= width:
+                fitted.append((text, size, color))
+                continue
+            current = ""
+            for word in text.split(" "):
+                candidate = f"{current} {word}" if current else word
+                if self._text_width(font, candidate) <= width:
+                    current = candidate
+                    continue
+                if current:
+                    fitted.append((current, size, color))
+                while len(word) > 1 and self._text_width(font, word) > width:
+                    cut = len(word) - 1
+                    while cut > 1 and self._text_width(font, word[:cut]) > width:
+                        cut -= 1
+                    fitted.append((word[:cut], size, color))
+                    word = word[cut:]
+                current = word
+            if current:
+                fitted.append((current, size, color))
+        return fitted
 
     def _line_font(self, size):
         if size == "large":
@@ -719,8 +815,11 @@ class LeelooBrain:
         self.show_frame(FrameType.MESSAGES, [
             (f"from {sender.lower()}", "large", COLORS['lavender']),
             ("", None, None),
-            *format_display_text(text, COLORS['white']),
-        ])
+            *format_display_text(clean_display_text(text, MAX_MESSAGE_CHARS), COLORS['white']),
+            ("", None, None),
+            ("2 taps = love", "small", HINT_COLOR),
+            ("3 taps = fire", "small", HINT_COLOR),
+        ], reactable=True)
         self._spawn(self._show_music_from_message(sender, text))
 
     async def _show_music_from_message(self, sender, text):
@@ -793,48 +892,89 @@ class LeelooBrain:
     def _hang_label(dt):
         return dt.strftime("%a %b %-d · %-I:%M%p").lower()
 
+    def _pending_hang(self):
+        """The hang proposal that waits for an answer: (datetime, proposed_by).
+        proposed_by is 'me' or a crew member's name. A proposal whose time
+        has passed is removed. Returns (None, None) when there is none."""
+        try:
+            stored = gadget_data.load_data().get('pending_hang')
+        except Exception:
+            stored = None
+        if isinstance(stored, str):                 # older format
+            stored = {'datetime': stored, 'by': 'crew'}
+        if not isinstance(stored, dict):
+            return None, None
+        dt = self._parse_hang(stored.get('datetime'))
+        if dt is None or dt <= self._now():
+            self._pending_hang_dt = None
+            return None, None
+        return dt, stored.get('by') or 'crew'
+
+    def _set_pending_hang(self, dt, proposed_by):
+        try:
+            data = gadget_data.load_data()
+            data['pending_hang'] = {'datetime': dt.isoformat(), 'by': proposed_by}
+            gadget_data.save_data(data)
+        except Exception as e:
+            print(f"[BRAIN] Could not store pending hang: {e}")
+
+    def _next_hang(self):
+        """The saved (confirmed) hang as a datetime in the future, or None."""
+        try:
+            hang = gadget_data.get_next_hang()
+        except Exception:
+            hang = None
+        dt = self._parse_hang((hang or {}).get('datetime'))
+        return dt if dt is not None and dt > self._now() else None
+
     def _save_pending_hang(self):
-        """Store the pending proposal as the next hang. Returns True if saved."""
-        dt = self._parse_hang(self._pending_hang_dt) if self._pending_hang_dt else None
+        """Make the pending proposal the next hang. Returns the datetime, or
+        None when there was no valid proposal (nothing is saved then)."""
+        dt, _by = self._pending_hang()
         self._pending_hang_dt = None
         if dt is None:
-            return False
+            return None
         try:
             set_next_hang(dt, set_by="voice")
             print(f"[BRAIN] Next hang saved: {dt.isoformat()}")
             self._wake_display()
-            return True
+            return dt
         except Exception as e:
             print(f"[BRAIN] Failed to save hang time: {e}")
-            return False
+            return None
 
     def _on_ws_hang_propose(self, sender, datetime_str, description):
         """Incoming hang proposal — remember it so a confirm can save it"""
         print(f"[BRAIN] Hang proposal from {sender}: {datetime_str}")
         dt = self._parse_hang(datetime_str)
+        if dt is not None and dt <= self._now():
+            dt = None                                # the time has passed: nothing to answer
         if dt is not None:
-            self._pending_hang_dt = dt.isoformat()
-        when = self._hang_label(dt) if dt is not None else (datetime_str or "")
+            self._set_pending_hang(dt, sender)
+        when = self._hang_label(dt) if dt is not None else ""
         self._led_notify(self.led.message_received)
         self.show_frame(FrameType.MESSAGES, [
             (f"{sender.lower()} wants to", "large", COLORS['lavender']),
             ("hang!", "large", COLORS['lavender']),
             ("", None, None),
-            *format_display_text(f"{when} {description or ''}".strip(), COLORS['white']),
+            *format_display_text(f"{when} {description or ''}".strip() or "(no time given)",
+                                 COLORS['white']),
             ("", None, None),
-            ('tap + say "i\'m in"', "small", COLORS['tan']),
+            *([('tap + say "i\'m in"', "small", COLORS['tan'])] if dt is not None else []),
         ])
 
     def _on_ws_hang_confirm(self, sender):
-        """Incoming hang confirmation — proposer side: lock in the hang time"""
+        """A crew member confirmed. The first confirmation makes the proposal
+        the next hang on every device; later ones only report who is in."""
         print(f"[BRAIN] Hang confirmed by {sender}!")
         self._led_notify(self.led.ack)
         saved = self._save_pending_hang()
-        # Say "confirmed" only when a hang time was really saved on this device
+        when = saved or self._next_hang()
         self.show_frame(FrameType.MESSAGES, [
             ("hang confirmed!" if saved else f"{sender.lower()} is in!", "large", COLORS['lavender']),
             ("", None, None),
-            (f"{sender.lower()} is in" if saved else "for the hang", "normal", COLORS['white']),
+            *([(f"{sender.lower()} is in", "normal", COLORS['white'])] if saved else []),
+            *([(self._hang_label(when), "normal", COLORS['purple'])] if when else []),
         ], duration=10.0)
 
     def _on_ws_queued(self, sender, msg_type, payload, timestamp):
@@ -859,7 +999,7 @@ class LeelooBrain:
             dt = self._parse_hang(payload.get('datetime', ''))
             if dt is None or dt <= self._now():
                 return   # the proposed time has passed
-            self._pending_hang_dt = dt.isoformat()
+            self._set_pending_hang(dt, sender)
             self.message_mgr.add_message(
                 sender, f"wants to hang {self._hang_label(dt)} {payload.get('description', '')}".strip(),
                 timestamp)
@@ -1117,6 +1257,10 @@ class LeelooBrain:
             print("[BRAIN] Double tap → heart reaction")
             ok = await self.ws_client.send_reaction('love')
             await (self.led.ack() if ok else self.led.error())
+        elif self._frame_active():
+            # A frame that is not a crew message is open (weather, "sent"...).
+            # A nudge from here would surprise the crew with a 30 s LED signal.
+            print("[BRAIN] Double tap ignored (a frame is open)")
         else:
             print("[BRAIN] Double tap → nudge")
             await self._send_nudge()
@@ -1159,18 +1303,50 @@ class LeelooBrain:
             self._wake_display()
             await self.led.listening()
             transcript = await self.voice.record_and_transcribe()
+            if transcript:
+                self.show_frame(FrameType.WEATHER, [
+                    ("you said:", "large", COLORS['tan']),
+                    ("", None, None),
+                    *format_display_text(transcript, COLORS['white']),
+                    ("", None, None),
+                    *format_display_text("commands are off: add ANTHROPIC_API_KEY to the .env file.",
+                                         COLORS['rose']),
+                ], duration=12.0, from_voice=True)
+            else:
+                self.show_frame(FrameType.WEATHER, self._no_transcript_lines(),
+                                duration=6.0, from_voice=True)
         finally:
-            await self.led.off()
-            if self.ui_state in VOICE_STATES:
-                self.ui_state = UIState.NORMAL
-            self._voice_busy = False
-            self._wake_display()
-        if transcript:
-            self.show_frame(FrameType.WEATHER, [
-                ("you said:", "large", COLORS['tan']),
-                ("", None, None),
-                *format_display_text(transcript, COLORS['white']),
-            ], duration=10.0)
+            await asyncio.shield(self.led.off())
+            self._end_voice_session()
+
+    def _end_voice_session(self):
+        """Return the UI to normal after a voice session (every exit path)."""
+        if self.ui_state in VOICE_STATES:
+            self.ui_state = UIState.NORMAL
+        self._voice_busy = False
+        # A frame that arrived during the session (message, nudge, hang...)
+        # is shown now — after the voice result frame, if there is one.
+        deferred, self._deferred_frame = self._deferred_frame, None
+        if deferred:
+            self._spawn(self._show_deferred(deferred, self._expand_task))
+        self._wake_display()
+
+    async def _show_deferred(self, deferred, result_task):
+        if result_task is not None and not result_task.done():
+            await asyncio.gather(result_task, return_exceptions=True)
+        if self._voice_busy:
+            # A new voice session started meanwhile: keep it for after that one
+            self._deferred_frame = self._deferred_frame or deferred
+        elif not self._frame_active():
+            self.show_frame(*deferred)
+
+    def _no_transcript_lines(self):
+        """What to show when the recording gave no text."""
+        return self._voice_failure_lines() or [
+            ("didn't catch that", "large", COLORS['tan']),
+            ("", None, None),
+            *format_display_text("tap, wait for the green light, then speak.", COLORS['white']),
+        ]
 
     def _voice_failure_lines(self):
         """Explain an empty transcript when the cause is a fault (not silence)."""
@@ -1208,9 +1384,9 @@ class LeelooBrain:
             if not transcript:
                 led_released = True
                 await self.led.error()
-                lines = self._voice_failure_lines()
-                if lines:
-                    self.show_frame(FrameType.WEATHER, lines, duration=10.0, from_voice=True)
+                self.show_frame(FrameType.WEATHER, self._no_transcript_lines(),
+                                duration=6.0 if self.voice.last_error is None else 10.0,
+                                from_voice=True)
                 return
 
             self.ui_state = UIState.PROCESSING
@@ -1218,12 +1394,13 @@ class LeelooBrain:
             self._spawn(self.led.processing())
             await asyncio.sleep(0)   # let the animation start, so led.off() can stop it
 
-            # Give Claude fresh music context, but do not wait long for Spotify
-            if time.time() - self.last_music_fetch > 30:
+            # Give Claude fresh music context if the data is old, but a person
+            # is waiting: allow Spotify half a second at most.
+            if time.time() - self.last_music_fetch > 60:
                 self.last_music_fetch = 0
                 try:
                     await asyncio.wait_for(
-                        asyncio.shield(self._in_thread(self._refresh_data)), timeout=2.0)
+                        asyncio.shield(self._in_thread(self._refresh_data)), timeout=0.5)
                 except asyncio.TimeoutError:
                     pass
 
@@ -1245,15 +1422,7 @@ class LeelooBrain:
             if not led_released:
                 # Cancelled while the LED showed listening/processing
                 await asyncio.shield(self.led.off())
-            if self.ui_state in VOICE_STATES:
-                self.ui_state = UIState.NORMAL
-            self._voice_busy = False
-            # A frame that arrived during the session is shown now, unless the
-            # voice result opened its own frame.
-            deferred, self._deferred_frame = self._deferred_frame, None
-            if deferred and not self._frame_active():
-                self.show_frame(*deferred)
-            self._wake_display()
+            self._end_voice_session()
 
     async def _execute_intent(self, intent):
         """Execute a classified intent. Every branch gives feedback on the screen."""
@@ -1312,20 +1481,31 @@ class LeelooBrain:
             await self._intent_hang_propose(intent, params, show)
 
         elif action == "HANG_CONFIRM":
-            if not self._pending_hang_dt:
+            pending_dt, proposed_by = self._pending_hang()
+            target = pending_dt or self._next_hang()
+            if target is None:
                 show(FrameType.MESSAGES, [
                     ("no hang to confirm", "large", COLORS['lavender']),
                     ("", None, None),
                     *format_display_text('say "let\'s hang saturday at 8" to propose one.',
                                          COLORS['white']),
                 ], 10.0)
+            elif pending_dt is not None and proposed_by == 'me':
+                # You cannot confirm your own proposal
+                show(FrameType.MESSAGES, [
+                    ("waiting for your crew", "large", COLORS['lavender']),
+                    ("", None, None),
+                    (self._hang_label(pending_dt), "normal", COLORS['purple']),
+                    *format_display_text('you proposed this. a friend must say "i\'m in".',
+                                         COLORS['white']),
+                ], 10.0)
             elif self._connected() and await self.ws_client.send_hang_confirm():
                 self._led_notify(self.led.ack)
                 self._save_pending_hang()
                 show(FrameType.MESSAGES, [
-                    ("hang confirmed!", "large", COLORS['lavender']),
+                    ("you're in!", "large", COLORS['lavender']),
                     ("", None, None),
-                    *format_display_text(intent.response_text or "you're in!", COLORS['white']),
+                    (self._hang_label(target), "normal", COLORS['purple']),
                 ], 10.0)
             else:
                 self._show_offline("not confirmed")
@@ -1348,7 +1528,13 @@ class LeelooBrain:
 
         elif action == "TIME_QUERY":
             time_text = await self._generate_cosmic_time()
-            show(FrameType.TIME, format_display_text(time_text, COLORS['purple']))
+            now = self._now()
+            show(FrameType.TIME, [
+                (now.strftime('%-I:%M %p').lower(), "large", COLORS['purple']),
+                (now.strftime('%A, %b %-d').lower(), "normal", COLORS['purple']),
+                ("", None, None),
+                *format_display_text(time_text, COLORS['white']),
+            ])
 
         else:   # UNKNOWN or anything unexpected
             text = intent.response_text or 'not sure what you mean. try "what\'s the weather".'
@@ -1420,11 +1606,21 @@ class LeelooBrain:
                                      COLORS['white']),
             ], 10.0)
             return
-        dt = roll_forward(dt, self._now())
+        now = self._now()
+        if dt < now and (now - dt).days < 1:
+            # "tonight at 8" said at 9 pm. Do not move it to next year.
+            show(FrameType.MESSAGES, [
+                ("that time has passed", "large", COLORS['lavender']),
+                ("", None, None),
+                (self._hang_label(dt), "normal", COLORS['purple']),
+                *format_display_text("say a time that is still to come.", COLORS['white']),
+            ], 10.0)
+            return
+        dt = roll_forward(dt, now)      # the model answered with a past YEAR
         desc = str(params.get('description', '') or '')
         print(f"[BRAIN] Hang propose: {dt.isoformat()} {desc}")
         if self._connected() and await self.ws_client.send_hang_propose(dt.isoformat(), desc):
-            self._pending_hang_dt = dt.isoformat()
+            self._set_pending_hang(dt, 'me')
             show(FrameType.MESSAGES, [
                 ("hang proposed!", "large", COLORS['lavender']),
                 ("", None, None),
@@ -1761,14 +1957,24 @@ class LeelooBrain:
                     ("to see this again", "small", COLORS['lavender']),
                 ])
 
-        if not self._has_live_spotify():
-            # The relay connection supplies the device id for the QR. Wait a little.
-            for _ in range(20):
-                if self.ws_client.config.device_id:
-                    break
-                await asyncio.sleep(0.5)
+        await self._offer_spotify()
+
+    async def _offer_spotify(self):
+        """Offer the Spotify QR once (also after a skipped welcome)."""
+        if self._has_live_spotify():
+            return
+        # The relay connection supplies the device id for the QR. Wait a little.
+        for _ in range(20):
             if self.ws_client.config.device_id:
-                await self._spotify_qr_frame(intro="one more thing...")
+                break
+            await asyncio.sleep(0.5)
+        if self.ws_client.config.device_id:
+            try:
+                with open(SPOTIFY_OFFERED_FLAG, 'w') as f:
+                    f.write('1')
+            except OSError:
+                pass
+            await self._spotify_qr_frame(intro="one more thing...")
 
     # =========================================================================
     # RUN
@@ -1803,6 +2009,9 @@ class LeelooBrain:
 
         if is_first_boot:
             self._start_frame_task(self._show_welcome_with_qr)
+        elif not self._has_live_spotify() and not os.path.exists(SPOTIFY_OFFERED_FLAG):
+            # The welcome was skipped before the Spotify step: offer it once more
+            self._start_frame_task(self._offer_spotify)
 
         try:
             await asyncio.gather(*tasks)

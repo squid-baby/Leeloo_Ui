@@ -120,3 +120,21 @@ def test_extract_json():
     assert li.extract_json('noise {"a": {"b": 1}} trailing') == {"a": {"b": 1}}
     with pytest.raises(json.JSONDecodeError):
         li.extract_json("nothing here")
+
+
+def test_api_errors_tell_the_user_what_to_check():
+    class AuthenticationError(Exception): pass
+    class NotFoundError(Exception): pass
+    class APIConnectionError(Exception): pass
+    assert "ANTHROPIC_API_KEY" in li.api_error_text(AuthenticationError())
+    assert li.CLAUDE_MODEL in li.api_error_text(NotFoundError())
+    assert "wifi" in li.api_error_text(APIConnectionError())
+    intent = asyncio.run(router_with(FakeMessages(error=AuthenticationError())).route("x"))
+    assert "ANTHROPIC_API_KEY" in intent.response_text
+
+
+def test_context_always_states_hang_status():
+    text = li.build_context()
+    assert "Pending hang proposal: none" in text and "Next confirmed hang: none" in text
+    text = li.build_context(pending_hang="Saturday", next_hang="sat nov 14 · 8:00pm")
+    assert "Pending hang proposal: Saturday" in text and "Next confirmed hang: sat nov 14" in text
