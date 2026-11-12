@@ -990,3 +990,93 @@ def test_ack_in_flight_does_not_write_after_listening_starts():
         await asyncio.sleep(0.15)
         return writes[n:]
     assert asyncio.run(go()) == []
+
+
+# =============================================================================
+# Review round 4
+# =============================================================================
+
+def test_ambient_task_is_never_orphaned_by_a_racing_cancel():
+    """_cancel_ambient() must not erase the reference to an ambient task
+    that another LED call started while it was waiting."""
+    from leeloo_led import LEDManager
+
+    async def go():
+        worst = 0
+        for yields in range(0, 6):
+            led = LEDManager()
+            await led.set_ambient("idle")
+            blink = asyncio.ensure_future(led.message_received())
+            for _ in range(yields):
+                await asyncio.sleep(0)
+            await led.off()
+            await led._cancel_ambient()
+            await led.listening()
+            await asyncio.sleep(0.02)
+            worst = max(worst, len(ambient_tasks()))
+            await led.off_all()
+            blink.cancel()
+            await asyncio.gather(blink, return_exceptions=True)
+            for t in ambient_tasks():
+                t.cancel()
+        return worst
+    assert asyncio.run(go()) == 0
+
+
+def test_full_width_normal_line_is_not_rewrapped(brain):
+    from PIL import ImageFont
+    try:
+        brain.font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 14)
+    except OSError:
+        pytest.skip("DejaVu font not installed")
+    line = "right now. check wifi"            # exactly WRAP_CHARS characters
+    assert len(line) == brain_mod.WRAP_CHARS
+    assert brain._fit_lines([(line, "normal", "#fff")], 176) == [(line, "normal", "#fff")]
+
+
+def test_all_frames_deferred_during_voice_are_shown_in_order(brain):
+    brain.voice = FakeVoice(transcript="", delay=0.3)
+
+    async def go():
+        tap = asyncio.ensure_future(brain._on_tap('single_tap'))
+        await asyncio.sleep(0.1)
+        brain._on_ws_message("Amy", "first")
+        brain._on_ws_nudge("Ben")
+        await tap
+        for _ in range(4):
+            await asyncio.sleep(0.2)
+            await settle(brain)
+    asyncio.run(go())
+    texts = [" ".join(lines) for _t, lines in brain.frames]
+    i_msg = next(i for i, t in enumerate(texts) if "from amy" in t)
+    i_nudge = next(i for i, t in enumerate(texts) if "nudged you" in t)
+    assert i_msg < i_nudge
+    assert sum("from amy" in t for t in texts) == 1 and not brain._deferred_frames
+
+
+def test_clean_display_text_keeps_supported_characters():
+    assert brain_mod.clean_display_text("costs 20€ „Hallo“ −5° well‑known Việt") == \
+        'costs 20€ "Hallo" -5° well-known Việt'
+
+
+def test_confirm_for_unknown_proposal_does_not_show_an_old_hang_time(brain):
+    old = (datetime.now() + timedelta(days=5)).replace(microsecond=0)
+    brain_mod.gadget_data.set_next_hang(old, set_by="test")
+
+    async def go():
+        brain._on_ws_hang_confirm("Bob")
+        await settle(brain)
+    asyncio.run(go())
+    text = frame_text(brain)
+    assert "bob is in!" in text and "hang confirmed!" not in text
+    assert brain._hang_label(old) not in text
+    brain_mod.gadget_data.clear_next_hang()
+
+
+def test_readout_cuts_very_long_messages(brain):
+    async def no_scroll(overflow, hold):        # scrolling is tested elsewhere
+        await asyncio.sleep(0.05)
+    brain._scroll_content = no_scroll
+    brain.message_mgr.add_message("Amy", "word " * 1000)
+    run_voice(brain, Intent("MESSAGE_READOUT", {}, ""))
+    assert sum(len(l) for l in brain.frames[-1][1]) < 600

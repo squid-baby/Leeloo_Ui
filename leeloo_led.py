@@ -144,13 +144,26 @@ class LEDManager:
 
     async def _cancel_ambient(self):
         """Cancel ambient breathe task without clearing ambient state"""
-        if self._ambient_task and not self._ambient_task.done():
+        task = self._ambient_task
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        # Another LED call can start a NEW ambient task while we wait above.
+        # Clear the reference only if it is still the task we cancelled;
+        # otherwise the new task would lose its only reference, could never
+        # be cancelled, and would write LEDs during every later recording.
+        if self._ambient_task is task:
+            self._ambient_task = None
+        elif self._ambient_task and not self._ambient_task.done():
             self._ambient_task.cancel()
             try:
                 await self._ambient_task
             except asyncio.CancelledError:
                 pass
-        self._ambient_task = None
+            self._ambient_task = None
 
     def _start_ambient_task(self):
         """Spawn the ambient breathe coroutine as a background task.

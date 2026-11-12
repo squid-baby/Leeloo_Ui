@@ -215,7 +215,8 @@ _EMOJI_WORDS = {
     '😭': '(cry)', '😢': ':(', '😊': ':)', '🙂': ':)', '😀': ':D', '😁': ':D', '😎': 'B)',
     '👍': '(+1)', '👎': '(-1)', '🙏': '(thanks)', '🎉': '(party)', '💯': '100', '✨': '*',
     '👀': '(eyes)', '💀': '(dead)', '🤔': '(hmm)', '🎵': '(music)', '🎶': '(music)', '🎧': '(music)',
-    '’': "'", '‘': "'", '“': '"', '”': '"', '–': '-', '—': '-', '…': '...', '•': '-',
+    '’': "'", '‘': "'", '“': '"', '”': '"', '„': '"', '–': '-', '—': '-', '−': '-',
+    '\u2011': '-', '…': '...', '•': '-',
 }
 MAX_MESSAGE_CHARS = 400
 
@@ -231,8 +232,8 @@ def clean_display_text(text, limit=None):
             out.append(f" {_EMOJI_WORDS[ch]} " if len(_EMOJI_WORDS[ch]) > 1 and ord(ch) > 0x2100 else _EMOJI_WORDS[ch])
         elif ch.isspace():
             out.append(" ")
-        elif ord(ch) < 0x0530 and ch.isprintable():
-            out.append(ch)
+        elif ch.isprintable() and (ord(ch) < 0x0530 or 0x1E00 <= ord(ch) <= 0x1EFF or ch == '€'):
+            out.append(ch)    # Latin (also Vietnamese), Greek, Cyrillic
         elif ch not in ('\ufe0f', '\u200d'):
             dropped = True
     cleaned = " ".join("".join(out).split())
@@ -333,7 +334,8 @@ class LeelooBrain:
         self._voice_busy = False          # a tap-to-talk session is running
         self._expand_task = None          # current frame task (expand/hold/collapse)
         self._frame_lock = asyncio.Lock() # only one frame draws at a time
-        self._deferred_frame = None       # frame that arrived during a voice session
+        self._deferred_frames = []        # frames that arrived during a voice session
+        self._deferred_runner_active = False
         self._welcome_qr_active = False   # album art box shows a QR code
         self._background_tasks = set()    # strong refs for fire-and-forget tasks
 
@@ -539,7 +541,9 @@ class LeelooBrain:
         (drawing during recording disturbs the audio and the UI state).
         """
         if self._voice_busy and not from_voice:
-            self._deferred_frame = (frame_type, lines, duration, False, reactable)
+            # Shown after the session, in order of arrival (the newest 3)
+            self._deferred_frames.append((frame_type, lines, duration, False, reactable))
+            del self._deferred_frames[:-3]
             return None
         return self._start_frame_task(
             lambda: self.expand_frame(frame_type, lines, duration, reactable=reactable))
@@ -627,20 +631,22 @@ class LeelooBrain:
         fitted = []
         for text, size, color in lines:
             font = self._line_font(size)
-            if not text or self._text_width(font, text) <= width:
+            # +2 px: a full 21-character normal line is 176.9 px in a 176 px frame
+            width_ok = width + 2
+            if not text or self._text_width(font, text) <= width_ok:
                 fitted.append((text, size, color))
                 continue
             current = ""
             for word in text.split(" "):
                 candidate = f"{current} {word}" if current else word
-                if self._text_width(font, candidate) <= width:
+                if self._text_width(font, candidate) <= width_ok:
                     current = candidate
                     continue
                 if current:
                     fitted.append((current, size, color))
-                while len(word) > 1 and self._text_width(font, word) > width:
+                while len(word) > 1 and self._text_width(font, word) > width_ok:
                     cut = len(word) - 1
-                    while cut > 1 and self._text_width(font, word[:cut]) > width:
+                    while cut > 1 and self._text_width(font, word[:cut]) > width_ok:
                         cut -= 1
                     fitted.append((word[:cut], size, color))
                     word = word[cut:]
@@ -969,11 +975,14 @@ class LeelooBrain:
         print(f"[BRAIN] Hang confirmed by {sender}!")
         self._led_notify(self.led.ack)
         saved = self._save_pending_hang()
-        when = saved or self._next_hang()
+        # Show a time only for the proposal this device knows about. (An older
+        # confirmed hang could be a different one.)
+        when = saved
         self.show_frame(FrameType.MESSAGES, [
             ("hang confirmed!" if saved else f"{sender.lower()} is in!", "large", COLORS['lavender']),
             ("", None, None),
-            *([(f"{sender.lower()} is in", "normal", COLORS['white'])] if saved else []),
+            *([(f"{sender.lower()} is in", "normal", COLORS['white'])] if saved
+              else [("for the hang", "normal", COLORS['white'])]),
             *([(self._hang_label(when), "normal", COLORS['purple'])] if when else []),
         ], duration=10.0)
 
@@ -1326,19 +1335,26 @@ class LeelooBrain:
         self._voice_busy = False
         # A frame that arrived during the session (message, nudge, hang...)
         # is shown now — after the voice result frame, if there is one.
-        deferred, self._deferred_frame = self._deferred_frame, None
-        if deferred:
-            self._spawn(self._show_deferred(deferred, self._expand_task))
+        if self._deferred_frames and not self._deferred_runner_active:
+            self._deferred_runner_active = True
+            self._spawn(self._show_deferred())
         self._wake_display()
 
-    async def _show_deferred(self, deferred, result_task):
-        if result_task is not None and not result_task.done():
-            await asyncio.gather(result_task, return_exceptions=True)
-        if self._voice_busy:
-            # A new voice session started meanwhile: keep it for after that one
-            self._deferred_frame = self._deferred_frame or deferred
-        elif not self._frame_active():
-            self.show_frame(*deferred)
+    async def _show_deferred(self):
+        """Show the frames that were held back, one after the other, each
+        after the frame before it has closed."""
+        try:
+            while self._deferred_frames and not self._voice_busy:
+                current = self._expand_task
+                if current is not None and not current.done():
+                    await asyncio.gather(current, return_exceptions=True)
+                    continue
+                if self._voice_busy or not self._deferred_frames:
+                    break     # a new voice session: it shows them when it ends
+                self.show_frame(*self._deferred_frames.pop(0))
+                await asyncio.sleep(0)
+        finally:
+            self._deferred_runner_active = False
 
     def _no_transcript_lines(self):
         """What to show when the recording gave no text."""
@@ -1464,7 +1480,8 @@ class LeelooBrain:
             lines = [("messages", "large", COLORS['lavender']), ("", None, None)]
             for m in reversed(messages):   # oldest first, like a chat
                 lines.append((str(m.get('sender', '?')).lower(), "small", COLORS['lavender']))
-                lines.extend(format_display_text(m.get('text', ''), COLORS['white']))
+                lines.extend(format_display_text(
+                    clean_display_text(m.get('text', ''), MAX_MESSAGE_CHARS), COLORS['white']))
                 lines.append(("", None, None))
             if not messages:
                 lines.append(("no messages", "normal", COLORS['white']))
