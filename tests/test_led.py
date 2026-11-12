@@ -79,7 +79,7 @@ async def one_sequence(seed, brain_like):
                 await REAL_SLEEP(0)
                 assert not ambient_tasks() or led.pixels.bad_writes == 0
             if rng.random() < 0.3:
-                await led.error()
+                await led.error(end_recording=True)
             else:
                 spawned.append(led.start_processing())
                 for _ in range(rng.randint(0, 5)):
@@ -147,4 +147,61 @@ def test_hardware_write_is_refused_while_recording():
         assert led.pixels.writes == before
         await led.off()
         assert led.pixels.writes > before        # works again after recording
+    asyncio.run(go())
+
+
+def test_error_from_a_notification_does_not_end_the_recording_protection():
+    """A failed reaction or a notification calls error() too. Only the voice
+    session that owns the recording may end it."""
+    async def go():
+        led = make_led()
+        await led.set_ambient("idle")
+        await led.listening()
+        await led.error()                          # from a notification: ignored
+        await asyncio.sleep(0.3)
+        assert led.recording is True and led.pixels.bad_writes == 0 and not ambient_tasks()
+        await led.error(end_recording=True)        # from the voice session: flashes
+        assert led.recording is False
+        await asyncio.sleep(0.05)
+        n = len(ambient_tasks())
+        await led.off_all()
+        return n
+    assert asyncio.run(go()) == 1
+
+
+def test_processing_requested_before_error_or_listening_never_runs():
+    async def go():
+        led = make_led()
+        led.start_processing()
+        await led.error(end_recording=True)        # no loop turn between
+        assert led._current_animation is None
+        led.start_processing()
+        await led.listening()
+        await asyncio.sleep(0.2)
+        assert led.recording is True and led.pixels.bad_writes == 0
+        await led.off_all()
+    asyncio.run(go())
+
+
+def test_cancelled_ack_restores_the_leds():
+    async def go():
+        led = make_led()
+        await led.set_ambient("idle")
+        task = asyncio.ensure_future(led.ack())
+        await asyncio.sleep(0.03)                  # inside the 100 ms flash
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0.05)
+        n = len(ambient_tasks())
+        await led.off_all()
+        return n
+    assert asyncio.run(go()) == 1
+
+
+def test_off_sync_ends_recording_state():
+    async def go():
+        led = make_led()
+        await led.listening()
+        led.off_sync()
+        assert led.recording is False
     asyncio.run(go())

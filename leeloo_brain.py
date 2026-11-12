@@ -1399,7 +1399,7 @@ class LeelooBrain:
 
             if not transcript:
                 led_released = True
-                await self.led.error()
+                await self.led.error(end_recording=True)
                 self.show_frame(FrameType.WEATHER, self._no_transcript_lines(),
                                 duration=6.0 if self.voice.last_error is None else 10.0,
                                 from_voice=True)
@@ -1432,7 +1432,7 @@ class LeelooBrain:
             print(f"[BRAIN] Voice error: {e}")
             traceback.print_exc()
             led_released = True
-            await self.led.error()
+            await self.led.error(end_recording=True)
         finally:
             if not led_released:
                 # Cancelled while the LED showed listening/processing

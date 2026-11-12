@@ -259,13 +259,15 @@ class LEDManager:
         if self.recording:    # recording started while we waited
             return
         self._set_color(GREEN)
-        await asyncio.sleep(0.1)
-        if self.recording:    # do not write over the solid "listening" green
-            return
-        self._set_color(OFF)
-        # Resume ambient after the flash
-        if self._ambient_state:
-            self._start_ambient_task()
+        try:
+            await asyncio.sleep(0.1)
+        finally:
+            # Also when the caller is cancelled during the flash: never leave
+            # the LEDs solid green with the ambient light off.
+            if not self.recording:    # do not write over the "listening" green
+                self._set_color(OFF)
+                if self._ambient_state:
+                    self._start_ambient_task()
 
     async def listening(self):
         """Solid green — mic is recording (suspends ambient until off() is called)"""
@@ -290,6 +292,8 @@ class LEDManager:
 
     async def processing(self, epoch=None):
         """Pulsing green breathe — waiting for STT/LLM response"""
+        if epoch is not None and epoch != self._stop_epoch:
+            return     # off()/error()/listening() came after start_processing()
         print("[LED] processing (green breathe)")
         self.recording = False
 
@@ -349,8 +353,15 @@ class LEDManager:
 
         await self._run_animation("nudge", _breathe())
 
-    async def error(self):
-        """Red flash — something went wrong"""
+    async def error(self, end_recording=False):
+        """Red flash — something went wrong.
+
+        end_recording=True is for the voice session that owns the recording
+        (it ends the "listening" state). Any other caller — a notification, a
+        failed reaction — must NOT end it: the flash is skipped while the
+        microphone records."""
+        if self.recording and not end_recording:
+            return
         print("[LED] error (red flash)")
         self.recording = False
         self._stop_epoch += 1      # also stops a "processing" animation that has not started yet
@@ -390,6 +401,8 @@ class LEDManager:
 
     def off_sync(self):
         """Synchronous off — for cleanup/shutdown (kills ambient too)"""
+        self.recording = False
+        self._stop_epoch += 1
         self._ambient_state = None
         if self._ambient_task and not self._ambient_task.done():
             self._ambient_task.cancel()
