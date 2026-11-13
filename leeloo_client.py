@@ -50,6 +50,9 @@ class CrewConfig:
     crew_id: str = ""
     crew_code: str = ""
     display_name: str = "LEELOO"
+    # Secret that proves this device owns its device_id. The relay gives it
+    # one time, at the first registration. Never show or log it.
+    device_key: str = ""
 
 
 class LeelooClient:
@@ -115,6 +118,7 @@ class LeelooClient:
                     self.config.crew_code = data.get('invite_code', '')
                     self.config.display_name = data.get('name', 'LEELOO')
                     self.config.device_id = data.get('device_id', '')
+                    self.config.device_key = data.get('device_key', '') or ''
                     self.config.crew_id = data.get('crew_id', '')
                     print(f"[CLIENT] Loaded config: crew={self.config.crew_code} ({self.config.display_name})")
                 elif 'crew_code' in data:
@@ -126,6 +130,22 @@ class LeelooClient:
                     print("[CLIENT] Config format not recognized")
         except Exception as e:
             print(f"[CLIENT] Could not load config: {e}")
+
+    def _take_device_key(self, data):
+        """Store the device key that the relay gives at the first registration."""
+        key = data.get('device_key')
+        if isinstance(key, str) and key:
+            self.config.device_key = key
+
+    def _handle_identity_error(self, data):
+        """The relay says our device_id belongs to another device (our key is
+        lost or wrong, for example after a restored config file). Forget the
+        id: the next attempt registers as a new device."""
+        if data.get('error') == 'device_key_required':
+            print("[CLIENT] Device key refused - will register as a new device")
+            self.config.device_id = ""
+            self.config.device_key = ""
+            self._save_config()
 
     def _save_config(self):
         """Save configuration, keeping keys written by others (setup portal)"""
@@ -143,6 +163,7 @@ class LeelooClient:
 
             existing.update({
                 'device_id': self.config.device_id,
+                'device_key': self.config.device_key,
                 'crew_id': self.config.crew_id,
                 'crew_code': self.config.crew_code,
                 'display_name': self.config.display_name
@@ -284,6 +305,7 @@ class LeelooClient:
         msg = {
             'type': 'create_crew',
             'device_id': self.config.device_id or None,
+            'device_key': self.config.device_key or None,
             'display_name': display_name
         }
         # Pass existing crew code if we have one (from captive portal setup)
@@ -305,6 +327,7 @@ class LeelooClient:
                 print("[CLIENT] crew_created reply had no crew_code")
                 return None
             self.config.device_id = data.get('device_id') or self.config.device_id
+            self._take_device_key(data)
             self.config.crew_id = data.get('crew_id') or crew_code
             self.config.crew_code = crew_code
             self._save_config()
@@ -313,6 +336,7 @@ class LeelooClient:
             self._call(self.on_crew_joined, self.config.crew_code)
             return self.config.crew_code
 
+        self._handle_identity_error(data)
         print(f"[CLIENT] Error creating crew: {data.get('message')}")
         return None
 
@@ -328,6 +352,7 @@ class LeelooClient:
             'type': 'join_crew',
             'crew_code': crew_code,
             'device_id': self.config.device_id or None,
+            'device_key': self.config.device_key or None,
             'display_name': display_name
         }):
             return False
@@ -340,6 +365,7 @@ class LeelooClient:
 
         if data.get('type') == 'crew_joined':
             self.config.device_id = data.get('device_id') or self.config.device_id
+            self._take_device_key(data)
             self.config.crew_code = data.get('crew_code') or crew_code
             self.config.crew_id = data.get('crew_id') or self.config.crew_code
             self._save_config()
@@ -362,6 +388,7 @@ class LeelooClient:
             self._call(self.on_crew_joined, self.config.crew_code)
             return True
 
+        self._handle_identity_error(data)
         print(f"[CLIENT] Error joining crew: {data.get('message')}")
         return False
 

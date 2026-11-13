@@ -11,7 +11,9 @@ Example: `packs/unc-hoops.json`.
 
 ## 1. Pack format (version 1)
 
-The JSON text of a pack is 8,000 bytes at most. Unknown keys are an error.
+The JSON text of a pack is 8,000 bytes at most (the relay accepts 7,800, to
+keep a margin). Unknown keys are an error. Text must not contain lone
+surrogate code points (U+D800 to U+DFFF).
 
 | Key | Type | Rules |
 |-----|------|-------|
@@ -29,6 +31,12 @@ The JSON text of a pack is 8,000 bytes at most. Unknown keys are an error.
   `rose`, `white`, `yellow`, `orange`. Each value `#RRGGBB`.
   (`tan` = weather box, `purple` = time box, `lavender` = outer frame and
   messages box, `green` = album box.)
+  **Readable screen rule:** put the pack's colours on top of the default
+  palette (`bg #1A1D2E`, `green #7beec0`, `purple #9C93DD`,
+  `lavender #d978f9`, `tan #C2995E`, `white #FFFFFF`). Each of `green`,
+  `purple`, `lavender`, `tan` and `white` must then have a WCAG contrast
+  ratio of 2.0 or more against `bg`. (A pack that only sets a light `bg`
+  must set these five colours too.)
 - `header`: string, 1 to 12 characters. Replaces `LEELOO v1.0`.
 - `labels`: object. Keys from `weather`, `time`, `messages`, `album`. Each
   value 1 to 10 characters.

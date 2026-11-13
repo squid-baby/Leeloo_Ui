@@ -252,7 +252,7 @@ def test_join_success_populates_config_and_callbacks(config_path):
             assert rec.of("on_crew_joined") == [("ABC123",)]
             assert relay.received[0] == {
                 "type": "join_crew", "crew_code": "ABC123",
-                "device_id": None, "display_name": "Nate"}
+                "device_id": None, "device_key": None, "display_name": "Nate"}
             await client.disconnect()
         with open(config_path) as f:
             assert json.load(f)["device_id"] == "dev_test"
@@ -678,3 +678,35 @@ def test_pack_and_agent_messages_reach_their_callbacks():
     asyncio.run(go())
     assert seen == [("offer", "Amy", "p1"), ("install", "p2"), ("reset",), ("data", "p2", {"a.b": "1"}),
                     ("connect", "ABCD2345", "https://x/connect/ABCD2345", 900), ("gone", 2)]
+
+
+def test_device_key_is_stored_sent_and_reset(tmp_path):
+    """The relay gives a secret key at the first registration. The client
+    keeps it, sends it at each join, and forgets its id if the key is refused."""
+    import leeloo_client
+    path = str(tmp_path / "crew.json")
+    sent = []
+
+    async def go():
+        c = leeloo_client.LeelooClient(relay_url="ws://unused", config_path=path)
+        c.websocket = object(); c.connected = True
+
+        async def fake_send(obj): sent.append(obj); return True
+        c._send = fake_send
+        replies = [{"type": "crew_joined", "device_id": "leeloo_1", "device_key": "k" * 64, "crew_code": "LEELOO-ABCD"},
+                   {"type": "crew_joined", "device_id": "leeloo_1", "crew_code": "LEELOO-ABCD"},
+                   {"type": "error", "error": "device_key_required", "message": "no"}]
+
+        async def fake_reply(types, timeout): return replies.pop(0)
+        c._wait_for_reply = fake_reply
+        assert await c.join_crew("LEELOO-ABCD", "Nat")
+        assert c.config.device_key == "k" * 64
+        assert await c.join_crew("LEELOO-ABCD", "Nat")
+        assert sent[1]["device_key"] == "k" * 64 and c.config.device_key == "k" * 64   # kept when the reply has none
+        assert not await c.join_crew("LEELOO-ABCD", "Nat")
+        assert c.config.device_id == "" and c.config.device_key == ""
+    asyncio.run(go())
+    saved = json.load(open(path))
+    assert saved["device_id"] == "" and saved["device_key"] == ""
+    c2 = leeloo_client.LeelooClient(relay_url="ws://unused", config_path=path)
+    assert c2.config.device_key == ""

@@ -93,6 +93,7 @@ WEATHER_MAX_AGE = 2 * 3600      # older data is shown as "weather offline"
 MUSIC_REFRESH_INTERVAL = 20     # when actively playing
 DISPLAY_REFRESH_INTERVAL = 1.0  # display loop tick (renders only on change)
 EXPANDED_HOLD_DURATION = 20.0   # How long expanded frames stay open
+PACK_OFFER_TTL = 1800           # an offered look can be accepted for 30 minutes
 OFFLINE_GRACE_S = 30            # relay down this long -> "offline" in header
 RELAY_URL = "wss://leeloobot.xyz/ws"
 
@@ -376,6 +377,7 @@ class LeelooBrain:
         # Packs: a look + one custom panel, as data (docs/PACKS.md)
         self.packs = PackManager(os.path.join(LEELOO_HOME, "pack.json"))
         self._offered_pack = None         # (sender, pack) that waits for "use it"
+        self._offered_pack_at = 0
         self._agent_connect_waiter = None # Future for the relay's connect code
         print(f"[BRAIN] Messages: {self.message_mgr.get_total_unread()} unread")
 
@@ -527,7 +529,8 @@ class LeelooBrain:
             next_hang=(self._hang_label(self._next_hang()) if self._next_hang() else None),
             pack=(self.packs.pack or {}).get('name'),
             offered_pack=(f"{self._offered_pack[1].get('name')} from {self._offered_pack[0]}"
-                          if self._offered_pack else None),
+                          if self._offered_pack
+                          and time.time() - self._offered_pack_at <= PACK_OFFER_TTL else None),
         )
 
     def _hang_context(self):
@@ -849,6 +852,7 @@ class LeelooBrain:
             return False
         self._remember_contact(sender)
         self._offered_pack = (sender, pack)
+        self._offered_pack_at = time.time()
         if notify:
             self._led_notify(self.led.message_received)
             self.show_frame(FrameType.MESSAGES, [
@@ -1350,12 +1354,25 @@ class LeelooBrain:
             if not force and sig == self._last_render_sig:
                 return False
 
-            img = self.display.render(
-                weather, self.time_data, list(self.contacts), music,
-                album_art_path=art, unread_counts=unread,
-                status_text=status, hang=hang,
-                header=self.packs.header(), labels=self.packs.labels(), custom_panel=panel,
-            )
+            try:
+                img = self.display.render(
+                    weather, self.time_data, list(self.contacts), music,
+                    album_art_path=art, unread_counts=unread,
+                    status_text=status, hang=hang,
+                    header=clean_display_text(self.packs.header()) or None,
+                    labels={k: clean_display_text(v) for k, v in self.packs.labels().items()},
+                    custom_panel=panel,
+                )
+            except Exception as e:
+                if self.packs.pack is None:
+                    raise
+                # A pack must never take the screen down: remove it, draw the default look
+                print(f"[BRAIN] Pack render failed, pack removed: {e!r}")
+                self.packs.reset()
+                self.display.apply_theme(None)
+                img = self.display.render(
+                    weather, self.time_data, list(self.contacts), music,
+                    album_art_path=art, unread_counts=unread, status_text=status, hang=hang)
             write_to_framebuffer(img)
             self._last_render_sig = sig
             return True
@@ -1702,6 +1719,8 @@ class LeelooBrain:
                 self._show_offline("not disconnected")
 
         elif action == "PACK_ACCEPT":
+            if self._offered_pack and time.time() - self._offered_pack_at > PACK_OFFER_TTL:
+                self._offered_pack = None      # an old offer must not install by surprise
             if self._offered_pack:
                 sender, pack = self._offered_pack
                 self._install_pack(pack, sender, from_voice=True)

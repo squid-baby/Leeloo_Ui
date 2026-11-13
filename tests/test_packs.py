@@ -66,7 +66,7 @@ def test_example_pack_is_valid():
 def test_all_optional_parts_valid():
     pack = dict(
         MINIMAL,
-        theme={"colors": {k: "#00ff7F" for k in leeloo_packs.COLOR_KEYS},
+        theme={"colors": dict({k: "#00ff7F" for k in leeloo_packs.COLOR_KEYS}, bg="#101010"),
                "header": "x" * 12,
                "labels": {k: "y" * 10 for k in leeloo_packs.LABEL_KEYS}},
         sources=[source(id=f"s{i}", every=e) for i, e in enumerate((30, 3600, 61.5))],
@@ -651,3 +651,24 @@ def test_reads_from_a_thread_while_the_pack_changes(mgr):
         stop.set()
         t.join()
     assert not errors
+
+
+# ---- rules added after the security review ----
+def test_unreadable_colours_are_rejected():
+    import leeloo_packs as lp
+    base = {"pack": 1, "id": "x", "name": "x"}
+    black = dict(base, theme={"colors": {k: "#000000" for k in ("bg", "green", "purple", "lavender", "tan", "white")}})
+    errors = lp.validate_pack(black)
+    assert errors and all("too close to the background" in e for e in errors) and len(errors) == 5
+    assert any("background" in e for e in lp.validate_pack(dict(base, theme={"colors": {"bg": "#FFFFFF"}})))
+    assert lp.validate_pack(dict(base, theme={"colors": {"bg": "#000000"}})) == []
+    assert round(lp.contrast_ratio("#000000", "#FFFFFF"), 1) == 21.0
+    assert round(lp.contrast_ratio("#1A1D2E", "#1A1D2E"), 1) == 1.0
+
+
+def test_lone_surrogates_and_huge_numbers_do_not_break_the_validator(tmp_path):
+    import leeloo_packs as lp
+    assert lp.validate_pack({"pack": 1, "id": "x", "name": "a\ud800"}) == ["pack: has an invalid character"]
+    assert lp.validate_pack({"pack": 1, "id": "x", "name": "x", "rotate_seconds": 10 ** 400})   # an error list, no exception
+    mgr = lp.PackManager(str(tmp_path / "pack.json"))
+    assert mgr.install({"pack": 1, "id": "x", "name": "a\ud800"}) and mgr.pack is None

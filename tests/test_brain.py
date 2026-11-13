@@ -1217,3 +1217,24 @@ def test_queued_pack_offer_is_kept_for_later(brain):
     asyncio.run(go())
     assert brain._offered_pack and brain._offered_pack[0] == "Amy" and brain.packs.pack is None
     assert brain.message_mgr.get_unread_counts() == {"Amy": 1}
+
+
+# ---- after the security review of packs ----
+def test_broken_pack_render_falls_back_to_the_default_look(brain, monkeypatch):
+    brain.packs.install(UNC)
+    real = brain.display.render
+
+    def render(*a, **k):
+        if k.get('header'):
+            raise RuntimeError("boom")
+        return real(*a, **k)
+    monkeypatch.setattr(brain.display, "render", render)
+    assert brain._render_normal(True) is True          # the screen is still drawn
+    assert brain.packs.pack is None                     # the pack is gone
+
+
+def test_old_pack_offer_expires(brain):
+    brain._on_pack_offer("Amy", UNC, notify=False)
+    brain._offered_pack_at -= brain_mod.PACK_OFFER_TTL + 1
+    run_voice(brain, Intent("PACK_ACCEPT", {}, ""))
+    assert brain.packs.pack is None and "no look to use" in frame_text(brain)

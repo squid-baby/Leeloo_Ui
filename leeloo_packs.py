@@ -48,7 +48,12 @@ _TEMPLATE_RE = re.compile(r'\{([A-Za-z0-9_.]+)\}')
 
 def _is_number(v):
     """A JSON number (bool is not a number; NaN / Infinity are not JSON)."""
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return False
+    try:
+        return math.isfinite(v)
+    except OverflowError:      # an integer too large for a float
+        return False
 
 
 def _is_integer(v):
@@ -89,6 +94,50 @@ def _check_range(value, path, errors, low, high, integer=False):
         errors.append(f"{path}: not in {low} to {high}")
 
 
+# Readable screen rule (docs/PACKS.md): the same numbers as the relay.
+_DEFAULT_PALETTE = {'bg': '#1A1D2E', 'green': '#7beec0', 'purple': '#9C93DD',
+                    'lavender': '#d978f9', 'tan': '#C2995E', 'white': '#FFFFFF'}
+_TEXT_COLOR_KEYS = ('green', 'purple', 'lavender', 'tan', 'white')
+MIN_CONTRAST = 2.0
+
+
+def _luminance(hex_color):
+    def channel(i):
+        c = int(hex_color[i:i + 2], 16) / 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    return 0.2126 * channel(1) + 0.7152 * channel(3) + 0.0722 * channel(5)
+
+
+def contrast_ratio(a, b):
+    """WCAG contrast ratio of two #RRGGBB colours (1.0 to 21.0)."""
+    la, lb = _luminance(a), _luminance(b)
+    return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+
+
+def _check_contrast(colors, errors):
+    """A pack must not make the screen unreadable (e.g. all colours black)."""
+    merged = dict(_DEFAULT_PALETTE)
+    for key, value in colors.items():
+        if key in merged and isinstance(value, str) and _COLOR_RE.fullmatch(value):
+            merged[key] = value
+    for key in _TEXT_COLOR_KEYS:
+        ratio = contrast_ratio(merged[key], merged['bg'])
+        if ratio < MIN_CONTRAST:
+            errors.append(f"theme.colors.{key}: too close to the background colour "
+                          f"(contrast {ratio:.2f}, need {MIN_CONTRAST:.1f})")
+
+
+def _has_surrogate(value):
+    """True if any string inside value holds a lone surrogate (cannot be stored as UTF-8)."""
+    if isinstance(value, str):
+        return any(0xD800 <= ord(ch) <= 0xDFFF for ch in value)
+    if isinstance(value, dict):
+        return any(_has_surrogate(k) or _has_surrogate(v) for k, v in value.items())
+    if isinstance(value, list):
+        return any(_has_surrogate(v) for v in value)
+    return False
+
+
 def _check_theme(theme, errors):
     if not isinstance(theme, dict):
         errors.append("theme: not an object")
@@ -106,6 +155,7 @@ def _check_theme(theme, errors):
                     errors.append(f"{path}: unknown key")
                 elif not isinstance(value, str) or not _COLOR_RE.fullmatch(value):
                     errors.append(f"{path}: not a #RRGGBB colour")
+            _check_contrast(colors, errors)
 
     if 'header' in theme:
         _check_text(theme['header'], "theme.header", errors, 1, 12)
@@ -275,6 +325,11 @@ def validate_pack(pack) -> list:
         return ["pack: not JSON data"]
     if size > MAX_PACK_BYTES:
         return [f"pack: larger than {MAX_PACK_BYTES} bytes"]
+    try:
+        if _has_surrogate(pack):
+            return ["pack: has an invalid character"]
+    except RecursionError:
+        return ["pack: not JSON data"]
 
     errors = []
     _unknown_keys(pack, _TOP_KEYS, "", errors)
