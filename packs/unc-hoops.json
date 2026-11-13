@@ -1,0 +1,66 @@
+{
+  "pack": 1,
+  "id": "unc-hoops",
+  "name": "UNC Hoops",
+  "theme": {
+    "colors": { "bg": "#13294B", "tan": "#7BAFD4", "lavender": "#FFFFFF", "purple": "#B9D9EB", "green": "#7BAFD4" },
+    "header": "GO HEELS",
+    "labels": { "messages": "crew" }
+  },
+  "sources": [
+    {
+      "id": "game",
+      "url": "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/teams/153",
+      "every": 60,
+      "fields": {
+        "state": "team.nextEvent.0.competitions.0.status.type.state",
+        "when": "team.nextEvent.0.competitions.0.status.type.shortDetail",
+        "match": "team.nextEvent.0.shortName",
+        "clock": "team.nextEvent.0.competitions.0.status.displayClock",
+        "period": "team.nextEvent.0.competitions.0.status.period",
+        "home": "team.nextEvent.0.competitions.0.competitors.0.team.abbreviation",
+        "home_score": "team.nextEvent.0.competitions.0.competitors.0.score",
+        "away": "team.nextEvent.0.competitions.0.competitors.1.team.abbreviation",
+        "away_score": "team.nextEvent.0.competitions.0.competitors.1.score",
+        "record": "team.record.items.0.summary",
+        "standing": "team.standingSummary"
+      }
+    }
+  ],
+  "panels": [
+    {
+      "slot": "weather",
+      "title": "live",
+      "priority": 10,
+      "when": { "field": "game.state", "equals": "in" },
+      "rows": [
+        { "left": "{game.home}", "right": "{game.home_score}" },
+        { "left": "{game.away}", "right": "{game.away_score}" },
+        { "left": "period {game.period}", "right": "{game.clock}" }
+      ]
+    },
+    {
+      "slot": "weather",
+      "title": "final",
+      "priority": 5,
+      "when": { "field": "game.state", "equals": "post" },
+      "rows": [
+        { "left": "{game.home}", "right": "{game.home_score}" },
+        { "left": "{game.away}", "right": "{game.away_score}" },
+        { "left": "final", "right": "{game.record}" }
+      ]
+    },
+    { "slot": "weather", "builtin": "weather" },
+    {
+      "slot": "weather",
+      "title": "next game",
+      "when": { "field": "game.state", "equals": "pre" },
+      "rows": [
+        { "left": "{game.match}" },
+        { "left": "{game.when}" },
+        { "left": "{game.record}", "right": "{game.standing}" }
+      ]
+    }
+  ],
+  "rotate_seconds": 20
+}

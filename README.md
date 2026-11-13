@@ -76,7 +76,7 @@ leeloo_brain.py         # Asyncio orchestrator — MAIN ENTRY POINT
 │   ├── _voice_interaction()   # tap → record → transcribe → classify → act
 │   ├── expand_frame()         # animate expand → typewriter → scroll → collapse
 │   ├── _scroll_content()      # smooth scroll for overflowed text
-│   └── _search_and_push_song() # Spotify search + album art + push to crew
+│   └── show_frame()            # The one way to open an expanded frame
 ├── Subsystems:
 │   ├── TapManager       (leeloo_tap.py)     # ADXL345 accelerometer tap detection
 │   ├── VoiceManager     (leeloo_voice.py)   # INMP441 mic → Deepgram Nova-2 STT
@@ -151,8 +151,8 @@ sudo systemctl stop gadget.service
 # Run the weather expansion demo
 python3 demo_weather_typewriter.py
 
-# Run the UI manager demo
-python3 leeloo_ui_manager.py
+# Run the automated tests (no Pi needed)
+python3 -m pytest
 
 # Run the reaction GIF demo
 python3 demo_message_expand.py
@@ -206,8 +206,7 @@ TipTop UI/
 ├── leeloo_client.py         # WebSocket relay client
 ├── leeloo_music_manager.py  # Spotify currently playing + listeners
 ├── leeloo_album_art.py      # Centralized album art (243x304)
-├── leeloo_spotify.py        # Spotify scancode generation
-├── gadget_main.py           # Legacy main loop (replaced by brain)
+├── tests/                   # Automated tests (python3 -m pytest)
 ├── gadget_display.py        # LeelooDisplay renderer
 ├── gadget_weather.py        # Open-Meteo weather API
 ├── text_scroller.py         # Text truncation utilities

@@ -16,23 +16,29 @@ SCANCODE_HEIGHT = 60    # Bottom bar height
 TOTAL_HEIGHT = 304      # Total: 244 + 60 = 304
 
 # Path to custom "Now Playing" bar image
-LEELOO_HOME = "/home/pi/leeloo-ui"
+LEELOO_HOME = os.environ.get("LEELOO_HOME", "/home/pi/leeloo-ui")
 NOW_PLAYING_PNG = os.path.join(LEELOO_HOME, "nowplaying.png")
 
 
-def get_album_art_path(spotify_uri, album_art_dir):
+def get_album_art_path(spotify_uri, album_art_dir, source='currently_playing'):
     """
     Get the expected path for cached album art based on Spotify URI
-    
+
+    The same track has two different images: "Now Playing" bar
+    (source='currently_playing') and scancode bar (source='shared').
+    They get different file names so that one never hides the other.
+
     Args:
         spotify_uri: Spotify URI (e.g., 'spotify:track:...')
         album_art_dir: Directory where album art is cached
-    
+        source: 'currently_playing' or 'shared'
+
     Returns:
         Path to cached album art file
     """
     uri_hash = hashlib.md5(spotify_uri.encode()).hexdigest()[:12]
-    return os.path.join(album_art_dir, f"{uri_hash}.jpg")
+    suffix = "_shared" if source == 'shared' else ""
+    return os.path.join(album_art_dir, f"{uri_hash}{suffix}.jpg")
 
 
 def create_now_playing_image(album_art_img):
@@ -137,7 +143,7 @@ def download_and_create_album_art(album_art_url, spotify_uri, album_art_dir, sou
     os.makedirs(album_art_dir, exist_ok=True)
     
     # Get cache path
-    art_path = get_album_art_path(spotify_uri, album_art_dir)
+    art_path = get_album_art_path(spotify_uri, album_art_dir, source)
     
     # Check if already cached
     if os.path.exists(art_path):
@@ -149,7 +155,7 @@ def download_and_create_album_art(album_art_url, spotify_uri, album_art_dir, sou
         if response.status_code != 200:
             return None
         
-        album_art_img = Image.open(BytesIO(response.content))
+        album_art_img = Image.open(BytesIO(response.content)).convert('RGB')
         
         # Create appropriate image based on source
         if source == 'currently_playing':
@@ -160,7 +166,7 @@ def download_and_create_album_art(album_art_url, spotify_uri, album_art_dir, sou
             if scancode_url:
                 scancode_response = requests.get(scancode_url, timeout=10)
                 if scancode_response.status_code == 200:
-                    scancode_img = Image.open(BytesIO(scancode_response.content))
+                    scancode_img = Image.open(BytesIO(scancode_response.content)).convert('RGB')
                     final_img = create_shared_image(album_art_img, scancode_img)
                 else:
                     # Fallback: no scancode, use "Now Playing" bar
@@ -169,8 +175,11 @@ def download_and_create_album_art(album_art_url, spotify_uri, album_art_dir, sou
                 # No scancode provided, use "Now Playing" bar
                 final_img = create_now_playing_image(album_art_img)
         
-        # Save to cache
-        final_img.save(art_path, "JPEG", quality=95)
+        # Save to cache (write to a temp name first: the display thread
+        # must never read a half-written file)
+        tmp_path = art_path + ".tmp"
+        final_img.convert('RGB').save(tmp_path, "JPEG", quality=95)
+        os.replace(tmp_path, art_path)
         print(f"   Created album art: {art_path} ({source})")
         return art_path
         

@@ -71,3 +71,14 @@ reference_*.png
 Gadget Images/
 assets/reference/
 assets/test-output/
+
+# Relay server
+leeloo_server/node_modules/
+leeloo_server/data/
+
+# Test caches
+.pytest_cache/
+
+# Telegram bot state
+leeloo_server/bot_state.json*
+.envrc

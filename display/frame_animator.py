@@ -12,6 +12,7 @@ The tradeoff: Slightly slower, but NO TEARING.
 from enum import Enum
 from dataclasses import dataclass
 from typing import Tuple, Optional, Callable, List
+import asyncio
 import time
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -72,6 +73,17 @@ def get_frame_geometries(box_right: int = 153):
         FrameType.MESSAGES: FrameGeometry(x=left_padding, y=162, width=width, height=28, color=COLORS['lavender'], label="messages"),
         FrameType.ALBUM: FrameGeometry(x=left_padding, y=198, width=width, height=108, color=COLORS['green'], label="album"),
     }
+
+
+# Palette key of each frame's border colour. The colour is looked up when an
+# animation starts, so it follows the active pack theme (COLORS is updated
+# in place by LeelooDisplay.apply_theme).
+FRAME_COLOR_KEYS = {
+    FrameType.WEATHER: 'tan',
+    FrameType.TIME: 'purple',
+    FrameType.MESSAGES: 'lavender',
+    FrameType.ALBUM: 'green',
+}
 
 
 def get_expanded_geometry(box_right: int = 153, color: str = '#A7AFD4', label: str = ""):
@@ -136,19 +148,25 @@ def write_region_to_framebuffer_rowbyrow(
     This is the KEY FIX - matches the working GIF approach.
     Slower than memmap, but no tearing!
     """
+    with open(fb_path, 'r+b', buffering=0) as fb:
+        _write_region_rows(fb, rgb565_array, x, y, screen_width)
+
+
+def _write_region_rows(fb, rgb565_array: np.ndarray, x: int, y: int, screen_width: int = SCREEN_WIDTH):
+    """Row-by-row write of an RGB565 region to an already-open framebuffer.
+
+    `fb` must be opened unbuffered ('r+b', buffering=0) so every row reaches
+    the device immediately (a buffered tail row would show up a frame late).
+    """
     height, width = rgb565_array.shape
+    row_bytes = width * 2
+    data = rgb565_array.tobytes()  # one conversion, sliced per row below
+    view = memoryview(data)
 
-    with open(fb_path, 'r+b') as fb:
-        for row in range(height):
-            # Calculate byte offset for this row
-            offset = ((y + row) * screen_width + x) * 2
-
-            # Get row data as bytes
-            row_data = rgb565_array[row, :].tobytes()
-
-            # Seek and write
-            fb.seek(offset)
-            fb.write(row_data)
+    for row in range(height):
+        # Seek to this row's byte offset and write it
+        fb.seek(((y + row) * screen_width + x) * 2)
+        fb.write(view[row * row_bytes:(row + 1) * row_bytes])
 
 
 class FrameAnimator:
@@ -265,6 +283,17 @@ class FrameAnimator:
 
         return processed_frames
 
+    def _collapsed_geometry(self, frame_type: FrameType) -> FrameGeometry:
+        """Collapsed geometry of a frame with its colour in the CURRENT
+        palette (self.frame_geometries holds the colours of the moment the
+        animator was made)."""
+        geom = self.frame_geometries[frame_type]
+        color = COLORS.get(FRAME_COLOR_KEYS.get(frame_type), geom.color)
+        if color == geom.color:
+            return geom
+        return FrameGeometry(x=geom.x, y=geom.y, width=geom.width, height=geom.height,
+                             color=color, label=geom.label)
+
     def expand(
         self,
         frame_type: FrameType,
@@ -272,7 +301,7 @@ class FrameAnimator:
         on_complete: Optional[Callable] = None
     ):
         """Animate a frame expanding from collapsed to full size"""
-        collapsed = self.frame_geometries[frame_type]
+        collapsed = self._collapsed_geometry(frame_type)
         expanded = FrameGeometry(
             x=self.expanded_geometry.x,
             y=self.expanded_geometry.y,
@@ -290,7 +319,7 @@ class FrameAnimator:
         on_complete: Optional[Callable] = None
     ):
         """Animate a frame collapsing from full size back to collapsed"""
-        collapsed = self.frame_geometries[frame_type]
+        collapsed = self._collapsed_geometry(frame_type)
         expanded = FrameGeometry(
             x=self.expanded_geometry.x,
             y=self.expanded_geometry.y,
@@ -325,24 +354,23 @@ class FrameAnimator:
         frame_time = 1.0 / self.FPS
         start_time = time.time()
 
-        for frame_idx in range(self.FRAME_COUNT):
-            frame_array = processed_frames[frame_idx]
+        # Framebuffer is opened once for the whole animation (None in preview mode)
+        fb = None if self.preview_mode else open(self.fb_path, 'r+b', buffering=0)
+        try:
+            for frame_idx in range(self.FRAME_COUNT):
+                if fb is not None:
+                    # KEY FIX: Use row-by-row file I/O instead of memmap
+                    _write_region_rows(fb, processed_frames[frame_idx], region_x, region_y)
 
-            if not self.preview_mode:
-                # KEY FIX: Use row-by-row file I/O instead of memmap
-                write_region_to_framebuffer_rowbyrow(
-                    frame_array,
-                    region_x,
-                    region_y,
-                    self.fb_path
-                )
-
-            # Maintain timing
-            elapsed = time.time() - start_time
-            next_frame_time = (frame_idx + 1) * frame_time
-            sleep_time = next_frame_time - elapsed
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+                # Maintain timing
+                elapsed = time.time() - start_time
+                next_frame_time = (frame_idx + 1) * frame_time
+                sleep_time = next_frame_time - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+        finally:
+            if fb is not None:
+                fb.close()
 
         actual_duration = time.time() - start_time
         actual_fps = self.FRAME_COUNT / actual_duration
@@ -362,7 +390,7 @@ class FrameAnimator:
         on_complete: Optional[Callable] = None
     ):
         """Async version of expand — yields to event loop between frames"""
-        collapsed = self.frame_geometries[frame_type]
+        collapsed = self._collapsed_geometry(frame_type)
         expanded = FrameGeometry(
             x=self.expanded_geometry.x,
             y=self.expanded_geometry.y,
@@ -380,7 +408,7 @@ class FrameAnimator:
         on_complete: Optional[Callable] = None
     ):
         """Async version of collapse — yields to event loop between frames"""
-        collapsed = self.frame_geometries[frame_type]
+        collapsed = self._collapsed_geometry(frame_type)
         expanded = FrameGeometry(
             x=self.expanded_geometry.x,
             y=self.expanded_geometry.y,
@@ -399,35 +427,36 @@ class FrameAnimator:
         on_complete: Optional[Callable]
     ):
         """Run animation with async sleep for non-blocking playback"""
-        import asyncio
-
         region = (7, 10, self.box_right - 7, 296)
         region_x, region_y, region_width, region_height = region
 
-        # Pre-process all frames (CPU-bound, runs synchronously)
-        processed_frames = self._preprocess_frames(start_geom, end_geom, region, content_drawer)
+        # Pre-process all frames in a worker thread (CPU-bound PIL work must
+        # not run on the event loop). content_drawer is called in that thread.
+        loop = asyncio.get_running_loop()
+        processed_frames = await loop.run_in_executor(
+            None, self._preprocess_frames, start_geom, end_geom, region, content_drawer
+        )
 
         # Play animation with async sleep between frames
         frame_time = 1.0 / self.FPS
         start_time = time.time()
 
-        for frame_idx in range(self.FRAME_COUNT):
-            frame_array = processed_frames[frame_idx]
+        # Framebuffer is opened once for the whole animation (None in preview mode)
+        fb = None if self.preview_mode else open(self.fb_path, 'r+b', buffering=0)
+        try:
+            for frame_idx in range(self.FRAME_COUNT):
+                if fb is not None:
+                    _write_region_rows(fb, processed_frames[frame_idx], region_x, region_y)
 
-            if not self.preview_mode:
-                write_region_to_framebuffer_rowbyrow(
-                    frame_array,
-                    region_x,
-                    region_y,
-                    self.fb_path
-                )
-
-            # Maintain timing with async sleep (yields to event loop!)
-            elapsed = time.time() - start_time
-            next_frame_time = (frame_idx + 1) * frame_time
-            sleep_time = next_frame_time - elapsed
-            if sleep_time > 0:
-                await asyncio.sleep(sleep_time)
+                # Maintain timing with async sleep. Always yield at least once
+                # per frame, even when running late (sleep(0)), so the event
+                # loop (audio reads!) is never starved.
+                elapsed = time.time() - start_time
+                next_frame_time = (frame_idx + 1) * frame_time
+                await asyncio.sleep(max(0.0, next_frame_time - elapsed))
+        finally:
+            if fb is not None:
+                fb.close()
 
         if on_complete:
             on_complete()
