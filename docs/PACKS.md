@@ -60,8 +60,8 @@ All panels in version 1 fill the **weather box** (three rows). Two forms:
 2. Custom: `{ "slot": "weather", "title", "rows", "when", "priority" }`
    - `title`: optional, 1 to 10 characters. Label of the box for this panel.
    - `rows`: 1 to 3 rows. Each row: `{ "left", "right", "bar" }`.
-     - `left`: required text template, 28 characters at most.
-     - `right`: optional text template, 14 characters at most.
+     - `left`: required text template, 28 characters at most (the text outside `{...}` is counted).
+     - `right`: optional text template, 14 characters at most (counted the same way).
      - `bar`: optional `{ "value": template, "max": number > 0 }`. Draws the
        12-box slider at the right. A row has `right` or `bar`, not the two.
    - A template puts values in with `{source_id.field}`. A value that is not

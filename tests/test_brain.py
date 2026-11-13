@@ -1108,7 +1108,10 @@ def test_agent_installs_pack_and_screen_changes(brain):
     assert after != before                               # Carolina navy, not the default background
     # A new brain (restart) keeps the pack
     assert LeelooBrain().packs.pack['id'] == 'unc-hoops'
-    brain._reset_pack()
+    async def undo():
+        brain._reset_pack()
+        await asyncio.sleep(0.05)
+    asyncio.run(undo())
     brain._render_normal(True)
     assert brain.display.image.getpixel((300, 2)) == before
 

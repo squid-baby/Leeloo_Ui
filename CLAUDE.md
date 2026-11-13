@@ -76,10 +76,33 @@ Tap device → speak → Haiku classifies:
 | `HANG_CONFIRM` | "i'm in" | Confirms a friend's proposal (you cannot confirm your own) |
 | `SPOTIFY_SETUP` | "connect spotify" | Shows the Spotify QR code again |
 | `TELEGRAM_SETUP` | "telegram setup" | Shows the bot name and crew code |
+| `AGENT_CONNECT` | "connect my agent" | QR code for the page that makes the agent's connector link |
+| `AGENT_DISCONNECT` | "disconnect my agent" | Deletes all connector links of this device |
+| `PACK_ACCEPT` | "use it" | Installs the look that a friend offered |
+| `PACK_RESET` | "default look" | Removes the installed look |
 
 Taps: single = talk (or close the open frame). Double = nudge when idle, love on a crew
 message. Triple = fire on a crew message. Reactions work ONLY on frames opened with
 `show_frame(..., reactable=True)`.
+
+## Packs and Agent Connect
+
+Full specification: `docs/PACKS.md`. Example: `packs/unc-hoops.json`.
+
+- A **pack** is one JSON file: colours, header, box labels, data sources and up to 6
+  panels for the weather box, with `when` conditions and rotation. It is **data, not
+  code**. Never add a pack feature that runs code or shell text from a pack.
+- `leeloo_packs.py` (device) and `validatePack()` in `leeloo_server/server.js` (relay)
+  check the same rules. Change both, plus `docs/PACKS.md`, together. The relay keeps a
+  copy of the guide and the example; `npm test` fails if the copies differ.
+- The **relay** fetches the pack's data sources (allowed hosts only) one time for all
+  devices and sends `pack_data`. The device never fetches a pack URL.
+- A pack from the owner's agent installs at once. A pack from a friend is only
+  **offered**; the user says "use it".
+- The agent's connector link `https://leeloobot.xyz/mcp/<token>` is a key to one
+  device. The relay stores only its hash. Never print or log a token.
+- `tests/test_e2e_agent_connect.py` runs the real Node relay with the real Python
+  client and an MCP agent call.
 
 ## Key Conventions
 

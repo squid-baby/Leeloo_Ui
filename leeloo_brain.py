@@ -1321,6 +1321,13 @@ class LeelooBrain:
             art = self.album_art_path
             self.display.apply_theme(self.packs.theme_colors())   # cheap when unchanged
             panel = self.packs.current_panel()
+            if panel:   # pack text comes from outside: only characters the font has
+                panel = {
+                    'title': clean_display_text(panel.get('title')) or None,
+                    'rows': [{'left': clean_display_text(r.get('left')),
+                              'right': clean_display_text(r.get('right')) or None,
+                              'bar': r.get('bar')} for r in panel.get('rows', [])],
+                }
             pack_sig = self.packs.signature()
 
             if status in ("listening...", "thinking..."):
