@@ -74,8 +74,8 @@ SPOTIFY_REDIRECT_URI=https://leeloobot.xyz/spotify/callback
   nothing else: queued messages, pending Spotify tokens and pending pack
   installs of the id are discarded, and its agent links are deleted. (Somebody
   who knows the crew code could be first, so the relay gives that bind no
-  secrets.) For an id that the relay does not know, pending Spotify tokens
-  are sent on the first bind WITH the key, not on the bind that makes it.
+  secrets.) Pending Spotify tokens are deleted on every bind that makes a
+  key: a device must have registered one time before its Spotify login.
 - **Lost key** (new SD card, restored config): stop the relay, run
   `node reset_device_key.js data/state.json <device_id>`, start the relay.
   The tool removes the key hash and the agent links of that one device and
@@ -84,11 +84,18 @@ SPOTIFY_REDIRECT_URI=https://leeloobot.xyz/spotify/callback
 - **One crew per device**: a device that binds to another crew leaves the old
   roster, and its agent links and open connect codes are deleted.
 - **Limits** (options of `createRelay`): `maxCrewMembers` 12 devices per crew.
-  When the roster is full and a new device joins, the member that is not
-  connected and was seen longest ago leaves the roster (its queue, pack and
-  agent links go, its key stays); `crew_full` only when all 12 are connected.
+  When the roster is full and a new device joins, a member can lose its
+  place only if it is not connected and (a) was not seen for 30 days
+  (`evictAfterMs`), or (b) is a "ghost": bound one time in its life, 24 h ago
+  or more (`ghostAfterMs`). Ghosts go first. The one that leaves loses its
+  queue, pack, agent links and pending Spotify tokens; its key stays. No
+  such member: `crew_full`. Members from older state files count as real
+  devices seen at the first start of this version.
   The first join of a device to a roster costs one unit of the per-IP
-  budget. `maxCrews` 5000 (`server_full` error). `maxCrewSourceUrls` 6 and `maxSourceUrls` 50 source
+  budget. `maxCrews` 5000 (`server_full` error); a crew with no members, no
+  Telegram users and no queue is removed after 24 h. `maxCrewSourceUrls` 6,
+  `maxSourceUrlsPerIp` 6 (per client address; IPv6: per /64) and
+  `maxSourceUrls` 50 source
   URLs polled at one time (sources over a limit are not polled, the pack
   stays active), `maxDevicePacks` 2000, `maxDeviceKeys` 20000. A new device
   id without a crew uses the per-IP budget of failed attempts. `pack_active`
@@ -98,8 +105,11 @@ SPOTIFY_REDIRECT_URI=https://leeloobot.xyz/spotify/callback
 - **Messages**: the JSON of a `payload` is 2,048 bytes at most (9,000 for
   `pack_offer`), else `message_too_large`. `maxMessagesPerMinute` 30 relayed
   messages per device (`rate_limited`). Offline queues: 50 messages and
-  `queueMaxBytes` 64 KB per device, `queuesMaxBytes` 20 MB for all (the
-  oldest messages are dropped).
+  `queueMaxBytes` 64 KB per device, `crewQueueMaxBytes` 512 KB per crew,
+  `queuesMaxBytes` 20 MB for all. Over a limit the oldest messages go: of
+  the device, of the crew, or (total) of the crew that holds the most bytes.
+  The Telegram message route has the same size and rate limits (per
+  Telegram user).
 - **Network**: the relay listens on `127.0.0.1` (env `HOST`, option `host`)
   because nginx is in front of it. Set `HOST=0.0.0.0` only when there is no
   proxy. The per-IP limiter takes the client address from `X-Forwarded-For`,

@@ -589,21 +589,26 @@ test('Spotify callback rejects error responses and forwards good tokens', async 
   const auth = await alice.next('spotify_auth_complete');
   assert.deepEqual(auth.tokens, { access_token: 'AT', refresh_token: 'RT', expires_in: 3600 });
 
-  // Success, device offline: stored, then delivered on connect
+  // A device that registered before (it has its key) gets them on connect
+  await alice.close();
+  res = await fetch(`${relay.httpUrl}/spotify/callback?code=abc&state=a1`);
+  assert.equal(res.status, 200);
+  await res.text();
+  assert.equal(relay.state.pendingSpotifyTokens.has('a1'), true);
+  const alice2 = await connect(relay);
+  assert.equal((await alice2.register('a1', 'LEELOO')).type, 'registered');
+  assert.equal((await alice2.next('spotify_auth_complete')).tokens.access_token, 'AT');
+  assert.equal(relay.state.pendingSpotifyTokens.size, 0);
+
+  // An id that never registered: the bind that makes its device key does not
+  // get them (anybody can be first with an id). They are deleted.
   res = await fetch(`${relay.httpUrl}/spotify/callback?code=abc&state=late1`);
   assert.equal(res.status, 200);
   await res.text();
   assert.equal(relay.state.pendingSpotifyTokens.has('late1'), true);
-  // The bind that makes the device key does not get them (anybody can be
-  // first with an id). The next bind, with the key, does.
   const late = await connect(relay);
   assert.equal((await late.register('late1', 'LEELOO')).type, 'registered');
   assert.deepEqual(await late.drain('spotify_auth_complete'), []);
-  assert.equal(relay.state.pendingSpotifyTokens.has('late1'), true);
-  await late.close();
-  const late2 = await connect(relay);
-  assert.equal((await late2.register('late1', 'LEELOO')).type, 'registered');
-  assert.equal((await late2.next('spotify_auth_complete')).tokens.access_token, 'AT');
   assert.equal(relay.state.pendingSpotifyTokens.size, 0);
 
   assert.equal((await fetch(`${relay.httpUrl}/spotify/callback`)).status, 400);

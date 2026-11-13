@@ -167,11 +167,17 @@ test('an id that the relay does not know: the bind that makes the key gets no Sp
   relay.state.pendingSpotifyTokens.set('new1', { tokens: { access_token: 'AT' }, timestamp: Date.now() });
 
   const squatter = await connect(relay);
-  squatter.send({ type: 'create_crew', device_id: 'new1', display_name: 'X' });
-  const created = await squatter.next();
-  assert.match(created.device_key, /^[0-9a-f]{64}$/);
+  squatter.send({ type: 'register', device_id: 'new1' });
+  const registered = await squatter.next();
+  assert.match(registered.device_key, /^[0-9a-f]{64}$/);
+  assert.equal(relay.state.pendingSpotifyTokens.has('new1'), false, 'deleted, not kept for later');
+
+  // The review: a second bind on the same socket (or with the new key) got them
+  squatter.send({ type: 'register', device_id: 'new1' });
+  assert.equal((await squatter.next()).type, 'registered');
+  squatter.send({ type: 'create_crew', device_id: 'new1', device_key: registered.device_key });
+  assert.equal((await squatter.next()).type, 'crew_created');
   assert.deepEqual(await squatter.drain('spotify_auth_complete'), []);
-  assert.equal(relay.state.pendingSpotifyTokens.has('new1'), true);
 });
 
 test('impersonation with odd device_key values is refused (attack a1)', async () => {
@@ -417,7 +423,10 @@ test('the queue flood of the review stays small with the default limits', async 
   assert.ok(fs.statSync(relay.dataFile).size < 700000, `${fs.statSync(relay.dataFile).size} bytes`);
   assert.ok(relay.state.queuedBytes <= 9 * 65536);
   const q1 = relay.state.queues.get('q1');
-  assert.ok(q1.length >= 30 && q1.length <= 33, `${q1.length} messages of 1.9 KB fit in 64 KB`);
+  // 9 queues share the 512 KB of the crew: about 27 messages of 1.9 KB each
+  assert.ok(q1.length >= 20 && q1.length <= 33, `${q1.length} messages`);
+  assert.ok(relay.state.crewQueuedBytes.get(code) <= 512 * 1024);
+  assert.equal(relay.state.crewQueuedBytes.get(code), relay.state.queuedBytes);
   assert.ok(q1.every((entry) => entry.message.payload.text.startsWith('B')), 'no 63 KB message got in');
   assert.equal((await boss.drain('error')).filter((e) => e.error === 'message_too_large').length, 50);
 });
@@ -543,71 +552,174 @@ test('a first join to a roster costs one unit of the address budget', async () =
   assert.equal((await back.joinCrew(code, 'ghost0', 'G')).type, 'crew_joined');
 });
 
-test('a full roster: the member that was offline longest leaves, real devices get in', async () => {
+test('ghost ids cannot push real members off a full roster (review b1)', async () => {
   const clock = fakeClock();
-  const relay = await relayUp({ now: clock, maxCrewMembers: 4 });
-  const vic = await connect(relay);
-  const { crew_code: code } = await vic.createCrew('vic', 'Vic');
+  const relay = await relayUp({ now: clock, maxCrewMembers: 5 });
+  const members = () => Array.from(relay.state.crews.get(code).members.keys()).sort();
 
-  // Three ghosts fill the roster and go offline, one after the other
-  const ghosts = [];
-  for (let i = 0; i < 3; i++) {
-    clock.advance(1000);
-    const ghost = await connect(relay, from(`198.51.100.${i}`));
-    await ghost.joinCrew(code, `ghost${i}`, `G${i}`);
-    ghosts.push(ghost);
+  // A real crew: a stays connected; b and c have a link, a pack and go offline
+  const a = await connect(relay, from('10.0.0.1'));
+  const { crew_code: code } = await a.createCrew('real_a', 'A');
+  const tokens = {};
+  for (const id of ['real_b', 'real_c']) {
+    // Real devices come back now and then (here: one reconnect), ghosts do not
+    const firstVisit = await connect(relay, from('10.0.0.1'));
+    await firstVisit.joinCrew(code, id, id);
+    await firstVisit.close();
+    await waitFor(() => !relay.state.devices.has(id), 'offline');
+    const client = await connect(relay, from('10.0.0.1'));
+    await client.joinCrew(code, id, id);
+    client.send({ type: 'agent_connect_request' });
+    const { code: connectCode } = await client.next('agent_connect');
+    const page = await (await fetch(`${relay.httpUrl}/connect/${connectCode}`, { method: 'POST' })).text();
+    tokens[id] = /\/mcp\/([0-9a-f]{64})/.exec(page)[1];
+    client.send({ type: 'pack_active', pack: { pack: 1, id: 'mine', name: 'Mine' } });
+    await client.sync();
+    await client.close();
+    await waitFor(() => !relay.state.devices.has(id), 'offline');
+    clock.advance(60000);
   }
-  // ghost1 has an agent link, a pack and a pending install
-  ghosts[1].send({ type: 'agent_connect_request' });
-  const { code: connectCode } = await ghosts[1].next('agent_connect');
-  const page = await (await fetch(`${relay.httpUrl}/connect/${connectCode}`, { method: 'POST' })).text();
-  const token = /\/mcp\/([0-9a-f]{64})/.exec(page)[1];
-  ghosts[1].send({ type: 'pack_active', pack: { pack: 1, id: 'g', name: 'G' } });
-  await ghosts[1].sync();
-  for (const i of [1, 0, 2]) { // ghost1 goes first: it is the one seen longest ago
-    clock.advance(1000);
-    await ghosts[i].close();
-    await waitFor(() => !relay.state.devices.has(`ghost${i}`), 'ghost offline');
+  a.sendMessage('text', { text: 'for b and c' });
+  await a.sync();
+
+  // The attacker knows the crew code: one address, one socket, ghost after ghost
+  const attacker = await connect(relay, from('6.6.6.6'));
+  const results = [];
+  for (let i = 0; i < 30; i++) {
+    const reply = await attacker.joinCrew(code, `ghost${i}`, 'G');
+    if (reply.error === 'rate_limited') {
+      clock.advance(10 * 60000 + 1);
+      i--;
+      continue;
+    }
+    results.push(reply.error || reply.type);
   }
-  vic.sendMessage('text', { text: 'for the offline ones' });
-  await vic.sync();
-  relay.state.pendingPackOps.set('ghost1', { message: { type: 'pack_reset' }, timestamp: clock() });
-  assert.equal(relay.state.queues.has('ghost1'), true);
-  assert.equal(await mcpStatus(relay, token), 200);
+  // Two free places, then the roster is full: nobody leaves for a ghost
+  assert.deepEqual(results.slice(0, 3), ['crew_joined', 'crew_joined', 'crew_full']);
+  assert.ok(results.slice(2).every((r) => r === 'crew_full'));
+  assert.deepEqual(members(), ['ghost0', 'ghost1', 'real_a', 'real_b', 'real_c']);
+  for (const id of ['real_b', 'real_c']) {
+    assert.equal(relay.state.queues.get(id).length, 1, `${id} keeps its queue`);
+    assert.equal(relay.state.devicePacks.has(id), true, `${id} keeps its pack`);
+    assert.equal(await mcpStatus(relay, tokens[id]), 200, `${id} keeps its agent link`);
+  }
 
-  // A friend joins the full crew
-  const friend = await connect(relay, from('203.0.113.1'));
-  const joined = await friend.joinCrew(code, 'friend', 'Friend');
-  assert.equal(joined.type, 'crew_joined');
-  assert.deepEqual(Array.from(relay.state.crews.get(code).members.keys()).sort(), ['friend', 'ghost0', 'ghost2', 'vic']);
-  assert.equal(relay.state.memberCrew.has('ghost1'), false);
-  assert.equal(relay.state.queues.has('ghost1'), false);
-  assert.equal(relay.state.pendingPackOps.has('ghost1'), false);
-  assert.equal(relay.state.devicePacks.has('ghost1'), false);
-  assert.equal(await mcpStatus(relay, token), 401);
-  assert.equal(relay.state.deviceKeys.has('ghost1'), true, 'its key stays');
-  assert.equal(relay.state.queues.has('ghost0'), true, 'the others keep their queue');
+  // A real friend, one day later: the oldest ghost leaves, not a real member
+  await attacker.close();
+  await waitFor(() => !relay.state.devices.has('ghost1'), 'attacker offline');
+  clock.advance(24 * 3600000);
+  const friend = await connect(relay, from('10.0.0.2'));
+  assert.equal((await friend.joinCrew(code, 'friend', 'F')).type, 'crew_joined');
+  assert.deepEqual(members(), ['friend', 'ghost1', 'real_a', 'real_b', 'real_c']);
+  const friend2 = await connect(relay, from('10.0.0.3'));
+  assert.equal((await friend2.joinCrew(code, 'friend2', 'F2')).type, 'crew_joined');
+  assert.deepEqual(members(), ['friend', 'friend2', 'real_a', 'real_b', 'real_c']);
 
-  // The one that left can join again as itself (with its key); now ghost0 leaves
-  const ghost1 = await connect(relay, from('198.51.100.1'));
-  const back = await ghost1.joinCrew(code, 'ghost1', 'G1');
-  assert.equal(back.type, 'crew_joined');
-  assert.equal('device_key' in back, false);
-  assert.deepEqual(Array.from(relay.state.crews.get(code).members.keys()).sort(), ['friend', 'ghost1', 'ghost2', 'vic']);
+  // No ghost is left: b and c (offline for a day) stay, the next device waits
+  const friend3 = await connect(relay, from('10.0.0.4'));
+  assert.equal((await friend3.joinCrew(code, 'friend3', 'F3')).error, 'crew_full');
+  assert.equal(relay.state.queues.get('real_b').length, 1);
 
-  // Without its key nobody takes the id of a device that left
-  const thief = await connect(relay, from('203.0.113.9'));
-  thief.send({ type: 'join_crew', crew_code: code, device_id: 'ghost0', display_name: 'G0' });
-  assert.equal((await thief.next()).error, 'device_key_required');
-
-  // last_seen is in the state file
-  relay.flush();
-  const saved = JSON.parse(fs.readFileSync(relay.dataFile, 'utf8'));
-  assert.deepEqual(Object.keys(saved.crews[code].last_seen).sort(), ['friend', 'ghost1', 'ghost2', 'vic']);
+  // b comes back with its key: queue delivered (the message of yesterday is
+  // past the 24 h limit by now), link works
+  a.sendMessage('text', { text: 'fresh' });
+  await a.sync();
+  const b = await connect(relay, from('10.0.0.1'));
+  assert.equal((await b.joinCrew(code, 'real_b', 'real_b')).type, 'crew_joined');
+  assert.deepEqual((await b.drain('message')).map((m) => m.payload.text), ['fresh']);
+  assert.equal(await mcpStatus(relay, tokens.real_b), 200);
 });
 
-test('crew_full only when every member is connected right now', async () => {
-  const relay = await relayUp({ maxCrewMembers: 2 });
+test('a ghost is a member that was bound one time; one that came back is not', async () => {
+  const clock = fakeClock();
+  const relay = await relayUp({ now: clock, maxCrewMembers: 3 });
+  const a = await connect(relay);
+  const { crew_code: code } = await a.createCrew('a1', 'A');
+  const crew = relay.state.crews.get(code);
+
+  // once: bound one time (a second join on the SAME socket does not count)
+  const once = await connect(relay);
+  await once.joinCrew(code, 'once', 'Once');
+  await once.joinCrew(code, 'once', 'Once');
+  assert.equal(crew.binds.get('once'), 1);
+  await once.close();
+  // twice: came back on a new connection
+  clock.advance(1000);
+  for (let i = 0; i < 2; i++) {
+    const twice = await connect(relay);
+    await twice.joinCrew(code, 'twice', 'Twice');
+    await twice.close();
+    await waitFor(() => !relay.state.devices.has('twice'), 'offline');
+  }
+  assert.equal(crew.binds.get('twice'), 2);
+  relay.state.pendingSpotifyTokens.set('once', { tokens: { access_token: 'AT' }, timestamp: clock() });
+
+  // Before 24 h nobody can be put out
+  clock.advance(24 * 3600000 - 2000);
+  const early = await connect(relay);
+  assert.equal((await early.joinCrew(code, 'new1', 'N')).error, 'crew_full');
+
+  // After 24 h: the ghost leaves, with what was kept for it (its key stays)
+  clock.advance(2000);
+  assert.equal((await early.joinCrew(code, 'new1', 'N')).type, 'crew_joined');
+  assert.deepEqual(Array.from(crew.members.keys()).sort(), ['a1', 'new1', 'twice']);
+  assert.equal(relay.state.pendingSpotifyTokens.has('once'), false);
+  assert.equal(relay.state.deviceKeys.has('once'), true);
+  assert.equal(crew.binds.has('once'), false);
+
+  // "twice" is a real device: 29 days offline is not enough, 30 days is
+  await early.close();
+  await waitFor(() => !relay.state.devices.has('new1'), 'offline');
+  clock.advance(29 * 24 * 3600000 - 3600000);
+  const late = await connect(relay);
+  // (new1 was bound one time, more than 24 h ago: it is the ghost now)
+  assert.equal((await late.joinCrew(code, 'new2', 'N2')).type, 'crew_joined');
+  assert.deepEqual(Array.from(crew.members.keys()).sort(), ['a1', 'new2', 'twice']);
+  const later = await connect(relay);
+  assert.equal((await later.joinCrew(code, 'new3', 'N3')).error, 'crew_full', 'twice: seen 29 days ago');
+  clock.advance(24 * 3600000);
+  assert.equal((await later.joinCrew(code, 'new3', 'N3')).type, 'crew_joined', 'twice: not seen for 30 days');
+  assert.deepEqual(Array.from(crew.members.keys()).sort(), ['a1', 'new2', 'new3']);
+
+  // binds and joined are in the state file
+  relay.flush();
+  const saved = JSON.parse(fs.readFileSync(relay.dataFile, 'utf8')).crews[code];
+  assert.deepEqual(Object.keys(saved.binds).sort(), ['a1', 'new2', 'new3']);
+  assert.deepEqual(Object.keys(saved.joined).sort(), ['a1', 'new2', 'new3']);
+});
+
+test('members from an old state file count as real devices seen at load time', async () => {
+  const clock = fakeClock();
+  const dataFile = tempDataFile();
+  const members = { o1: 'One', o2: 'Two', o3: 'Three' };
+  fs.writeFileSync(dataFile, JSON.stringify({
+    version: 1,
+    crews: {
+      // no fields at all / last_seen 0 without a bind count (the file of the version before)
+      'LEELOO-OLD1': { created_at: 1, telegram_users: [], members },
+      'LEELOO-OLD2': { created_at: 1, telegram_users: [], members: { p1: 'P1', p2: 'P2', p3: 'P3' }, last_seen: { p1: 0, p2: 5, p3: 0 } }
+    }
+  }));
+  const relay = await relayUp({ dataFile, now: clock, maxCrewMembers: 3 });
+  for (const [code, ids] of [['LEELOO-OLD1', ['o1', 'o2', 'o3']], ['LEELOO-OLD2', ['p1', 'p2', 'p3']]]) {
+    const crew = relay.state.crews.get(code);
+    for (const id of ids) {
+      assert.equal(crew.last_seen.get(id), clock(), id);
+      assert.equal(crew.binds.get(id), 2, id);
+    }
+  }
+
+  const stranger = await connect(relay);
+  clock.advance(25 * 3600000);
+  assert.equal((await stranger.joinCrew('LEELOO-OLD1', 'new1', 'N')).error, 'crew_full', 'not ghosts');
+  clock.advance(29 * 24 * 3600000);
+  assert.equal((await stranger.joinCrew('LEELOO-OLD1', 'new1', 'N')).type, 'crew_joined', '30 days after the load');
+  assert.equal(relay.state.crews.get('LEELOO-OLD1').members.size, 3);
+});
+
+test('crew_full when no member can be put out; connected members never are', async () => {
+  const clock = fakeClock();
+  const relay = await relayUp({ now: clock, maxCrewMembers: 2 });
   const vic = await connect(relay);
   const { crew_code: code } = await vic.createCrew('vic', 'Vic');
   const bob = await connect(relay);
@@ -615,12 +727,206 @@ test('crew_full only when every member is connected right now', async () => {
 
   const third = await connect(relay);
   assert.equal((await third.joinCrew(code, 'third', 'T')).error, 'crew_full');
-  assert.equal(relay.state.crews.get(code).members.size, 2);
+  // Both are "bound one time, long ago", but they are connected
+  clock.advance(40 * 24 * 3600000);
+  assert.equal((await third.joinCrew(code, 'third', 'T')).error, 'crew_full');
+  assert.deepEqual(Array.from(relay.state.crews.get(code).members.keys()), ['vic', 'bob']);
 
   await bob.close();
   await waitFor(() => !relay.state.devices.has('bob'), 'bob offline');
   assert.equal((await third.joinCrew(code, 'third', 'T')).type, 'crew_joined');
   assert.deepEqual(Array.from(relay.state.crews.get(code).members.keys()), ['vic', 'third']);
+});
+
+// --- Third review: queues of other crews, URL places, Telegram, empty crews ---
+
+test('a crew that queues a lot loses its own messages, never those of another crew (review b3)', async () => {
+  const clock = fakeClock();
+  // Small limits: 3 KB per crew, 5 KB for all, so two loud crews fill the relay
+  const relay = await relayUp({ now: clock, maxMessagesPerMinute: 1000, crewQueueMaxBytes: 3000, queuesMaxBytes: 5000 });
+  const entryBytes = (id) => (relay.state.queues.get(id) || []).reduce((sum, e) => sum + Buffer.byteLength(JSON.stringify(e.message)), 0);
+
+  // The quiet crew: 5 short messages wait for v2
+  const v1 = await connect(relay, from('10.0.0.1'));
+  const { crew_code: quiet } = await v1.createCrew('v1', 'V1');
+  const v2 = await connect(relay, from('10.0.0.1'));
+  await v2.joinCrew(quiet, 'v2', 'V2');
+  await v2.close();
+  await waitFor(() => !relay.state.devices.has('v2'), 'v2 offline');
+  for (let i = 0; i < 5; i++) v1.sendMessage('text', { text: `important ${i}` });
+  await v1.sync();
+  assert.equal(relay.state.queues.get('v2').length, 5);
+  const quietBytes = relay.state.crewQueuedBytes.get(quiet);
+
+  // Two loud crews, each with an offline member, send much more than fits
+  const loud = [];
+  for (let c = 0; c < 2; c++) {
+    const boss = await connect(relay, from(`6.6.6.${c}`));
+    const { crew_code: code } = await boss.createCrew(`g${c}_0`, 'G');
+    const ghost = await connect(relay, from(`6.6.6.${c}`));
+    await ghost.joinCrew(code, `g${c}_1`, 'G');
+    await ghost.close();
+    await waitFor(() => !relay.state.devices.has(`g${c}_1`), 'ghost offline');
+    loud.push({ boss, code });
+  }
+  for (let round = 0; round < 10; round++) {
+    clock.advance(1000);
+    for (const { boss } of loud) boss.sendMessage('text', { text: `${round} ${'L'.repeat(900)}` });
+  }
+  for (const { boss } of loud) await boss.sync();
+
+  // The quiet crew lost nothing (its messages are the oldest on the relay)
+  assert.deepEqual(relay.state.queues.get('v2').map((e) => e.message.payload.text),
+    [0, 1, 2, 3, 4].map((i) => `important ${i}`));
+  assert.equal(relay.state.crewQueuedBytes.get(quiet), quietBytes);
+  // The loud crews paid: each under its own limit, all together under the total
+  for (const { code } of loud) assert.ok(relay.state.crewQueuedBytes.get(code) <= 3000, 'crew limit');
+  assert.ok(relay.state.queuedBytes <= 5000, `total ${relay.state.queuedBytes}`);
+  assert.equal(relay.state.queuedBytes, entryBytes('v2') + entryBytes('g0_1') + entryBytes('g1_1'), 'counters are exact');
+  assert.match(relay.state.queues.get('g0_1').slice(-1)[0].message.payload.text, /^9 /, 'they keep their newest');
+
+  // New messages of the quiet crew are queued and kept while the others go on
+  v1.sendMessage('text', { text: 'new one' });
+  await v1.sync();
+  clock.advance(1000);
+  for (const { boss } of loud) boss.sendMessage('text', { text: `10 ${'L'.repeat(900)}` });
+  for (const { boss } of loud) await boss.sync();
+  assert.equal(relay.state.queues.get('v2').length, 6);
+
+  const back = await connect(relay, from('10.0.0.1'));
+  await back.joinCrew(quiet, 'v2', 'V2');
+  assert.equal((await back.drain('message')).length, 6);
+  assert.equal(relay.state.crewQueuedBytes.has(quiet), false);
+});
+
+test('one client address holds at most 6 source URLs (review b4)', async () => {
+  const fake = fakeFetch();
+  const clock = fakeClock();
+  const relay = await relayUp({ fetch: fake, now: clock, maxSourceUrls: 8 });
+  const pack3 = (tag) => ({
+    pack: 1, id: 'p', name: 'P',
+    sources: [0, 1, 2].map((n) => ({ id: `s${n}`, url: `${HOST}/${tag}/${n}`, every: 60, fields: { v: 'value' } }))
+  });
+  const lastData = async (client) => {
+    await relay.pollSources();
+    const all = await client.drain('pack_data');
+    return all[all.length - 1];
+  };
+
+  // The attacker: one address, many crews (other crews, so the crew limit does not stop it)
+  const attackers = [];
+  for (let c = 0; c < 4; c++) {
+    const client = await connect(relay, from('6.6.6.6'));
+    await client.createCrew(`f${c}`, 'F');
+    client.send({ type: 'pack_active', pack: pack3(`att${c}`) });
+    await client.sync();
+    attackers.push(client);
+  }
+  await relay.pollSources();
+  assert.equal(fake.calls.length, 6, '12 URLs asked, 6 polled');
+  assert.deepEqual(Object.keys((await lastData(attackers[1])).values).length, 3);
+  assert.deepEqual((await lastData(attackers[2])).values, {}, 'over the limit of the address');
+
+  // A real device that comes late, from another address, still gets its sources
+  const late = await connect(relay, from('10.0.0.1'));
+  await late.createCrew('late', 'Late');
+  late.send({ type: 'pack_active', pack: pack3('real').sources.length ? { ...pack3('real'), sources: pack3('real').sources.slice(0, 2) } : null });
+  await late.sync();
+  assert.deepEqual((await lastData(late)).values, { 's0.v': 'ok', 's1.v': 'ok' });
+  assert.equal(fake.calls.length, 8);
+
+  // Addresses of one IPv6 /64 are one client
+  const v6 = [];
+  for (let i = 0; i < 3; i++) {
+    const client = await connect(relay, from(`2001:db8:1:2::${i + 1}`));
+    await client.createCrew(`v6_${i}`, 'V');
+    v6.push(client);
+  }
+  assert.equal(relay.state.devices.get('v6_0').ip_key, relay.state.devices.get('v6_2').ip_key);
+});
+
+test('the URL limit per address: 7 crews of one address get 6 URLs, the others none', async () => {
+  const fake = fakeFetch();
+  const lines = [];
+  const log = { log: (...args) => lines.push(args.join(' ')), error() {} };
+  const relay = await relayUp({ fetch: fake, log, joinMaxFailures: 100 });
+  const clients = [];
+  for (let c = 0; c < 8; c++) {
+    const client = await connect(relay, from('2001:db8:9:9::' + (c + 1)));
+    await client.createCrew(`d${c}`, 'D');
+    client.send({ type: 'pack_active', pack: packWith(c) });
+    await client.sync();
+    clients.push(client);
+  }
+  await relay.pollSources();
+  assert.equal(fake.calls.length, 6);
+  assert.equal(lines.filter((l) => l.includes('URLs for one client address')).length, 2, 'logged once per device');
+  // A device of the address disconnects: its place goes to the next one
+  await clients[0].close();
+  await waitFor(() => !relay.state.devices.has('d0'), 'offline');
+  await relay.pollSources();
+  assert.equal(fake.calls.length, 7);
+  assert.ok(fake.calls.includes(`${HOST}/x?n=6`));
+});
+
+test('Telegram messages: pack_offer is reduced to {pack}, same rate limit as a device', async () => {
+  const clock = fakeClock();
+  const relay = await relayUp({ now: clock });
+  const alice = await connect(relay);
+  const { crew_code: code } = await alice.createCrew('a1', 'Alice');
+  assert.equal((await post(relay, '/api/telegram/crew/join', { telegram_user_id: 6, crew_code: code, display_name: 'T' })).status, 200);
+  assert.equal((await post(relay, '/api/telegram/crew/join', { telegram_user_id: 7, crew_code: code, display_name: 'U' })).status, 200);
+  const send = (user, body) => post(relay, '/api/telegram/message', { telegram_user_id: user, crew_code: code, sender_name: 'T', ...body });
+
+  const pack = { pack: 1, id: 'p', name: 'P' };
+  const offer = await send(6, { msg_type: 'pack_offer', payload: { pack, junk: 'x'.repeat(8000), more: { a: 1 } } });
+  assert.equal(offer.status, 200);
+  assert.deepEqual((await alice.next('message')).payload, { pack }, 'no junk reaches the device');
+  assert.equal((await send(6, { msg_type: 'pack_offer', payload: { junk: 'x' } })).body.error, 'invalid_pack');
+  assert.equal((await send(6, { msg_type: 'pack_offer', payload: { pack, junk: 'x'.repeat(9000) } })).status, 413);
+
+  // 30 per minute per Telegram user (refused ones count too)
+  let accepted = 0;
+  let limited = 0;
+  for (let i = 0; i < 40; i++) {
+    const res = await send(6, { payload: { text: `m${i}` } });
+    if (res.status === 200) accepted++;
+    else if (res.status === 429 && res.body.error === 'rate_limited') limited++;
+  }
+  assert.equal(accepted, 27);
+  assert.equal(limited, 13);
+  assert.equal((await alice.drain('message')).length, 27);
+  assert.equal((await send(7, { payload: { text: 'other user' } })).status, 200);
+  clock.advance(60000);
+  assert.equal((await send(6, { payload: { text: 'later' } })).status, 200);
+});
+
+test('empty crews older than 24 hours are removed by the sweep', async () => {
+  const clock = fakeClock();
+  const relay = await relayUp({ now: clock, maxCrews: 4, joinMaxFailures: 100 });
+  // One device makes crew after crew: each one it leaves is empty
+  const solo = await connect(relay);
+  const codes = [];
+  for (let i = 0; i < 4; i++) codes.push((await solo.createCrew('solo', 'Solo')).crew_code);
+  assert.equal(relay.state.crews.size, 4);
+  assert.equal((await solo.createCrew('solo', 'Solo')).error, 'server_full');
+
+  // A crew with only a Telegram user, and one with a member, are in use
+  relay.state.crews.get(codes[1]).telegram_users.set(5, 'Tess');
+
+  clock.advance(24 * 3600000 - 1);
+  relay.sweep();
+  assert.equal(relay.state.crews.size, 4, 'not yet');
+  clock.advance(1);
+  relay.sweep();
+  assert.deepEqual(Array.from(relay.state.crews.keys()).sort(), [codes[1], codes[3]].sort());
+
+  // There is room again, and the member crew still works
+  const other = await connect(relay);
+  assert.equal((await other.createCrew('o1', 'Other')).type, 'crew_created');
+  assert.equal((await solo.joinCrew(codes[3], 'solo', 'Solo')).type, 'crew_joined');
+  relay.flush();
+  assert.equal(Object.keys(JSON.parse(fs.readFileSync(relay.dataFile, 'utf8')).crews).length, 3);
 });
 
 test('the number of crews is limited: server_full', async () => {
