@@ -27,6 +27,7 @@ echo "Step 2: Uploading relay server files..."
 ssh ${SERVER_USER}@${SERVER_IP} "mkdir -p /root/leeloo-relay/public"
 scp server.js ${SERVER_USER}@${SERVER_IP}:/root/leeloo-relay/
 scp package.json ${SERVER_USER}@${SERVER_IP}:/root/leeloo-relay/
+scp reset_device_key.js ${SERVER_USER}@${SERVER_IP}:/root/leeloo-relay/
 scp .env ${SERVER_USER}@${SERVER_IP}:/root/leeloo-relay/
 scp public/index.html ${SERVER_USER}@${SERVER_IP}:/root/leeloo-relay/public/
 
@@ -91,7 +92,7 @@ server {
 
     # Static files (landing page)
     location / {
-        proxy_pass http://localhost:3000;
+        proxy_pass http://127.0.0.1:3000;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection 'upgrade';
@@ -103,7 +104,7 @@ server {
 
     # WebSocket endpoint
     location /ws {
-        proxy_pass http://localhost:3000;
+        proxy_pass http://127.0.0.1:3000;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "Upgrade";
@@ -119,7 +120,7 @@ server {
 
     # Agent connector (MCP). The token in the path is a key: keep it out of the logs.
     location /mcp/ {
-        proxy_pass http://localhost:3000;
+        proxy_pass http://127.0.0.1:3000;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $remote_addr;
@@ -129,7 +130,7 @@ server {
 
     # Telegram API endpoints
     location /api/telegram/ {
-        proxy_pass http://localhost:3000;
+        proxy_pass http://127.0.0.1:3000;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $remote_addr;
@@ -138,7 +139,7 @@ server {
 
     # Spotify OAuth callback
     location /spotify/callback {
-        proxy_pass http://localhost:3000;
+        proxy_pass http://127.0.0.1:3000;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $remote_addr;
@@ -147,7 +148,7 @@ server {
 
     # Health check
     location /health {
-        proxy_pass http://localhost:3000;
+        proxy_pass http://127.0.0.1:3000;
         access_log off;
     }
 }
@@ -261,7 +262,7 @@ echo "   Telegram API:  https://leeloobot.xyz/api/telegram/"
 echo ""
 echo "Required .env vars (add to /root/leeloo-relay/.env):"
 echo "   LEELOO_BOT_TOKEN=<from @BotFather>"
-echo "   RELAY_API_URL=http://localhost:3000"
+echo "   RELAY_API_URL=http://127.0.0.1:3000"
 echo "   TELEGRAM_API_SECRET=<generate with: openssl rand -hex 32>"
 echo ""
 echo "Quick commands:"

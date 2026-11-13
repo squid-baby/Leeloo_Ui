@@ -69,14 +69,42 @@ SPOTIFY_REDIRECT_URI=https://leeloobot.xyz/spotify/callback
   state file). Devices from before the keys get one at their next bind.
   **Update the device code before the relay**: an old client does not save
   the key and cannot connect a second time.
+- **Devices from before the keys** (on a roster, no key stored): the first
+  bind must name the crew code of that roster. That bind gets a key and
+  nothing else: queued messages, pending Spotify tokens and pending pack
+  installs of the id are discarded, and its agent links are deleted. (Somebody
+  who knows the crew code could be first, so the relay gives that bind no
+  secrets.) For an id that the relay does not know, pending Spotify tokens
+  are sent on the first bind WITH the key, not on the bind that makes it.
+- **Lost key** (new SD card, restored config): stop the relay, run
+  `node reset_device_key.js data/state.json <device_id>`, start the relay.
+  The tool removes the key hash and the agent links of that one device and
+  prints what it did (never a key or a hash). The device then joins its crew
+  again and gets a new key.
 - **One crew per device**: a device that binds to another crew leaves the old
   roster, and its agent links and open connect codes are deleted.
-- **Limits** (options of `createRelay`): `maxCrewMembers` 12 devices per crew
-  (`crew_full` error), `maxCrewSourceUrls` 6 and `maxSourceUrls` 50 source
+- **Limits** (options of `createRelay`): `maxCrewMembers` 12 devices per crew.
+  When the roster is full and a new device joins, the member that is not
+  connected and was seen longest ago leaves the roster (its queue, pack and
+  agent links go, its key stays); `crew_full` only when all 12 are connected.
+  The first join of a device to a roster costs one unit of the per-IP
+  budget. `maxCrews` 5000 (`server_full` error). `maxCrewSourceUrls` 6 and `maxSourceUrls` 50 source
   URLs polled at one time (sources over a limit are not polled, the pack
   stays active), `maxDevicePacks` 2000, `maxDeviceKeys` 20000. A new device
   id without a crew uses the per-IP budget of failed attempts. `pack_active`
-  is accepted only from a device in a crew, 20 changes in 10 minutes.
+  is accepted only from a device in a crew, 20 changes in 10 minutes per
+  device id. `maxFetchesPerMinute` 60 source requests for the whole relay,
+  and no URL twice within 10 s.
+- **Messages**: the JSON of a `payload` is 2,048 bytes at most (9,000 for
+  `pack_offer`), else `message_too_large`. `maxMessagesPerMinute` 30 relayed
+  messages per device (`rate_limited`). Offline queues: 50 messages and
+  `queueMaxBytes` 64 KB per device, `queuesMaxBytes` 20 MB for all (the
+  oldest messages are dropped).
+- **Network**: the relay listens on `127.0.0.1` (env `HOST`, option `host`)
+  because nginx is in front of it. Set `HOST=0.0.0.0` only when there is no
+  proxy. The per-IP limiter takes the client address from `X-Forwarded-For`,
+  so nginx must SET that header (`proxy_set_header X-Forwarded-For
+  $remote_addr;`), not append to it. IPv6 clients are limited per /64.
 
 ## Agent connect and packs
 

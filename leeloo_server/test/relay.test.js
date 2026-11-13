@@ -174,7 +174,8 @@ test('queue cap drops the oldest messages', async () => {
 
 test('default queue cap is 50 and default TTL is 24 h', async () => {
   const clock = fakeClock();
-  const relay = await relayUp({ now: clock });
+  // (the default of 30 messages per minute per device is tested in limits.test.js)
+  const relay = await relayUp({ now: clock, maxMessagesPerMinute: 1000 });
   const { alice, bob, code } = await crewOfTwo(relay);
   await bob.close();
   await alice.next('member_offline');
@@ -386,19 +387,34 @@ test('WebSocket join rate limit triggers and resets', async () => {
   clock.advance(2 * 60000);
   assert.equal((await guesser.joinCrew(code, 'g1', 'Guess')).type, 'crew_joined');
 
+  // The first join of a device to a roster costs one unit (no free ghost ids)
+  relay.sweep();
+  assert.equal(relay.state.joinFailures.size, 1);
+  clock.advance(11 * 60000);
   relay.sweep();
   assert.equal(relay.state.joinFailures.size, 0);
 });
 
-test('successful joins are not limited and the limit is per client IP', async () => {
+test('rejoins are not limited, first joins cost budget, and the limit is per client IP', async () => {
   const relay = await relayUp({ maxCrewMembers: 50 });
   const { code } = await crewOfTwo(relay);
 
+  // A roster member can come back as often as it wants
   for (let i = 0; i < 15; i++) {
+    const device = await connect(relay);
+    assert.equal((await device.joinCrew(code, 'b1', 'Bob')).type, 'crew_joined');
+    await device.close();
+  }
+
+  // New ids: the crew above used 2 units of this address (create + first join), 8 are left
+  for (let i = 0; i < 8; i++) {
     const device = await connect(relay);
     assert.equal((await device.joinCrew(code, `d${i}`, `D${i}`)).type, 'crew_joined');
     await device.close();
   }
+  const ninth = await connect(relay);
+  assert.equal((await ninth.joinCrew(code, 'd8', 'D8')).error, 'rate_limited');
+  assert.equal(relay.state.crews.get(code).members.has('d8'), false);
 
   // Exhaust the budget of one forwarded address
   const bad = await connect(relay, { headers: { 'X-Forwarded-For': '203.0.113.7, 10.0.0.1' } });
@@ -578,10 +594,16 @@ test('Spotify callback rejects error responses and forwards good tokens', async 
   assert.equal(res.status, 200);
   await res.text();
   assert.equal(relay.state.pendingSpotifyTokens.has('late1'), true);
+  // The bind that makes the device key does not get them (anybody can be
+  // first with an id). The next bind, with the key, does.
   const late = await connect(relay);
-  late.send({ type: 'register', device_id: 'late1', device_name: 'LEELOO' });
-  await late.next('registered');
-  assert.equal((await late.next('spotify_auth_complete')).tokens.access_token, 'AT');
+  assert.equal((await late.register('late1', 'LEELOO')).type, 'registered');
+  assert.deepEqual(await late.drain('spotify_auth_complete'), []);
+  assert.equal(relay.state.pendingSpotifyTokens.has('late1'), true);
+  await late.close();
+  const late2 = await connect(relay);
+  assert.equal((await late2.register('late1', 'LEELOO')).type, 'registered');
+  assert.equal((await late2.next('spotify_auth_complete')).tokens.access_token, 'AT');
   assert.equal(relay.state.pendingSpotifyTokens.size, 0);
 
   assert.equal((await fetch(`${relay.httpUrl}/spotify/callback`)).status, 400);

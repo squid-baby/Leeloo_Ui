@@ -2,6 +2,7 @@ const express = require('express');
 const WebSocket = require('ws');
 const http = require('http');
 const crypto = require('crypto');
+const net = require('net');
 const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
@@ -38,6 +39,33 @@ function cleanString(value, maxLength) {
 
 function normalizeCrewCode(value) {
   return cleanString(value, 32).toUpperCase();
+}
+
+// Key of the limiter for a client address. An IPv6 client owns a whole /64
+// (2^64 addresses), so all of it is one key.
+function ipLimitKey(ip) {
+  let address = String(ip).split('%')[0];
+  if (/^::ffff:\d+\.\d+\.\d+\.\d+$/i.test(address)) address = address.slice(7); // IPv4 in IPv6 form
+  if (net.isIPv6(address)) {
+    const [head, tail] = address.split('::');
+    const first = head ? head.split(':') : [];
+    let groups = first;
+    if (tail !== undefined) {
+      const last = tail ? tail.split(':') : [];
+      const lastCount = last.length + (last.some((g) => g.includes('.')) ? 1 : 0); // a.b.c.d = 2 groups
+      groups = [...first, ...Array(Math.max(0, 8 - first.length - lastCount)).fill('0'), ...last];
+    }
+    address = `${groups.slice(0, 4).map((g) => (parseInt(g, 16) || 0).toString(16)).join(':')}::/64`;
+  }
+  return `ip:${address}`;
+}
+
+// Size limit of the payload of a relayed message (bytes of its JSON text)
+const MESSAGE_PAYLOAD_MAX_BYTES = 2048;
+const PACK_OFFER_PAYLOAD_MAX_BYTES = 9000;
+function payloadTooLarge(msgType, payload) {
+  const limit = msgType === 'pack_offer' ? PACK_OFFER_PAYLOAD_MAX_BYTES : MESSAGE_PAYLOAD_MAX_BYTES;
+  return Buffer.byteLength(JSON.stringify(payload), 'utf8') > limit;
 }
 
 function clientIp(req) {
@@ -647,7 +675,7 @@ const AGENT_SEND_LIMIT = 20;            // send_message + share_pack per token .
 const AGENT_SEND_WINDOW_MS = 10 * 60000; // ... in this window
 const AGENT_PACK_OP_LIMIT = 10;         // install_pack + reset_pack per token in the same window
 const PACK_ACTIVE_LIMIT = 20;           // changed pack_active per connection in the same window
-const SOURCE_MIN_GAP_MS = 10000;        // a new field of a cached URL waits this long for its fetch
+const SOURCE_MIN_GAP_MS = 10000;        // a URL is never fetched again sooner than this
 const MCP_BODY_LIMIT = 64 * 1024;
 const MCP_MAX_BATCH = 20;
 const MCP_PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
@@ -823,6 +851,13 @@ const MCP_INSTRUCTIONS =
  *   maxSourceUrls     distinct source URLs polled at one time, all crews (default 50)
  *   maxCrewSourceUrls distinct source URLs polled for one crew (default 6)
  *   maxCrewMembers    devices on the roster of one crew (default 12)
+ *   maxCrews          crews on the relay (default 5000; then: server_full)
+ *   maxMessagesPerMinute  relayed messages per device id (default 30)
+ *   queueMaxBytes     bytes of queued messages per device (default 64 KB, oldest dropped)
+ *   queuesMaxBytes    bytes of all queues together (default 20 MB, oldest dropped)
+ *   maxFetchesPerMinute  source fetches of the relay, all URLs (default 60)
+ *   host              address to listen on (env HOST, default 127.0.0.1:
+ *                     nginx is in front; use 0.0.0.0 only without a proxy)
  *   maxDevicePacks    stored active packs (default 2000, oldest dropped)
  *   maxDeviceKeys     stored device keys (default 20000; keys of devices that
  *                     are in no crew are dropped first)
@@ -861,6 +896,12 @@ function createRelay(options = {}) {
   const maxCrewMembers = options.maxCrewMembers ?? 12;
   const maxDevicePacks = options.maxDevicePacks ?? 2000;
   const maxDeviceKeys = options.maxDeviceKeys ?? 20000;
+  const maxCrews = options.maxCrews ?? 5000;
+  const maxMessagesPerMinute = options.maxMessagesPerMinute ?? 30;
+  const queueMaxBytes = options.queueMaxBytes ?? 64 * 1024;
+  const queuesMaxBytes = options.queuesMaxBytes ?? 20 * 1024 * 1024;
+  const maxFetchesPerMinute = options.maxFetchesPerMinute ?? 60;
+  const listenHost = options.host ?? process.env.HOST ?? '127.0.0.1';
   const checkPack = (pack) => validatePack(pack, { sourceHosts });
 
   const app = express();
@@ -888,6 +929,12 @@ function createRelay(options = {}) {
   const agentCalls = new Map();   // "send:<token hash>" / "pack:<token hash>" -> [timestamps]
   const sourceCache = new Map();  // url -> { values: Map<dot path, text>, hasData, lastAttempt, failing, inflight }
   const capLogged = new Set();    // "device url" pairs already logged as over a source cap
+  const messageTimes = new Map(); // device_id -> [timestamps] of relayed messages (last minute)
+  const packChanges = new Map();  // device_id -> [timestamps] of changed pack_active (last 10 minutes)
+  const fetchTimes = [];          // timestamps of the source fetches of the last minute
+  let fetchCapLogged = false;
+  let queuedBytes = 0;            // bytes of all offline queues (see queueEntryBytes)
+  let lastLimiterSweep = 0;
 
   let closed = false;
 
@@ -903,7 +950,8 @@ function createRelay(options = {}) {
         created_at: crew.created_at,
         // Pairs keep the key type: Telegram user ids are numbers
         telegram_users: Array.from(crew.telegram_users.entries()),
-        members: Object.fromEntries(crew.members)
+        members: Object.fromEntries(crew.members),
+        last_seen: Object.fromEntries(crew.last_seen)
       };
     });
     return {
@@ -947,7 +995,8 @@ function createRelay(options = {}) {
         const crew = {
           created_at: Number(saved.created_at) || now(),
           telegram_users: new Map(),
-          members: new Map()
+          members: new Map(),
+          last_seen: new Map()
         };
         if (Array.isArray(saved.telegram_users)) {
           for (const pair of saved.telegram_users) {
@@ -958,6 +1007,9 @@ function createRelay(options = {}) {
           for (const [id, name] of Object.entries(saved.members)) {
             crew.members.set(id, String(name));
             memberCrew.set(id, code);
+            // Files from before this field: 0 = never seen (first to go when the roster is full)
+            const seen = isPlainObject(saved.last_seen) ? Number(saved.last_seen[id]) : 0;
+            crew.last_seen.set(id, Number.isFinite(seen) ? seen : 0);
           }
         }
         crews.set(code, crew);
@@ -970,6 +1022,7 @@ function createRelay(options = {}) {
         const valid = entries.filter((e) => isPlainObject(e) && typeof e.crew_code === 'string' && isPlainObject(e.message));
         if (valid.length) queues.set(id, valid);
       }
+      recountQueues();
     }
 
     if (isPlainObject(state.pendingSpotifyTokens)) {
@@ -1056,7 +1109,8 @@ function createRelay(options = {}) {
       crews.set(crewCode, {
         created_at: now(),
         telegram_users: new Map(), // user_id -> display_name
-        members: new Map()         // device_id -> display name (remembered while offline)
+        members: new Map(),        // device_id -> display name (remembered while offline)
+        last_seen: new Map()       // device_id -> time of its last bind or disconnect
       });
       scheduleSave();
     }
@@ -1102,7 +1156,53 @@ function createRelay(options = {}) {
     return now() - (entry.message.timestamp || 0) >= queueTtlMs;
   }
 
+  // Bytes that a queue entry takes in the state file (about). Kept on the
+  // entry, so it is counted one time.
+  function queueEntryBytes(entry) {
+    if (typeof entry.bytes !== 'number') {
+      entry.bytes = Buffer.byteLength(JSON.stringify(entry.message), 'utf8');
+    }
+    return entry.bytes;
+  }
+
+  function queueBytes(queue) {
+    return queue.reduce((sum, entry) => sum + queueEntryBytes(entry), 0);
+  }
+
+  function recountQueues() {
+    queuedBytes = 0;
+    queues.forEach((queue) => { queuedBytes += queueBytes(queue); });
+  }
+
+  function dropQueue(deviceId) {
+    const queue = queues.get(deviceId);
+    if (!queue) return false;
+    queuedBytes -= queueBytes(queue);
+    queues.delete(deviceId);
+    return true;
+  }
+
+  // All queues together are too large: drop the oldest messages, whose ever they are.
+  function trimAllQueues() {
+    while (queuedBytes > queuesMaxBytes) {
+      let oldestId = null;
+      let oldestTime = Infinity;
+      queues.forEach((queue, id) => {
+        const time = queue[0].message.timestamp || 0;
+        if (time < oldestTime) {
+          oldestTime = time;
+          oldestId = id;
+        }
+      });
+      if (oldestId === null) break;
+      const queue = queues.get(oldestId);
+      queuedBytes -= queueEntryBytes(queue.shift());
+      if (!queue.length) queues.delete(oldestId);
+    }
+  }
+
   // Queue a relayed message for every roster device of the crew that is offline.
+  // Limits per device: `queueLimit` messages and `queueMaxBytes` (oldest dropped).
   function queueForOffline(crewCode, message, excludeDeviceId = null) {
     if (!QUEUEABLE_MSG_TYPES.has(message.msg_type)) return 0;
     const crew = crews.get(crewCode);
@@ -1111,14 +1211,37 @@ function createRelay(options = {}) {
     let queued = 0;
     crew.members.forEach((_name, id) => {
       if (id === excludeDeviceId || isOnline(id, crewCode)) return;
-      const queue = (queues.get(id) || []).filter((entry) => !isExpired(entry));
-      queue.push({ crew_code: crewCode, message });
-      while (queue.length > queueLimit) queue.shift(); // drop oldest
+      dropQueueEntries(id, isExpired);
+      const queue = queues.get(id) || [];
+      const entry = { crew_code: crewCode, message };
+      queue.push(entry);
+      queuedBytes += queueEntryBytes(entry);
+      let bytes = queueBytes(queue);
+      while (queue.length > queueLimit || (bytes > queueMaxBytes && queue.length > 1)) {
+        const dropped = queueEntryBytes(queue.shift()); // drop oldest
+        bytes -= dropped;
+        queuedBytes -= dropped;
+      }
       queues.set(id, queue);
       queued++;
     });
-    if (queued) scheduleSave();
+    if (queued) {
+      trimAllQueues();
+      scheduleSave();
+    }
     return queued;
+  }
+
+  // Remove the entries of one queue that match. True when something was removed.
+  function dropQueueEntries(deviceId, match) {
+    const queue = queues.get(deviceId);
+    if (!queue) return false;
+    const kept = queue.filter((entry) => !match(entry));
+    if (kept.length === queue.length) return false;
+    queuedBytes -= queueBytes(queue) - queueBytes(kept);
+    if (kept.length) queues.set(deviceId, kept);
+    else queues.delete(deviceId);
+    return true;
   }
 
   // Relay a crew message to online devices and queue it for offline ones.
@@ -1137,7 +1260,7 @@ function createRelay(options = {}) {
       send(ws, { ...entry.message, queued: true });
       delivered++;
     }
-    queues.delete(deviceId);
+    dropQueue(deviceId);
     scheduleSave();
     if (delivered) log.log(`[QUEUE] Delivered ${delivered} queued messages to ${deviceId}`);
   }
@@ -1174,23 +1297,28 @@ function createRelay(options = {}) {
     const recent = recentFailures(key);
     recent.push(now());
     joinFailures.set(key, recent);
-    // Hard cap in case of a flood between two sweeps
-    if (joinFailures.size > 20000) sweep();
+    // Hard cap in case of a flood between two sweeps (a sweep walks every
+    // key, so not more than one time per second)
+    if (joinFailures.size > 20000 && Math.abs(now() - lastLimiterSweep) >= 1000) sweep();
   }
 
   // --- Periodic cleanup ---
 
   function sweep() {
+    lastLimiterSweep = now();
     for (const key of Array.from(joinFailures.keys())) recentFailures(key);
+    messageTimes.forEach((list, id) => {
+      if (!list.some((t) => now() - t < 60000)) messageTimes.delete(id);
+    });
+    packChanges.forEach((list, id) => {
+      if (!list.some((t) => now() - t < AGENT_SEND_WINDOW_MS)) packChanges.delete(id);
+    });
 
     let changed = false;
-    queues.forEach((queue, id) => {
-      const kept = queue.filter((entry) => !isExpired(entry));
-      if (kept.length === queue.length) return;
-      if (kept.length) queues.set(id, kept);
-      else queues.delete(id);
-      changed = true;
-    });
+    for (const id of Array.from(queues.keys())) {
+      if (dropQueueEntries(id, isExpired)) changed = true;
+    }
+    recountQueues();
     pendingSpotifyTokens.forEach((pending, id) => {
       if (now() - pending.timestamp >= SPOTIFY_PENDING_TTL_MS) {
         pendingSpotifyTokens.delete(id);
@@ -1338,11 +1466,27 @@ function createRelay(options = {}) {
     return data;
   }
 
+  // The relay makes at most `maxFetchesPerMinute` requests to the sources,
+  // whatever the devices ask for.
+  function fetchAllowed() {
+    const cutoff = now() - 60000;
+    while (fetchTimes.length && (fetchTimes[0] <= cutoff || fetchTimes[0] > now())) fetchTimes.shift();
+    const allowed = fetchTimes.length < maxFetchesPerMinute;
+    if (!allowed && !fetchCapLogged) {
+      log.log(`[SOURCE] ${maxFetchesPerMinute} fetches in the last minute: the other sources wait`);
+    }
+    fetchCapLogged = !allowed;
+    return allowed;
+  }
+
   // Fetch one URL (one request at a time per URL), then send the values to
-  // every connected device that uses it. Never rejects. Only the values that
-  // the users ask for are kept, not the reply.
+  // every connected device that uses it. The promise never rejects. Returns
+  // null when the fetch has to wait (fetch limit). Only the values that the
+  // users ask for are kept, not the reply.
   function fetchSource(url) {
     let entry = sourceCache.get(url);
+    if (entry && entry.inflight) return entry.inflight;
+    if (!fetchAllowed()) return null;
     if (!entry) {
       entry = { values: new Map(), hasData: false, lastAttempt: 0, failing: false, inflight: null };
       sourceCache.set(url, entry);
@@ -1350,6 +1494,7 @@ function createRelay(options = {}) {
     if (entry.inflight) return entry.inflight;
 
     entry.lastAttempt = now();
+    fetchTimes.push(now());
     entry.inflight = (async () => {
       let data = null;
       let failure = null;
@@ -1383,8 +1528,9 @@ function createRelay(options = {}) {
   function isSourceDue(entry, user) {
     if (!entry) return true;
     const age = now() - entry.lastAttempt;
+    if (age < SOURCE_MIN_GAP_MS) return false; // success or failure: not again so soon
     if (age >= user.every * 1000) return true;
-    if (entry.failing || age < SOURCE_MIN_GAP_MS) return false;
+    if (entry.failing) return false;
     // A user asks for a field that the last fetch did not take
     for (const dotPath of user.paths) {
       if (!entry.values.has(dotPath)) return true;
@@ -1404,11 +1550,19 @@ function createRelay(options = {}) {
     });
 
     const running = [];
+    const due = [];
     users.forEach((user, url) => {
       const entry = sourceCache.get(url);
       if (entry && entry.inflight) running.push(entry.inflight);
-      else if (isSourceDue(entry, user)) running.push(fetchSource(url));
+      else if (isSourceDue(entry, user)) due.push({ url, last: entry ? entry.lastAttempt : 0 });
     });
+    // The URL that waited longest goes first, so the fetch limit starves none
+    due.sort((a, b) => a.last - b.last);
+    for (const { url } of due) {
+      const started = fetchSource(url); // null: over the fetch limit, waits for the next tick
+      if (!started) break;
+      running.push(started);
+    }
     return Promise.all(running).then(() => undefined);
   }
 
@@ -1425,8 +1579,7 @@ function createRelay(options = {}) {
       if (!user || !user.deviceIds.has(deviceId)) continue; // over a limit: not polled
       if (entry && entry.inflight) {
         fetching = true;
-      } else if (isSourceDue(entry, user)) {
-        fetchSource(url);
+      } else if (isSourceDue(entry, user) && fetchSource(url)) {
         fetching = true;
       }
     }
@@ -1514,9 +1667,26 @@ function createRelay(options = {}) {
     log.log(`[PACK] Delivered pending ${op.message.type} to ${deviceId}`);
   }
 
-  // After register / create_crew / join_crew
-  function afterBind(ws, deviceId) {
-    deliverPendingPackOp(ws, deviceId);
+  // After register / create_crew / join_crew. `first` is firstBindInfo()
+  // from before the bind.
+  function afterBind(ws, deviceId, crewCode, first) {
+    if (first.legacy) {
+      // The id was on a roster before the keys. This bind proved only that
+      // the sender knows the crew code, so it gets nothing that was kept
+      // for the device, and the agent links of the id end.
+      const hadQueue = dropQueue(deviceId);
+      const hadSpotify = pendingSpotifyTokens.delete(deviceId);
+      const hadOp = pendingPackOps.delete(deviceId);
+      const links = removeAgentTokens(deviceId);
+      scheduleSave();
+      log.log(`[DEVICE] First keyed bind of roster device ${deviceId}: discarded queue=${hadQueue} spotify=${hadSpotify} pack_op=${hadOp}, removed ${links} agent links`);
+    } else {
+      if (crewCode) deliverQueued(ws, deviceId, crewCode);
+      // Spotify tokens wait for a bind that proves the key (not the bind
+      // that makes the key: anybody can be first with an id)
+      if (!first.keyIssued) deliverPendingSpotifyTokens(ws, deviceId);
+      deliverPendingPackOp(ws, deviceId);
+    }
     startDeviceSources(deviceId);
   }
 
@@ -1647,6 +1817,7 @@ function createRelay(options = {}) {
         const count = charCount(text);
         if (count < 1) return toolText('text: required, 1 to 500 characters. Nothing was sent.', true);
         if (count > 500) return toolText(`text: longer than 500 characters (it has ${count}). Nothing was sent.`, true);
+        if (payloadTooLarge('text', { text })) return toolText('text: too large (2,048 bytes at most as JSON). Nothing was sent.', true);
         if (!agentCallAllowed('send', auth.hash, AGENT_SEND_LIMIT)) return tooMany();
         const { sent, queued } = relayCrewMessage(auth.crew_code, {
           type: 'message',
@@ -1757,18 +1928,27 @@ function createRelay(options = {}) {
         // The device moved to this crew: it leaves the other rosters, and
         // the agent links made for the old crew stop working.
         crews.forEach((other, code) => {
-          if (code !== crewCode) other.members.delete(deviceId);
+          if (code === crewCode) return;
+          other.members.delete(deviceId);
+          other.last_seen.delete(deviceId);
         });
         removeAgentTokens(deviceId);
         memberCrew.set(deviceId, crewCode);
         scheduleSave();
       }
       const crew = getOrCreateCrew(crewCode);
-      if (crew.members.get(deviceId) !== deviceName) {
-        crew.members.set(deviceId, deviceName);
-        scheduleSave();
-      }
+      if (crew.members.get(deviceId) !== deviceName) crew.members.set(deviceId, deviceName);
+      crew.last_seen.set(deviceId, now());
+      scheduleSave();
     }
+  }
+
+  // What the coming bind of deviceId is (ask BEFORE bindDevice):
+  // keyIssued: the id has no key yet, this bind makes it.
+  // legacy: ... and the id is on a roster (a device from before the keys).
+  function firstBindInfo(deviceId) {
+    const keyIssued = !deviceKeys.has(deviceId);
+    return { keyIssued, legacy: keyIssued && memberCrew.has(deviceId) };
   }
 
   // --- Device identity ---
@@ -1776,10 +1956,18 @@ function createRelay(options = {}) {
   // The first bind of an id gives the device a secret key. Every later bind
   // of that id needs the key. The relay keeps only the hash.
 
-  // True when this socket may bind deviceId. If not, the error was sent.
-  function deviceKeyAccepted(ws, ctx, deviceId, data, ip) {
+  // True when this socket may bind deviceId (to crewCode, or to no crew).
+  // If not, the error was sent.
+  function deviceKeyAccepted(ws, ctx, deviceId, crewCode, data, ip) {
     const stored = deviceKeys.get(deviceId);
-    if (!stored) return true; // first bind of this id (or a device from before the keys)
+    if (!stored) {
+      if (!memberCrew.has(deviceId)) return true; // an id that the relay does not know
+      // A roster device from before the keys: the crew code is the only
+      // proof there is. Without it, an outsider could take the id.
+      const crew = crewCode ? crews.get(crewCode) : null;
+      if (crew && crew.members.has(deviceId)) return true;
+      return refuseDeviceKey(ws, deviceId, ip);
+    }
 
     // This socket already proved that it is the device
     const bound = devices.get(deviceId);
@@ -1789,8 +1977,12 @@ function createRelay(options = {}) {
     if (given && crypto.timingSafeEqual(Buffer.from(sha256Hex(given), 'hex'), Buffer.from(stored, 'hex'))) {
       return true;
     }
+    return refuseDeviceKey(ws, deviceId, ip);
+  }
 
-    const limitKey = `ip:${ip}`;
+  // Always false: sends device_key_required (or rate_limited) and counts the attempt.
+  function refuseDeviceKey(ws, deviceId, ip) {
+    const limitKey = ipLimitKey(ip);
     if (isRateLimited(limitKey)) {
       sendRateLimited(ws);
       return false;
@@ -1827,12 +2019,63 @@ function createRelay(options = {}) {
     send(ws, key ? { ...reply, device_key: key } : reply);
   }
 
-  // False (and the error was sent) when the roster of the crew is full.
-  function crewHasRoom(ws, crewCode, deviceId) {
+  // Take a device off a roster with everything the relay kept for it. Its
+  // device key stays: the device can join again as itself.
+  function evictMember(crewCode, deviceId) {
+    const crew = crews.get(crewCode);
+    if (!crew) return;
+    crew.members.delete(deviceId);
+    crew.last_seen.delete(deviceId);
+    if (memberCrew.get(deviceId) === crewCode) memberCrew.delete(deviceId);
+    dropQueue(deviceId);
+    pendingPackOps.delete(deviceId);
+    devicePacks.delete(deviceId);
+    removeAgentTokens(deviceId);
+    scheduleSave();
+    log.log(`[CREW] ${deviceId} left the roster of ${crewCode}: the crew is full and a new device joined`);
+  }
+
+  // Room on the roster for a new device. When the roster is full, the member
+  // that is not connected and was seen longest ago leaves. False (and
+  // crew_full was sent) only when every member is connected right now.
+  function makeRoom(ws, crewCode, deviceId) {
     const crew = crews.get(crewCode);
     if (!crew || crew.members.has(deviceId) || crew.members.size < maxCrewMembers) return true;
-    send(ws, { type: 'error', error: 'crew_full', message: `Crew ${crewCode} is full (${maxCrewMembers} devices)` });
+
+    let oldestId = null;
+    let oldestSeen = Infinity;
+    crew.members.forEach((_name, id) => {
+      if (isConnected(id)) return;
+      const seen = crew.last_seen.get(id) || 0;
+      if (seen < oldestSeen) {
+        oldestSeen = seen;
+        oldestId = id;
+      }
+    });
+    if (oldestId === null) {
+      send(ws, { type: 'error', error: 'crew_full', message: `Crew ${crewCode} is full (${maxCrewMembers} devices)` });
+      return false;
+    }
+    evictMember(crewCode, oldestId);
+    return true;
+  }
+
+  // False (and server_full was sent) when the bind would make one crew too many.
+  function crewCountAllowed(ws, crewCode) {
+    if (crews.has(crewCode) || crews.size < maxCrews) return true;
+    send(ws, { type: 'error', error: 'server_full', message: 'This relay cannot take more crews' });
     return false;
+  }
+
+  // At most `maxMessagesPerMinute` relayed messages per device id (not per
+  // socket: a reconnect does not reset it). False: rate_limited was sent.
+  function messageAllowed(ws, deviceId) {
+    const recent = (messageTimes.get(deviceId) || []).filter((t) => now() - t < 60000);
+    const allowed = recent.length < maxMessagesPerMinute;
+    if (allowed) recent.push(now());
+    messageTimes.set(deviceId, recent);
+    if (!allowed) send(ws, { type: 'error', error: 'rate_limited', message: 'Too many messages, wait a minute' });
+    return allowed;
   }
 
   // create_crew / register with a client-supplied crew code never fail on an
@@ -1841,7 +2084,7 @@ function createRelay(options = {}) {
   function crewClaimAllowed(crewCode, deviceId, ip) {
     const crew = crews.get(crewCode);
     if (crew && deviceId && crew.members.has(deviceId)) return true;
-    const key = `ip:${ip}`;
+    const key = ipLimitKey(ip);
     if (isRateLimited(key)) return false;
     recordFailure(key);
     return true;
@@ -1929,7 +2172,7 @@ function createRelay(options = {}) {
 
   // The entry of the code in the URL. Sends the error page itself when there is none.
   function connectEntry(req, res) {
-    const limitKey = `ip:${clientIp(req)}`;
+    const limitKey = ipLimitKey(clientIp(req));
     connectHeaders(res);
     if (isRateLimited(limitKey)) {
       res.status(429).send(htmlPage('Too many attempts', `
@@ -2047,6 +2290,10 @@ function createRelay(options = {}) {
       return res.status(400).json({ error: 'telegram_user_id required' });
     }
 
+    if (crews.size >= maxCrews) {
+      return res.status(503).json({ error: 'server_full', message: 'This relay cannot take more crews' });
+    }
+
     // Generate unique crew code
     let crewCode = generateCrewCode();
     while (crews.has(crewCode)) {
@@ -2071,7 +2318,7 @@ function createRelay(options = {}) {
 
     // With an API secret the caller is our own bot (all users share its IP), so
     // the Telegram user is the unit to limit. Without one, limit by client IP.
-    const limitKey = TELEGRAM_API_SECRET ? `tg:${telegram_user_id}` : `ip:${clientIp(req)}`;
+    const limitKey = TELEGRAM_API_SECRET ? `tg:${telegram_user_id}` : ipLimitKey(clientIp(req));
     const crew = crews.get(code);
     const alreadyMember = !!crew && crew.telegram_users.has(telegram_user_id);
 
@@ -2106,6 +2353,10 @@ function createRelay(options = {}) {
 
     if (!crew || !crew.telegram_users.has(telegram_user_id)) {
       return res.status(403).json({ error: 'not_in_crew', message: 'You are not a member of this crew' });
+    }
+
+    if (payloadTooLarge(msgType, isPlainObject(payload) ? payload : {})) {
+      return res.status(413).json({ error: 'message_too_large', message: 'The payload is too large' });
     }
 
     if (msgType === 'pack_offer') {
@@ -2277,7 +2528,7 @@ function createRelay(options = {}) {
             const crewCode = normalizeCrewCode(data.crew_code) || null;
             const deviceName = cleanString(data.device_name, 64) || 'LEELOO';
 
-            if (!deviceKeyAccepted(ws, ctx, deviceId, data, ip)) break;
+            if (!deviceKeyAccepted(ws, ctx, deviceId, crewCode, data, ip)) break;
 
             if (crewCode && !crewClaimAllowed(crewCode, deviceId, ip)) {
               sendRateLimited(ws);
@@ -2285,21 +2536,21 @@ function createRelay(options = {}) {
             }
             if (!crewCode && !deviceKeys.has(deviceId)) {
               // A new device id without a crew makes state: same per-IP budget
-              if (isRateLimited(`ip:${ip}`)) {
+              if (isRateLimited(ipLimitKey(ip))) {
                 sendRateLimited(ws);
                 break;
               }
-              recordFailure(`ip:${ip}`);
+              recordFailure(ipLimitKey(ip));
             }
-            if (crewCode && !crewHasRoom(ws, crewCode, deviceId)) break;
+            if (crewCode && !crewCountAllowed(ws, crewCode)) break;
+            if (crewCode && !makeRoom(ws, crewCode, deviceId)) break;
 
+            const first = firstBindInfo(deviceId);
             bindDevice(ws, ctx, deviceId, crewCode, deviceName);
 
             sendBound(ws, { type: 'registered', device_id: deviceId });
 
-            if (crewCode) deliverQueued(ws, deviceId, crewCode);
-            deliverPendingSpotifyTokens(ws, deviceId);
-            afterBind(ws, deviceId);
+            afterBind(ws, deviceId, crewCode, first);
 
             log.log(`Device registered: ${deviceId} (${deviceName}) crew=${crewCode}`);
             break;
@@ -2311,26 +2562,26 @@ function createRelay(options = {}) {
             const deviceId = requestedDeviceId(data);
             const deviceName = cleanString(data.display_name, 64) || cleanString(data.device_name, 64) || 'LEELOO';
 
-            if (!deviceKeyAccepted(ws, ctx, deviceId, data, ip)) break;
-
             let crewCode = requestedCode || generateCrewCode();
             while (!requestedCode && crews.has(crewCode)) {
               crewCode = generateCrewCode();
             }
 
+            if (!deviceKeyAccepted(ws, ctx, deviceId, crewCode, data, ip)) break;
+
             if (!crewClaimAllowed(crewCode, deviceId, ip)) {
               sendRateLimited(ws);
               break;
             }
-            if (!crewHasRoom(ws, crewCode, deviceId)) break;
+            if (!crewCountAllowed(ws, crewCode)) break;
+            if (!makeRoom(ws, crewCode, deviceId)) break;
 
+            const first = firstBindInfo(deviceId);
             bindDevice(ws, ctx, deviceId, crewCode, deviceName);
 
             sendBound(ws, { type: 'crew_created', device_id: deviceId, crew_code: crewCode });
 
-            deliverQueued(ws, deviceId, crewCode);
-            deliverPendingSpotifyTokens(ws, deviceId);
-            afterBind(ws, deviceId);
+            afterBind(ws, deviceId, crewCode, first);
 
             log.log(`Device ${deviceId} created crew ${crewCode}`);
             break;
@@ -2342,11 +2593,11 @@ function createRelay(options = {}) {
             const deviceName = cleanString(data.display_name, 64) || cleanString(data.device_name, 64) || 'LEELOO';
             const crew = crews.get(joinCode);
 
-            if (!deviceKeyAccepted(ws, ctx, deviceId, data, ip)) break;
+            if (!deviceKeyAccepted(ws, ctx, deviceId, joinCode, data, ip)) break;
 
             // A device already on the roster is not guessing: never limit its rejoin
             const knownMember = !!crew && crew.members.has(deviceId);
-            const limitKey = `ip:${ip}`;
+            const limitKey = ipLimitKey(ip);
 
             if (!knownMember && isRateLimited(limitKey)) {
               sendRateLimited(ws);
@@ -2362,8 +2613,12 @@ function createRelay(options = {}) {
               });
               break;
             }
-            if (!crewHasRoom(ws, joinCode, deviceId)) break;
+            // A device that is new on this roster uses one unit of the budget
+            // of its address: nobody fills a roster with made-up ids for free
+            if (!knownMember) recordFailure(limitKey);
+            if (!makeRoom(ws, joinCode, deviceId)) break;
 
+            const first = firstBindInfo(deviceId);
             bindDevice(ws, ctx, deviceId, joinCode, deviceName);
 
             // Count crew members and collect existing member names (excluding self)
@@ -2386,9 +2641,7 @@ function createRelay(options = {}) {
             });
 
             // Messages missed while offline come right after crew_joined
-            deliverQueued(ws, deviceId, joinCode);
-            deliverPendingSpotifyTokens(ws, deviceId);
-            afterBind(ws, deviceId);
+            afterBind(ws, deviceId, joinCode, first);
 
             // Notify others
             broadcastToCrew(joinCode, {
@@ -2405,6 +2658,7 @@ function createRelay(options = {}) {
             // Generic message relay (text, song_push, nudge, hang_propose, etc.)
             const msgSender = currentDevice();
             if (!msgSender || !msgSender.crew_code) break;
+            if (!messageAllowed(ws, ctx.deviceId)) break;
 
             const relayMsg = {
               type: 'message',
@@ -2414,6 +2668,16 @@ function createRelay(options = {}) {
               payload: isPlainObject(data.payload) ? data.payload : {},
               timestamp: now()
             };
+
+            // Checked before the relay and before the queue: the queues are on disk
+            if (payloadTooLarge(relayMsg.msg_type, relayMsg.payload)) {
+              send(ws, {
+                type: 'error',
+                error: 'message_too_large',
+                message: `The message is too large (${relayMsg.msg_type === 'pack_offer' ? PACK_OFFER_PAYLOAD_MAX_BYTES : MESSAGE_PAYLOAD_MAX_BYTES} bytes at most)`
+              });
+              break;
+            }
 
             if (relayMsg.msg_type === 'pack_offer') {
               // Friends only ever get packs that passed the check
@@ -2434,6 +2698,13 @@ function createRelay(options = {}) {
             // Legacy music sharing
             const sender = currentDevice();
             if (!sender || !sender.crew_code) break;
+            if (!messageAllowed(ws, ctx.deviceId)) break;
+            if (payloadTooLarge('share_music', {
+              spotify_uri: data.spotify_uri, artist: data.artist, track: data.track, album: data.album
+            })) {
+              send(ws, { type: 'error', error: 'message_too_large', message: 'The message is too large' });
+              break;
+            }
 
             const sentCount = broadcastToCrew(sender.crew_code, {
               type: 'music_shared',
@@ -2453,6 +2724,11 @@ function createRelay(options = {}) {
             // Legacy reaction
             const reactor = currentDevice();
             if (!reactor || !reactor.crew_code) break;
+            if (!messageAllowed(ws, ctx.deviceId)) break;
+            if (payloadTooLarge('reaction', { reaction_type: data.reaction_type })) {
+              send(ws, { type: 'error', error: 'message_too_large', message: 'The message is too large' });
+              break;
+            }
 
             broadcastToCrew(reactor.crew_code, {
               type: 'reaction',
@@ -2509,14 +2785,15 @@ function createRelay(options = {}) {
               break;
             }
             if (JSON.stringify(devicePacks.get(ctx.deviceId)) !== JSON.stringify(pack)) {
-              // A changed pack can start fetches: only so many per connection
-              const recent = (member.packChanges || []).filter((t) => now() - t < AGENT_SEND_WINDOW_MS);
+              // A changed pack can start fetches: only so many per device id
+              // (not per socket or bind: a rejoin does not reset it)
+              const recent = (packChanges.get(ctx.deviceId) || []).filter((t) => now() - t < AGENT_SEND_WINDOW_MS);
               if (recent.length >= PACK_ACTIVE_LIMIT) {
                 log.log(`[PACK] Ignored pack_active from ${ctx.deviceId}: more than ${PACK_ACTIVE_LIMIT} changes in 10 minutes`);
                 break;
               }
               recent.push(now());
-              member.packChanges = recent;
+              packChanges.set(ctx.deviceId, recent);
               setDevicePack(ctx.deviceId, pack);
             }
             startDeviceSources(ctx.deviceId);
@@ -2543,6 +2820,11 @@ function createRelay(options = {}) {
 
       devices.delete(ctx.deviceId);
       if (device.crew_code) {
+        const crew = crews.get(device.crew_code);
+        if (crew && crew.members.has(ctx.deviceId)) {
+          crew.last_seen.set(ctx.deviceId, now());
+          scheduleSave();
+        }
         broadcastToCrew(device.crew_code, {
           type: 'member_offline',
           device_id: ctx.deviceId,
@@ -2581,7 +2863,7 @@ function createRelay(options = {}) {
 
   // --- Lifecycle ---
 
-  function listen(port = 0, host) {
+  function listen(port = 0, host = listenHost) {
     return new Promise((resolve, reject) => {
       server.once('error', reject);
       server.listen(port, host, () => {
@@ -2621,17 +2903,20 @@ function createRelay(options = {}) {
     pollSources,
     validatePack: checkPack,
     dataFile,
+    host: listenHost,
     // Exposed for tests and debugging
     state: {
       devices, crews, queues, pendingSpotifyTokens, joinFailures,
       agentTokens, devicePacks, pendingPackOps, connectCodes, sourceCache,
-      deviceKeys, memberCrew
+      deviceKeys, memberCrew, messageTimes, packChanges,
+      get queuedBytes() { return queuedBytes; }
     }
   };
 }
 
 module.exports = {
   createRelay,
+  ipLimitKey,
   generateCrewCode,
   QUEUEABLE_MSG_TYPES,
   validatePack,
@@ -2647,8 +2932,9 @@ if (require.main === module) {
   const PORT = process.env.PORT || 3000;
   const relay = createRelay();
 
-  relay.server.listen(PORT, () => {
-    console.log(`LEELOO Relay Server running on port ${PORT}`);
+  // 127.0.0.1 by default: nginx is in front. HOST=0.0.0.0 only without a proxy.
+  relay.server.listen(PORT, relay.host, () => {
+    console.log(`LEELOO Relay Server running on ${relay.host} port ${PORT}`);
     console.log(`WebSocket endpoint: ws://localhost:${PORT}`);
     console.log(`Telegram API: http://localhost:${PORT}/api/telegram/...`);
     console.log(`State file: ${relay.dataFile || '(persistence disabled)'}`);
