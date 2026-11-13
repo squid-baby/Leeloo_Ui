@@ -494,3 +494,296 @@ def test_sync_animation_with_fake_framebuffer(display, tmp_path, monkeypatch, ca
     assert np.count_nonzero(data[10:306, 7:208]) == 296 * 201
     assert np.count_nonzero(data[:10]) == 0 and np.count_nonzero(data[306:]) == 0
     assert np.count_nonzero(data[:, :7]) == 0 and np.count_nonzero(data[:, 208:]) == 0
+
+
+# ------------------------------------------------------------------ packs
+# (docs/PACKS.md: theme colours, header, labels, custom panel in the weather box)
+
+from gadget_display import DEFAULT_COLORS
+
+PANEL_TEXT = {'title': 'live', 'rows': [
+    {'left': 'UNC', 'right': '78', 'bar': None},
+    {'left': 'DUKE', 'right': '70', 'bar': None},
+    {'left': 'period 2', 'right': '4:12', 'bar': None},
+]}
+PANEL_BAR = {'title': None, 'rows': [
+    {'left': 'score', 'right': None, 'bar': 0.5},
+    {'left': 'full', 'right': None, 'bar': 1.0},
+    {'left': 'none', 'right': None, 'bar': 0.0},
+]}
+PANEL_LONG = {'title': 'W' * 40, 'rows': [
+    {'left': 'W' * 28, 'right': 'W' * 14, 'bar': None},
+    {'left': 'W' * 200, 'right': 'W' * 200, 'bar': None},
+    {'left': 'W' * 200, 'right': None, 'bar': 0.75},
+]}
+THEME = {'bg': '#13294B', 'tan': '#7BAFD4', 'lavender': '#FFFFFF', 'purple': '#B9D9EB', 'green': '#7BAFD4'}
+
+
+@pytest.fixture
+def default_theme():
+    """The palette is module-wide: always give it back."""
+    yield
+    COLORS.clear()
+    COLORS.update(DEFAULT_COLORS)
+
+
+def weather_box(display):
+    """(left, top, right, bottom) of the weather box with its label, for crop()."""
+    box_right = display.album_frame_x(None) - 5 - 5
+    return (7, 10, box_right + 1, 76)
+
+
+def outside_equal(a, b, box):
+    """True if two frames are the same everywhere outside `box`."""
+    x = np.asarray(a).copy()
+    y = np.asarray(b).copy()
+    left, top, right, bottom = box
+    x[top:bottom, left:right] = 0
+    y[top:bottom, left:right] = 0
+    return np.array_equal(x, y)
+
+
+def render_base(display, **kw):
+    return display.render(WEATHER, TIME, ['Amy', 'Ben'], ALBUM, hang=HANG, **kw).copy()
+
+
+@pytest.mark.parametrize('panel', [PANEL_TEXT, PANEL_BAR, PANEL_LONG], ids=['text', 'bar', 'long'])
+def test_custom_panel_draws_only_inside_weather_box(display, panel):
+    base = render_base(display)
+    img = render_base(display, custom_panel=panel)
+    check_frame(img)
+    box = weather_box(display)
+    assert img.crop(box).tobytes() != base.crop(box).tobytes()
+    assert outside_equal(img, base, box)
+    # ... and the frame of the box itself is not drawn over (2px tan border)
+    tan = tuple(int(COLORS['tan'][i:i + 2], 16) for i in (1, 3, 5))
+    for edge in ((box[2] - 2, 30, box[2], 74), (7, 30, 9, 74), (7, 74, box[2], 76)):
+        strip = img.crop(edge)
+        assert strip.getcolors() == [(strip.width * strip.height, tan)], edge
+
+
+def test_custom_panel_inner_text_stays_inside_border(display):
+    """Long text is cut: the padding column next to the right border stays empty."""
+    img = render_base(display, custom_panel=PANEL_LONG)
+    box = weather_box(display)
+    pad = img.crop((box[2] - 6, 24, box[2] - 2, 73))       # between text and border
+    assert pad.getcolors() == [(pad.width * pad.height, BG)]
+    left_pad = img.crop((9, 24, 12, 73))
+    assert left_pad.getcolors() == [(left_pad.width * left_pad.height, BG)]
+
+
+def test_custom_panel_replaces_weather_content(display):
+    """weather_data is not drawn: any weather gives the same frame."""
+    a = render_base(display, custom_panel=PANEL_TEXT)
+    b = display.render({'temp_f': 5, 'uv_raw': 11, 'rain_24h_inches': 3}, TIME, ['Amy', 'Ben'], ALBUM,
+                       hang=HANG, custom_panel=PANEL_TEXT)
+    c = display.render(None, TIME, ['Amy', 'Ben'], ALBUM, hang=HANG, custom_panel=PANEL_TEXT)
+    d = display.render({'error': 'timeout'}, TIME, ['Amy', 'Ben'], ALBUM, hang=HANG, custom_panel=PANEL_TEXT)
+    assert a.tobytes() == b.tobytes() == c.tobytes() == d.tobytes()
+
+
+def test_custom_panel_rows_and_bar_change_the_picture(display):
+    box = weather_box(display)
+
+    def crop(panel):
+        return display.render(WEATHER, TIME, [], None, hang=HANG, custom_panel=panel).crop(box).tobytes()
+
+    def one(**row):
+        return {'title': None, 'rows': [dict({'left': 'x', 'right': None, 'bar': None}, **row)]}
+
+    assert crop(one(right='78')) != crop(one(right='80'))
+    assert crop(one(left='UNC')) != crop(one(left='DUKE'))
+    assert crop(one(bar=0.0)) != crop(one(bar=0.5)) != crop(one(bar=1.0))
+    assert crop(one(bar=0.0)) != crop(one())
+    # bar is clamped to 0..1, 12 boxes
+    assert crop(one(bar=1.0)) == crop(one(bar=7)) and crop(one(bar=0.0)) == crop(one(bar=-1))
+    assert crop(one(bar=0.5)) == crop(one(bar=6 / 12))
+    # at most 3 rows are drawn
+    rows = [{'left': f'row {i}', 'right': None, 'bar': None} for i in range(5)]
+    assert crop({'title': None, 'rows': rows}) == crop({'title': None, 'rows': rows[:3]})
+    # the title is the label of the box; no title -> the pack label, else "weather"
+    assert crop({'title': 'live', 'rows': rows[:1]}) != crop({'title': None, 'rows': rows[:1]})
+    with_label = display.render(WEATHER, TIME, [], None, hang=HANG, labels={'weather': 'live'},
+                                custom_panel={'title': None, 'rows': rows[:1]})
+    assert with_label.crop(box).tobytes() == crop({'title': 'live', 'rows': rows[:1]})
+
+
+def test_custom_panel_odd_data_does_not_crash(display):
+    base = render_base(display)
+    for panel in ({}, {'rows': None}, {'title': 5, 'rows': [None, 'x', {}]},
+                  {'rows': [{'left': None, 'right': 7, 'bar': 'x'}]},
+                  {'rows': [{'left': 'a\nb\tc', 'right': '', 'bar': float('nan')}]}):
+        img = render_base(display, custom_panel=panel)
+        check_frame(img)
+        assert outside_equal(img, base, weather_box(display))
+    # not a dict -> the normal weather
+    assert render_base(display, custom_panel='live').tobytes() == base.tobytes()
+    assert render_base(display, custom_panel=None, header=None, labels=None).tobytes() == base.tobytes()
+    assert render_base(display, header='', labels={}).tobytes() == base.tobytes()
+
+
+def test_header_replaces_leeloo_text(display):
+    base = render_base(display)
+    img = render_base(display, header='GO HEELS')
+    check_frame(img)
+    name = (6, 0, 89, 12)                       # "LEELOO v1.0" is at x=8..89
+    assert img.crop(name).tobytes() != base.crop(name).tobytes()
+    assert outside_equal(img, base, name)       # "tap to talk" and the rest are the same
+    # a long header is cut and does not reach "tap to talk"
+    long = render_base(display, header='W' * 60)
+    assert long.crop(name).tobytes() != base.crop(name).tobytes()
+    assert outside_equal(long, base, name)
+    # works together with a status text
+    a = render_base(display, header='GO HEELS', status_text='listening...')
+    b = render_base(display, status_text='listening...')
+    assert a.crop(name).tobytes() == img.crop(name).tobytes()
+    assert outside_equal(a, b, name)
+
+
+@pytest.mark.parametrize('name,y', [('weather', 16), ('time', 83), ('messages', 162), ('album', 198)])
+def test_labels_replace_box_labels(display, name, y):
+    base = render_base(display)
+    img = render_base(display, labels={name: 'crew'})
+    check_frame(img)
+    region = (9, y - 6, weather_box(display)[2] - 2, y + 10)     # label text with descenders
+    assert img.crop(region).tobytes() != base.crop(region).tobytes()
+    assert outside_equal(img, base, region)
+    # unknown names are ignored; a long label stays on the top edge of its box
+    assert render_base(display, labels={'other': 'x'}).tobytes() == base.tobytes()
+    long = render_base(display, labels={name: 'W' * 80})
+    assert outside_equal(long, base, region)
+
+
+def test_apply_theme_changes_and_restores(display, default_theme, tmp_path):
+    colors_obj = gadget_display.COLORS
+    art = make_art(tmp_path / 'art.png')
+    args = (WEATHER, TIME, ['Amy'], ALBUM)
+    before = display.render(*args, album_art_path=art, unread_counts={'Amy': 2}, hang=HANG).copy()
+    assert before.getpixel((300, 2)) == BG
+
+    assert display.apply_theme(THEME) is True
+    themed = display.render(*args, album_art_path=art, unread_counts={'Amy': 2}, hang=HANG).copy()
+    assert themed.getpixel((300, 2)) == (0x13, 0x29, 0x4B)
+    assert themed.getpixel((7, 40)) == (0x7B, 0xAF, 0xD4)          # weather box border (tan)
+    assert themed.getpixel((2, 100)) == (255, 255, 255)            # outer frame (lavender)
+    assert BG not in [c for _, c in themed.crop((0, 0, 200, 320)).getcolors(100000)]
+
+    # same object, default copy untouched
+    assert gadget_display.COLORS is colors_obj is COLORS
+    assert COLORS['bg'] == '#13294B' and COLORS['rose'] == DEFAULT_COLORS['rose']
+    assert DEFAULT_COLORS['bg'] == '#1A1D2E' and DEFAULT_COLORS is not COLORS
+
+    for restore in (None, {}):
+        display.apply_theme(THEME)
+        assert display.apply_theme(restore) is True
+        assert COLORS == DEFAULT_COLORS
+        after = display.render(*args, album_art_path=art, unread_counts={'Amy': 2}, hang=HANG)
+        assert after.tobytes() == before.tobytes()
+
+
+def test_apply_theme_is_on_top_of_default_not_previous_theme(display, default_theme):
+    display.apply_theme({'bg': '#000000', 'tan': '#111111'})
+    display.apply_theme({'tan': '#222222'})
+    assert COLORS['bg'] == DEFAULT_COLORS['bg'] and COLORS['tan'] == '#222222'
+    # unknown names / bad values are ignored, never an error
+    assert display.apply_theme({'tan': '#222222', 'pink': '#FF00FF', 'bg': 'navy', 'rose': None, 5: 5}) is False
+    assert set(COLORS) == set(DEFAULT_COLORS)
+    assert display.apply_theme('blue') is True and COLORS == DEFAULT_COLORS
+
+
+def test_apply_theme_same_colours_again_is_cheap(display, default_theme):
+    assert display.apply_theme(THEME) is True
+    display.render(None, TIME, [], None, hang=HANG)
+    dim_cache = dict(display._dim_cache)
+    art_keys = list(display._art_cache)
+    assert dim_cache
+    for _ in range(3):
+        assert display.apply_theme(dict(THEME)) is False        # nothing changed
+    assert display._dim_cache == dim_cache and list(display._art_cache) == art_keys
+    t0 = time.perf_counter()
+    for _ in range(2000):
+        display.apply_theme(THEME)
+    assert time.perf_counter() - t0 < 1.0
+
+
+def test_dim_colour_follows_the_theme_background(display, default_theme):
+    assert display._dim_color('#FFFFFF') == '#5e606c'            # 30% white on navy
+    empty = display.render(None, TIME, [], None, hang=HANG).copy()
+    display.apply_theme({'bg': '#000000'})
+    assert display._dim_color('#FFFFFF') == '#4c4c4c'            # 30% white on black
+    # a second display sees the new palette too (COLORS is shared), no stale cache
+    other = LeelooDisplay()
+    assert other._dim_color('#FFFFFF') == '#4c4c4c'
+    other.apply_theme(None)
+    assert display._dim_color('#FFFFFF') == '#5e606c'
+    assert display.render(None, TIME, [], None, hang=HANG).tobytes() == empty.tobytes()
+
+
+def test_gradient_placeholder_follows_theme(display, default_theme, monkeypatch):
+    monkeypatch.setattr(LeelooDisplay, '_file_sig', staticmethod(lambda p: None))
+    before = display.render(None, TIME, [], None, hang=HANG).copy()
+    display.apply_theme({'bg': '#402000'})
+    themed = display.render(None, TIME, [], None, hang=HANG)
+    assert themed.getpixel((300, 2)) == (0x40, 0x20, 0x00)
+    assert BG not in [c for _, c in themed.getcolors(200000)]   # no navy left anywhere
+    display.apply_theme(None)
+    assert display.render(None, TIME, [], None, hang=HANG).tobytes() == before.tobytes()
+
+
+def test_views_and_animator_follow_theme(display, default_theme, tmp_path):
+    display.apply_theme(THEME)
+    bg = (0x13, 0x29, 0x4B)
+    assert display.render_message_view('Amy', 'hello').getpixel((100, 150)) == bg
+    gif = Image.new('RGBA', (64, 64), (0, 0, 0, 0))               # fully transparent
+    assert display.render_reaction_view('Ben', gif).getpixel((100, 150)) == bg
+
+    # an animator made BEFORE the theme change uses the new colours
+    display.apply_theme(None)
+    fb = tmp_path / 'fb1'
+    fb.write_bytes(b'\x00' * FB_BYTES)
+    animator = FrameAnimator(display, box_right=208, fb_path=str(fb))
+    display.apply_theme(THEME)
+
+    async def run():
+        await animator.async_expand(FrameType.WEATHER)
+
+    asyncio.run(run())
+    data = np.frombuffer(fb.read_bytes(), dtype=np.uint16).reshape(320, 480)
+
+    def rgb565(rgb):
+        r, g, b = rgb
+        return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+
+    assert data[150, 100] == rgb565(bg)                          # interior
+    assert data[150, 7] == rgb565((0x7B, 0xAF, 0xD4))            # border = themed tan
+    assert rgb565(BG) not in np.unique(data[10:306, 7:208])
+
+
+def test_render_with_pack_manager_output(display, default_theme, tmp_path):
+    """The real path: PackManager -> apply_theme + render."""
+    import json
+    from leeloo_packs import PackManager
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, 'packs', 'unc-hoops.json'), encoding='utf-8') as f:
+        pack = json.load(f)
+    packs = PackManager(str(tmp_path / 'pack.json'))
+    assert packs.install(pack) == []
+    packs.set_values('unc-hoops', {'game.state': 'in', 'game.home': 'UNC', 'game.home_score': '78',
+                                   'game.away': 'DUKE', 'game.away_score': '70',
+                                   'game.period': '2', 'game.clock': '4:12'})
+    display.apply_theme(packs.theme_colors())
+
+    def frame():
+        return display.render(WEATHER, TIME, ['Amy'], ALBUM, hang=HANG, header=packs.header(),
+                              labels=packs.labels(), custom_panel=packs.current_panel()).copy()
+
+    live = frame()
+    check_frame(live)
+    assert live.getpixel((300, 2)) == (0x13, 0x29, 0x4B)
+    sig = packs.signature()
+    packs.set_values('unc-hoops', dict(packs.values, **{'game.home_score': '80'}))
+    assert packs.signature() != sig
+    scored = frame()
+    box = weather_box(display)
+    assert scored.crop(box).tobytes() != live.crop(box).tobytes()
+    assert outside_equal(scored, live, box)

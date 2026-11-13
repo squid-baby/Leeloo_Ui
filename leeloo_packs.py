@@ -61,12 +61,19 @@ def _unknown_keys(obj, allowed, path, errors):
             errors.append(f"{path + '.' if path else ''}{key}: unknown key")
 
 
-def _check_text(value, path, errors, min_len, max_len):
-    """A string of min_len..max_len characters. Returns True when valid."""
+def _check_text(value, path, errors, min_len, max_len, template=False):
+    """A string of min_len..max_len characters. Returns True when valid.
+
+    template=True: `{source.field}` placeholders do not count. The limit is
+    for the fixed text (the example pack has "{game.home_score}", 17
+    characters, as a `right` text with a limit of 14). The drawn text is cut
+    to the width of the box in any case.
+    """
     if not isinstance(value, str):
         errors.append(f"{path}: not a string")
         return False
-    if len(value) > max_len:
+    counted = _TEMPLATE_RE.sub('', value) if template else value
+    if len(counted) > max_len:
         errors.append(f"{path}: longer than {max_len} characters")
         return False
     if len(value) < min_len:
@@ -188,9 +195,9 @@ def _check_row(row, path, errors):
     if 'left' not in row:
         errors.append(f"{path}.left: missing")
     else:
-        _check_text(row['left'], f"{path}.left", errors, 0, 28)
+        _check_text(row['left'], f"{path}.left", errors, 0, 28, template=True)
     if 'right' in row:
-        _check_text(row['right'], f"{path}.right", errors, 0, 14)
+        _check_text(row['right'], f"{path}.right", errors, 0, 14, template=True)
     if 'right' in row and 'bar' in row:
         errors.append(f"{path}: has right and bar (use one)")
     if 'bar' in row:
@@ -479,35 +486,27 @@ class PackManager:
         """Take source values from the relay (`pack_data`).
 
         Ignored when pack_id is not the active pack or values is not a dict.
-        Values are merged: a None value removes its key, and for every
-        source named in the message ("game" of "game.state") the old keys of
-        that source that are not in the message are dropped (one fetch gives
-        all fields of a source). Returns True if something changed.
+        The message holds ALL values of the pack (a value that is not in it
+        is gone). Only string keys are kept; values become strings of 40
+        characters at most. Returns True if something changed.
         """
         if not isinstance(values, dict):
             return False
         with self._lock:
             if self._pack is None or pack_id != self._pack.get('id'):
                 return False
-            incoming = {}
-            removed = set()
+            new = {}
             for key, value in values.items():
                 if not isinstance(key, str) or not key or len(key) > MAX_VALUE_KEY_CHARS:
                     continue
-                if value is None:
-                    removed.add(key)
-                elif isinstance(value, (str, int, float, bool)):
-                    incoming[key] = _value_text(value)
-            sources = {k.split('.', 1)[0] for k in list(incoming) + list(removed)}
-            merged = {k: v for k, v in self._values.items()
-                      if k.split('.', 1)[0] not in sources}
-            for key, value in incoming.items():
-                if len(merged) >= MAX_VALUES:
+                if value is None or isinstance(value, (dict, list, tuple, set)):
+                    continue            # no value
+                if len(new) >= MAX_VALUES:
                     break
-                merged[key] = value
-            if merged == self._values:
+                new[key] = _value_text(value)
+            if new == self._values:
                 return False
-            self._values = merged
+            self._values = new
             return True
 
     # -- look -------------------------------------------------------------

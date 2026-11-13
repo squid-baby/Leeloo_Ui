@@ -117,6 +117,16 @@ server {
         proxy_send_timeout 86400;
     }
 
+    # Agent connector (MCP). The token in the path is a key: keep it out of the logs.
+    location /mcp/ {
+        proxy_pass http://localhost:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        access_log off;
+    }
+
     # Telegram API endpoints
     location /api/telegram/ {
         proxy_pass http://localhost:3000;

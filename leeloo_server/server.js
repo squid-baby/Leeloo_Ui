@@ -11,7 +11,7 @@ require('dotenv').config();
 const QUEUEABLE_MSG_TYPES = new Set(['text', 'song_push', 'hang_propose', 'hang_confirm', 'pack_offer']);
 
 const SPOTIFY_PENDING_TTL_MS = 3600000; // access tokens expire after 1 hour
-const STATE_VERSION = 2; // 2: agentTokens, devicePacks, pendingPackOps
+const STATE_VERSION = 1; // new keys are optional when loading, so no bump was needed for packs
 
 function generateCrewCode() {
   const chars = CODE_ALPHABET;
@@ -59,7 +59,7 @@ const PACK_COLOR_KEYS = ['bg', 'green', 'purple', 'lavender', 'tan', 'rose', 'wh
 const PACK_LABEL_KEYS = ['weather', 'time', 'messages', 'album'];
 const PACK_ID_RE = /^[a-z0-9-]{1,32}$/;
 const PACK_NAME_RE = /^[a-z][a-z0-9_]{0,15}$/;          // source id, field key
-const PACK_VALUE_NAME_RE = /^[a-z][a-z0-9_]{0,15}\.[a-z][a-z0-9_]{0,15}$/; // source_id.field
+const PACK_TEMPLATE_RE = /\{([A-Za-z0-9_.]+)\}/g;        // {source_id.field}, same as leeloo_packs.py
 const PACK_COLOR_RE = /^#[0-9A-Fa-f]{6}$/;
 const PACK_VALUE_MAX_CHARS = 40;
 
@@ -78,6 +78,7 @@ function parseSourceHosts(value) {
 // Why a source URL may not be fetched, or null when it is fine.
 function sourceUrlProblem(url, hosts) {
   if (typeof url !== 'string') return 'must be a string';
+  if (!url.startsWith('https://')) return 'must start with https://';
   let parsed;
   try {
     parsed = new URL(url);
@@ -133,6 +134,16 @@ function validatePack(pack, options = {}) {
     const count = charCount(value);
     if (count < min) return add(where, 'must not be empty');
     if (count > max) return add(where, `longer than ${max} characters`);
+    return undefined;
+  };
+  // Text template of a row. The limit is for the text you write: a
+  // {source_id.field} placeholder does not count, because its length is known
+  // only when the value is there (the example pack has "{game.home_score}",
+  // 17 characters, as a `right` text with a limit of 14). The device cuts
+  // text that is too wide for the box.
+  const checkTemplate = (value, where, max) => {
+    if (typeof value !== 'string') return add(where, 'must be a string');
+    if (charCount(value.replace(PACK_TEMPLATE_RE, '')) > max) return add(where, `longer than ${max} characters`);
     return undefined;
   };
   const checkNumber = (value, where, min, max, integer = false) => {
@@ -234,8 +245,6 @@ function validatePack(pack, options = {}) {
               add(where, 'must be a dot path string like "team.nextEvent.0.shortName"');
             } else if (charCount(value) > 200) {
               add(where, 'longer than 200 characters');
-            } else if (value.split('.').some((part) => part === '')) {
-              add(where, 'dot path has an empty part');
             }
           }
         }
@@ -248,8 +257,8 @@ function validatePack(pack, options = {}) {
   const checkWhen = (when, at) => {
     if (!isPlainObject(when)) return add(at, 'must be an object');
     unknownKeys(when, ['field', 'equals', 'not_equals', 'exists'], `${at}.`);
-    if (typeof when.field !== 'string' || !PACK_VALUE_NAME_RE.test(when.field)) {
-      add(`${at}.field`, 'must be a value name like "game.state" (source_id.field)');
+    if (typeof when.field !== 'string' || !when.field) {
+      add(`${at}.field`, 'required, a value name like "game.state" (source_id.field)');
     }
     const ops = ['equals', 'not_equals', 'exists'].filter((op) => when[op] !== undefined);
     if (ops.length !== 1) return add(at, 'needs exactly one of equals, not_equals, exists');
@@ -265,8 +274,8 @@ function validatePack(pack, options = {}) {
     if (!isPlainObject(row)) return add(at, 'must be an object');
     unknownKeys(row, ['left', 'right', 'bar'], `${at}.`);
     if (row.left === undefined) add(`${at}.left`, 'required');
-    else checkText(row.left, `${at}.left`, 0, 28);
-    if (row.right !== undefined) checkText(row.right, `${at}.right`, 0, 14);
+    else checkTemplate(row.left, `${at}.left`, 28);
+    if (row.right !== undefined) checkTemplate(row.right, `${at}.right`, 14);
     if (row.right !== undefined && row.bar !== undefined) {
       add(at, 'has right and bar, use only one of them');
     }
@@ -329,7 +338,7 @@ function packWarnings(pack) {
   const warnings = [];
   const checkTemplate = (text, where) => {
     if (typeof text !== 'string') return;
-    for (const match of text.matchAll(/\{([^{}]*)\}/g)) {
+    for (const match of text.matchAll(PACK_TEMPLATE_RE)) {
       if (!known.has(match[1])) warnings.push(`${where}: {${match[1]}} is not a field of any source, it will show as --`);
     }
   };
@@ -879,7 +888,7 @@ function createRelay(options = {}) {
       }
     }
 
-    // Added in state version 2. Older files do not have these keys.
+    // Agent connect and packs. Older files do not have these keys.
     if (isPlainObject(state.agentTokens)) {
       for (const [hash, saved] of Object.entries(state.agentTokens)) {
         if (!/^[0-9a-f]{64}$/.test(hash) || !isPlainObject(saved)) continue;
@@ -1091,6 +1100,458 @@ function createRelay(options = {}) {
       }
     });
     if (changed) scheduleSave();
+
+    connectCodes.forEach((entry, code) => {
+      if (now() >= entry.expires_at) connectCodes.delete(code);
+    });
+    agentSends.forEach((list, hash) => {
+      if (!list.some((t) => now() - t < AGENT_SEND_WINDOW_MS)) agentSends.delete(hash);
+    });
+  }
+
+  // --- Pack sources: the relay fetches each URL once for all devices ---
+
+  function packSources(pack) {
+    return pack && Array.isArray(pack.sources) ? pack.sources : [];
+  }
+
+  function isConnected(deviceId) {
+    const device = devices.get(deviceId);
+    return !!device && device.ws.readyState === WebSocket.OPEN;
+  }
+
+  // url -> { every (smallest among the users, seconds), deviceIds } for the
+  // active packs of the devices that are connected now.
+  function sourceUsers() {
+    const users = new Map();
+    devices.forEach((_device, id) => {
+      if (!isConnected(id)) return;
+      for (const source of packSources(devicePacks.get(id))) {
+        const user = users.get(source.url) || { every: source.every, deviceIds: new Set() };
+        user.every = Math.min(user.every, source.every);
+        user.deviceIds.add(id);
+        users.set(source.url, user);
+      }
+    });
+    return users;
+  }
+
+  // All values of a pack from the cached replies: { "game.state": "in", ... }
+  function packValues(pack) {
+    const values = {};
+    for (const source of packSources(pack)) {
+      const entry = sourceCache.get(source.url);
+      if (!entry || !entry.hasData) continue;
+      for (const [field, dotPath] of Object.entries(source.fields)) {
+        const value = extractValue(entry.data, dotPath);
+        if (value !== undefined) values[`${source.id}.${field}`] = value;
+      }
+    }
+    return values;
+  }
+
+  function sendPackData(deviceId) {
+    const pack = devicePacks.get(deviceId);
+    if (!isConnected(deviceId) || !packSources(pack).length) return;
+    send(devices.get(deviceId).ws, { type: 'pack_data', pack_id: pack.id, values: packValues(pack) });
+  }
+
+  async function readLimitedText(res) {
+    const declared = Number(res.headers && typeof res.headers.get === 'function' && res.headers.get('content-length'));
+    if (declared > SOURCE_MAX_BYTES) throw new Error('reply is larger than 2 MB');
+
+    if (res.body && typeof res.body.getReader === 'function') {
+      const reader = res.body.getReader();
+      const chunks = [];
+      let total = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > SOURCE_MAX_BYTES) {
+          try { await reader.cancel(); } catch (_) { /* ignore */ }
+          throw new Error('reply is larger than 2 MB');
+        }
+        chunks.push(Buffer.from(value));
+      }
+      return Buffer.concat(chunks).toString('utf8');
+    }
+
+    const text = await res.text();
+    if (Buffer.byteLength(text, 'utf8') > SOURCE_MAX_BYTES) throw new Error('reply is larger than 2 MB');
+    return text;
+  }
+
+  async function fetchSourceJson(url) {
+    // Checked again here: the allowed hosts can differ from when the pack was accepted
+    const problem = sourceUrlProblem(url, sourceHosts);
+    if (problem) throw new Error(problem);
+
+    const res = await fetchImpl(url, {
+      method: 'GET',
+      redirect: 'error', // never follow a redirect (it could leave the allowed hosts)
+      headers: { Accept: 'application/json', 'User-Agent': `leeloo-relay/${RELAY_VERSION}` },
+      signal: AbortSignal.timeout(SOURCE_TIMEOUT_MS)
+    });
+    if (!res || !res.ok) throw new Error(`HTTP ${res ? res.status : 'error'}`);
+    if (res.redirected || (res.url && sourceUrlProblem(res.url, sourceHosts))) {
+      throw new Error('redirected');
+    }
+
+    const data = JSON.parse(await readLimitedText(res));
+    if (data === null || typeof data !== 'object') throw new Error('reply is not a JSON object');
+    return data;
+  }
+
+  // Fetch one URL (one request at a time per URL), then send the values to
+  // every connected device whose active pack uses it. Never rejects.
+  function fetchSource(url) {
+    let entry = sourceCache.get(url);
+    if (!entry) {
+      entry = { data: null, hasData: false, lastAttempt: 0, failing: false, inflight: null };
+      sourceCache.set(url, entry);
+    }
+    if (entry.inflight) return entry.inflight;
+
+    entry.lastAttempt = now();
+    entry.inflight = (async () => {
+      try {
+        entry.data = await fetchSourceJson(url);
+        entry.hasData = true;
+        if (entry.failing) log.log(`[SOURCE] ${url} works again`);
+        entry.failing = false;
+      } catch (error) {
+        // The old values stay. Logged one time until the URL recovers.
+        if (!entry.failing) log.error(`[SOURCE] ${url} failed: ${error.message}`);
+        entry.failing = true;
+      }
+      entry.inflight = null;
+      if (closed) return;
+      devices.forEach((_device, id) => {
+        if (packSources(devicePacks.get(id)).some((source) => source.url === url)) sendPackData(id);
+      });
+    })();
+    return entry.inflight;
+  }
+
+  function isSourceDue(entry, every) {
+    return !entry || now() - entry.lastAttempt >= every * 1000;
+  }
+
+  // Fetch every URL whose interval has passed. Called by a timer; tests call
+  // it directly. Resolves when the fetches it started (or found running) are done.
+  function pollSources() {
+    const users = sourceUsers();
+
+    sourceCache.forEach((entry, url) => {
+      if (!users.has(url) && !entry.inflight && now() - entry.lastAttempt >= SOURCE_KEEP_UNUSED_MS) {
+        sourceCache.delete(url);
+      }
+    });
+
+    const running = [];
+    users.forEach((user, url) => {
+      const entry = sourceCache.get(url);
+      if (entry && entry.inflight) running.push(entry.inflight);
+      else if (isSourceDue(entry, user.every)) running.push(fetchSource(url));
+    });
+    return Promise.all(running).then(() => undefined);
+  }
+
+  // Values for one device right now: from the cache if it is fresh, else fetch.
+  function startDeviceSources(deviceId) {
+    const sources = packSources(devicePacks.get(deviceId));
+    if (!sources.length || !isConnected(deviceId)) return;
+
+    const users = sourceUsers();
+    let fetching = false;
+    for (const url of new Set(sources.map((source) => source.url))) {
+      const entry = sourceCache.get(url);
+      const user = users.get(url);
+      if (entry && entry.inflight) {
+        fetching = true;
+      } else if (user && isSourceDue(entry, user.every)) {
+        fetchSource(url);
+        fetching = true;
+      }
+    }
+    // A fetch sends pack_data when it ends. With nothing to fetch, send now.
+    if (!fetching) sendPackData(deviceId);
+  }
+
+  // --- Agent connect ---
+
+  function tokensOfDevice(deviceId) {
+    const hashes = [];
+    agentTokens.forEach((entry, hash) => {
+      if (entry.device_id === deviceId) hashes.push(hash);
+    });
+    return hashes;
+  }
+
+  function createConnectCode(deviceId, crewCode) {
+    // One open code per device
+    connectCodes.forEach((entry, code) => {
+      if (entry.device_id === deviceId) connectCodes.delete(code);
+    });
+    let code = generateConnectCode();
+    while (connectCodes.has(code)) code = generateConnectCode();
+    connectCodes.set(code, { device_id: deviceId, crew_code: crewCode, expires_at: now() + AGENT_CODE_TTL_MS });
+    return code;
+  }
+
+  // The entry of a code that is still good, or null.
+  function lookupConnectCode(raw) {
+    const code = cleanString(raw, 16).toUpperCase();
+    const entry = connectCodes.get(code);
+    if (!entry) return null;
+    if (now() >= entry.expires_at) {
+      connectCodes.delete(code);
+      return null;
+    }
+    return { code, ...entry };
+  }
+
+  function createAgentToken(deviceId, crewCode) {
+    const mine = tokensOfDevice(deviceId)
+      .sort((a, b) => agentTokens.get(a).created_at - agentTokens.get(b).created_at);
+    while (mine.length >= AGENT_TOKENS_PER_DEVICE) agentTokens.delete(mine.shift()); // drop oldest
+
+    const token = crypto.randomBytes(32).toString('hex');
+    agentTokens.set(sha256Hex(token), { device_id: deviceId, crew_code: crewCode, created_at: now() });
+    scheduleSave();
+    return token;
+  }
+
+  function removeAgentTokens(deviceId) {
+    const hashes = tokensOfDevice(deviceId);
+    for (const hash of hashes) {
+      agentTokens.delete(hash);
+      agentSends.delete(hash);
+    }
+    connectCodes.forEach((entry, code) => {
+      if (entry.device_id === deviceId) connectCodes.delete(code);
+    });
+    if (hashes.length) scheduleSave();
+    return hashes.length;
+  }
+
+  // Send a pack_install / pack_reset to a device, or keep it (only the newest
+  // one) for its next connection. Returns true when it was sent now.
+  function sendOrKeepPackOp(deviceId, message) {
+    if (isConnected(deviceId)) {
+      send(devices.get(deviceId).ws, message);
+      if (pendingPackOps.delete(deviceId)) scheduleSave();
+      return true;
+    }
+    pendingPackOps.set(deviceId, { message, timestamp: now() });
+    scheduleSave();
+    return false;
+  }
+
+  function deliverPendingPackOp(ws, deviceId) {
+    const op = pendingPackOps.get(deviceId);
+    if (!op) return;
+    send(ws, op.message);
+    pendingPackOps.delete(deviceId);
+    scheduleSave();
+    log.log(`[PACK] Delivered pending ${op.message.type} to ${deviceId}`);
+  }
+
+  // After register / create_crew / join_crew
+  function afterBind(ws, deviceId) {
+    deliverPendingPackOp(ws, deviceId);
+    startDeviceSources(deviceId);
+  }
+
+  // --- MCP tools (docs/PACKS.md §3) ---
+
+  function packArgument(args) {
+    let pack = args.pack;
+    if (typeof pack === 'string') {
+      // Some agents send the pack as JSON text
+      try { pack = JSON.parse(pack); } catch (_) { return { errors: ['pack: is not valid JSON'] }; }
+    }
+    if (pack === undefined) return { errors: ['pack: required'] };
+    return { pack, errors: checkPack(pack) };
+  }
+
+  function packErrorResult(errors) {
+    return toolText(
+      `The pack is not valid. Nothing was changed. Correct these ${errors.length === 1 ? 'error' : 'errors'} and try again:\n` +
+      errors.map((e) => `- ${e}`).join('\n'), true);
+  }
+
+  function warningText(pack) {
+    const warnings = packWarnings(pack);
+    return warnings.length ? `\nWarnings:\n${warnings.map((w) => `- ${w}`).join('\n')}` : '';
+  }
+
+  function crewSendAllowed(tokenHash) {
+    const recent = (agentSends.get(tokenHash) || []).filter((t) => now() - t < AGENT_SEND_WINDOW_MS);
+    if (recent.length >= AGENT_SEND_LIMIT) {
+      agentSends.set(tokenHash, recent);
+      return false;
+    }
+    recent.push(now());
+    agentSends.set(tokenHash, recent);
+    return true;
+  }
+
+  function reachText(sent, queued) {
+    if (!sent && !queued) return 'There is no other Leeloo in the crew, so nobody got it.';
+    return `${sent} ${sent === 1 ? 'Leeloo' : 'Leeloos'} got it now, ${queued} will get it when they come online.`;
+  }
+
+  function callTool(name, args, auth) {
+    if (!MCP_TOOLS.some((tool) => tool.name === name)) throw new RpcError(-32602, `Unknown tool: ${name}`);
+
+    const crew = crews.get(auth.crew_code);
+    if (!crew || !crew.members.has(auth.device_id)) {
+      return toolText('This Leeloo is not in its crew any more, so this connector link does not work. ' +
+        'Ask the owner to say "connect my agent" to the Leeloo and to add the new connector link.', true);
+    }
+    const deviceId = auth.device_id;
+    const ownerName = crew.members.get(deviceId);
+    const tooMany = () => toolText(
+      `Too many messages to the crew (limit: ${AGENT_SEND_LIMIT} in 10 minutes). Try again later.`, true);
+
+    switch (name) {
+      case 'get_status': {
+        const online = [];
+        devices.forEach((device, id) => {
+          if (device.crew_code === auth.crew_code && isConnected(id)) online.push(device.device_name);
+        });
+        const active = devicePacks.get(deviceId);
+        return toolText(JSON.stringify({
+          owner: ownerName,
+          owner_online: isConnected(deviceId),
+          crew_members: allMemberNames(crew, null),
+          online_devices: online,
+          active_pack: active ? { id: active.id, name: active.name } : null
+        }, null, 2));
+      }
+
+      case 'get_pack_guide':
+        return toolText(
+          `${PACK_GUIDE}\n\n` +
+          `Source hosts that this relay allows: ${Array.from(sourceHosts).join(', ')}\n\n` +
+          `## Example pack\n\n${JSON.stringify(EXAMPLE_PACK, null, 2)}\n`);
+
+      case 'validate_pack': {
+        const { pack, errors } = packArgument(args);
+        if (errors.length) return packErrorResult(errors);
+        return toolText(`The pack is valid.${warningText(pack)}`);
+      }
+
+      case 'install_pack': {
+        const { pack, errors } = packArgument(args);
+        if (errors.length) return packErrorResult(errors);
+        const sentNow = sendOrKeepPackOp(deviceId, { type: 'pack_install', pack, from: 'agent' });
+        log.log(`[AGENT] install_pack ${pack.id} for ${deviceId} (${sentNow ? 'sent' : 'queued'})`);
+        return toolText((sentNow
+          ? `Sent "${pack.name}" to ${ownerName}'s Leeloo. It is online and installs it now.`
+          : `${ownerName}'s Leeloo is offline. "${pack.name}" is queued and will be installed when it connects again.`) +
+          warningText(pack));
+      }
+
+      case 'share_pack': {
+        const { pack, errors } = packArgument(args);
+        if (errors.length) return packErrorResult(errors);
+        if (!crewSendAllowed(auth.hash)) return tooMany();
+        const { sent, queued } = relayCrewMessage(auth.crew_code, {
+          type: 'message',
+          from_device: deviceId,
+          from_name: ownerName,
+          msg_type: 'pack_offer',
+          payload: { pack },
+          timestamp: now()
+        }, deviceId);
+        log.log(`[AGENT] share_pack ${pack.id} from ${deviceId} (${sent} devices, ${queued} queued)`);
+        return toolText(`Offered "${pack.name}" to the crew in ${ownerName}'s name. ${reachText(sent, queued)} ` +
+          `Each friend decides to use it or not.${warningText(pack)}`);
+      }
+
+      case 'reset_pack': {
+        const sentNow = sendOrKeepPackOp(deviceId, { type: 'pack_reset' });
+        log.log(`[AGENT] reset_pack for ${deviceId} (${sentNow ? 'sent' : 'queued'})`);
+        return toolText(sentNow
+          ? `${ownerName}'s Leeloo is online and goes back to the default look now.`
+          : `${ownerName}'s Leeloo is offline. It will go back to the default look when it connects again.`);
+      }
+
+      case 'send_message': {
+        const text = typeof args.text === 'string' ? args.text.trim() : '';
+        const count = charCount(text);
+        if (count < 1) return toolText('text: required, 1 to 500 characters. Nothing was sent.', true);
+        if (count > 500) return toolText(`text: longer than 500 characters (it has ${count}). Nothing was sent.`, true);
+        if (!crewSendAllowed(auth.hash)) return tooMany();
+        const { sent, queued } = relayCrewMessage(auth.crew_code, {
+          type: 'message',
+          from_device: deviceId,
+          from_name: ownerName,
+          msg_type: 'text',
+          payload: { text },
+          timestamp: now()
+        }, deviceId);
+        log.log(`[AGENT] send_message from ${deviceId} (${sent} devices, ${queued} queued)`);
+        return toolText(`Message sent in ${ownerName}'s name. ${reachText(sent, queued)}`);
+      }
+
+      default:
+        throw new RpcError(-32602, `Unknown tool: ${name}`);
+    }
+  }
+
+  // One JSON-RPC message. Returns the response, or null when none is due
+  // (notifications, and responses that a client sends to us).
+  function handleRpc(message, auth) {
+    if (!isPlainObject(message) || message.jsonrpc !== '2.0') {
+      return rpcError(null, -32600, 'Invalid request: not a JSON-RPC 2.0 message');
+    }
+    const hasId = typeof message.id === 'string' || typeof message.id === 'number';
+    if (typeof message.method !== 'string') {
+      if (hasId && (message.result !== undefined || message.error !== undefined)) return null;
+      return rpcError(hasId ? message.id : null, -32600, 'Invalid request: no method');
+    }
+    if (!hasId) return null; // notification
+
+    const params = isPlainObject(message.params) ? message.params : {};
+    try {
+      let result;
+      switch (message.method) {
+        case 'initialize':
+          result = {
+            protocolVersion: MCP_PROTOCOL_VERSIONS.includes(params.protocolVersion)
+              ? params.protocolVersion
+              : MCP_DEFAULT_PROTOCOL_VERSION,
+            capabilities: { tools: {} },
+            serverInfo: { name: 'leeloo', version: RELAY_VERSION },
+            instructions: MCP_INSTRUCTIONS
+          };
+          break;
+        case 'ping':
+          result = {};
+          break;
+        case 'tools/list':
+          result = { tools: MCP_TOOLS };
+          break;
+        case 'tools/call': {
+          if (typeof params.name !== 'string') throw new RpcError(-32602, 'Invalid params: name is required');
+          const args = params.arguments === undefined ? {} : params.arguments;
+          if (!isPlainObject(args)) throw new RpcError(-32602, 'Invalid params: arguments must be an object');
+          result = callTool(params.name, args, auth);
+          break;
+        }
+        default:
+          throw new RpcError(-32601, `Method not found: ${message.method}`);
+      }
+      return { jsonrpc: '2.0', id: message.id, result };
+    } catch (error) {
+      if (error instanceof RpcError) return rpcError(message.id, error.code, error.message);
+      log.error('[MCP] Internal error:', error.message);
+      return rpcError(message.id, -32603, 'Internal error');
+    }
   }
 
   // --- Crew membership helpers ---
@@ -1161,7 +1622,163 @@ function createRelay(options = {}) {
   // --- HTTP ---
 
   app.use(express.static(path.join(__dirname, 'public')));
+
+  // --- MCP connector of one device: POST /mcp/<token> (Streamable HTTP,
+  // stateless, JSON replies). Registered before express.json() because it
+  // needs the raw text: bad JSON must give a JSON-RPC error. ---
+
+  const mcpBody = express.text({ type: () => true, limit: MCP_BODY_LIMIT });
+
+  app.post('/mcp/:token', (req, res) => {
+    res.set('Cache-Control', 'no-store');
+
+    // The relay keeps only the hash of a token, so the lookup is by hash
+    const token = String(req.params.token || '');
+    const hash = /^[0-9a-f]{64}$/.test(token) ? sha256Hex(token) : null;
+    const saved = hash ? agentTokens.get(hash) : null;
+    if (!saved) {
+      return res.status(401).json(rpcError(null, -32001,
+        'Unknown or deleted connector link. Say "connect my agent" to the Leeloo to make a new one.'));
+    }
+    const auth = { ...saved, hash };
+
+    return mcpBody(req, res, (bodyError) => {
+      if (bodyError) {
+        const tooLarge = bodyError.type === 'entity.too.large';
+        return res.status(tooLarge ? 413 : 400).json(rpcError(null, -32600,
+          tooLarge ? 'Invalid request: body is larger than 64 KB' : 'Invalid request: cannot read the body'));
+      }
+
+      let parsed;
+      try {
+        if (typeof req.body !== 'string') throw new Error('empty body');
+        parsed = JSON.parse(req.body);
+      } catch (_) {
+        return res.status(400).json(rpcError(null, -32700, 'Parse error: the body is not valid JSON'));
+      }
+
+      if (Array.isArray(parsed)) {
+        if (parsed.length === 0 || parsed.length > MCP_MAX_BATCH) {
+          return res.status(400).json(rpcError(null, -32600,
+            `Invalid request: a batch needs 1 to ${MCP_MAX_BATCH} messages`));
+        }
+        const replies = parsed.map((message) => handleRpc(message, auth)).filter(Boolean);
+        return replies.length ? res.json(replies) : res.status(202).end();
+      }
+
+      const reply = handleRpc(parsed, auth);
+      return reply ? res.json(reply) : res.status(202).end();
+    });
+  });
+
+  // No SSE stream and no sessions: only POST
+  app.all('/mcp/:token', (req, res) => {
+    res.set('Allow', 'POST').status(405).json(rpcError(null, -32000, 'Method not allowed: use POST'));
+  });
+
   app.use(express.json());
+
+  // --- Agent connect pages: the QR code on the device opens /connect/<code> ---
+
+  function connectHeaders(res) {
+    res.set({
+      'Cache-Control': 'no-store',
+      'Referrer-Policy': 'no-referrer',
+      'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options': 'DENY',
+      'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'; base-uri 'none'"
+    });
+    return res.type('html');
+  }
+
+  // The entry of the code in the URL. Sends the error page itself when there is none.
+  function connectEntry(req, res) {
+    const limitKey = `ip:${clientIp(req)}`;
+    connectHeaders(res);
+    if (isRateLimited(limitKey)) {
+      res.status(429).send(htmlPage('Too many attempts', `
+      <h1>Too many attempts</h1>
+      <p>Wait ten minutes, then say "connect my agent" to your Leeloo again.</p>`));
+      return null;
+    }
+    const entry = lookupConnectCode(req.params.code);
+    if (!entry) {
+      recordFailure(limitKey); // wrong codes count, like wrong crew codes
+      res.status(404).send(htmlPage('Link not found', `
+      <h1>This link does not work</h1>
+      <p>The code is wrong, was used before, or is older than 15 minutes.</p>
+      <p>Say "connect my agent" to your Leeloo again and scan the new code.</p>`));
+      return null;
+    }
+    return entry;
+  }
+
+  app.get('/connect/:code', (req, res) => {
+    const entry = connectEntry(req, res);
+    if (!entry) return;
+    const crew = crews.get(entry.crew_code);
+    const ownerName = (crew && crew.members.get(entry.device_id)) || 'your';
+    res.send(htmlPage('Connect your agent', `
+      <h1>Connect your AI agent</h1>
+      <p>This makes a personal connector link for the Leeloo of <b>${escapeHtml(ownerName)}</b>.
+         With it, an AI agent (Claude, ChatGPT) can change how the Leeloo looks and send messages to the crew in your name.</p>
+      <form method="post" action="/connect/${escapeHtml(encodeURIComponent(entry.code))}">
+        <button type="submit">Create my connector link</button>
+      </form>
+      <p>The link can be made one time. To take the access away, say "disconnect my agent" to your Leeloo.</p>`));
+  });
+
+  app.post('/connect/:code', (req, res) => {
+    const entry = connectEntry(req, res);
+    if (!entry) return;
+    connectCodes.delete(entry.code); // one use
+
+    const token = createAgentToken(entry.device_id, entry.crew_code);
+    const connectorUrl = `${publicBaseUrl}/mcp/${token}`;
+    log.log(`[AGENT] Connector link created for device ${entry.device_id}`);
+
+    res.send(htmlPage('Your connector link', `
+      <h1>Your connector link</h1>
+      <textarea id="link" rows="4" readonly>${escapeHtml(connectorUrl)}</textarea>
+      <p><button type="button" id="copy">Copy the link</button></p>
+      <p class="warn"><b>This link is a key to your Leeloo. Do not share it.</b>
+         It is shown only now. If you lose it, say "connect my agent" again.</p>
+      <h2>Claude</h2>
+      <ol>
+        <li>Open Settings, then Connectors.</li>
+        <li>Choose "Add custom connector".</li>
+        <li>Give it the name Leeloo, paste the link, and add it.</li>
+      </ol>
+      <h2>ChatGPT</h2>
+      <ol>
+        <li>Open Settings and enable Developer Mode (in the connector settings).</li>
+        <li>Add a connector.</li>
+        <li>Paste the link as the server URL, with no authentication, and create it.</li>
+      </ol>
+      <p>Then ask your agent: "Make my Leeloo look like ..."</p>
+      <p>To take the access away, say "disconnect my agent" to your Leeloo.</p>
+      <script>
+        (function () {
+          var box = document.getElementById('link');
+          var button = document.getElementById('copy');
+          function selectLink() { box.focus(); box.select(); box.setSelectionRange(0, box.value.length); }
+          function done() { button.textContent = 'Copied'; }
+          function fallback() {
+            selectLink();
+            try { if (document.execCommand('copy')) { done(); return; } } catch (e) {}
+            button.textContent = 'Link selected - copy it';
+          }
+          box.addEventListener('focus', selectLink);
+          button.addEventListener('click', function () {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(box.value).then(done, fallback);
+            } else {
+              fallback();
+            }
+          });
+        })();
+      </script>`));
+  });
 
   function telegramAuth(req, res, next) {
     if (TELEGRAM_API_SECRET) {
@@ -1251,6 +1868,13 @@ function createRelay(options = {}) {
 
     if (!crew || !crew.telegram_users.has(telegram_user_id)) {
       return res.status(403).json({ error: 'not_in_crew', message: 'You are not a member of this crew' });
+    }
+
+    if (msgType === 'pack_offer') {
+      const offerErrors = checkPack(isPlainObject(payload) ? payload.pack : undefined);
+      if (offerErrors.length) {
+        return res.status(400).json({ error: 'invalid_pack', errors: offerErrors });
+      }
     }
 
     // Keep display name fresh (user may have changed their Telegram name)
@@ -1426,6 +2050,7 @@ function createRelay(options = {}) {
 
             if (crewCode) deliverQueued(ws, deviceId, crewCode);
             deliverPendingSpotifyTokens(ws, deviceId);
+            afterBind(ws, deviceId);
 
             log.log(`Device registered: ${deviceId} (${deviceName}) crew=${crewCode}`);
             break;
@@ -1453,6 +2078,7 @@ function createRelay(options = {}) {
 
             deliverQueued(ws, deviceId, crewCode);
             deliverPendingSpotifyTokens(ws, deviceId);
+            afterBind(ws, deviceId);
 
             log.log(`Device ${deviceId} created crew ${crewCode}`);
             break;
@@ -1507,6 +2133,7 @@ function createRelay(options = {}) {
             // Messages missed while offline come right after crew_joined
             deliverQueued(ws, deviceId, joinCode);
             deliverPendingSpotifyTokens(ws, deviceId);
+            afterBind(ws, deviceId);
 
             // Notify others
             broadcastToCrew(joinCode, {
@@ -1532,6 +2159,16 @@ function createRelay(options = {}) {
               payload: isPlainObject(data.payload) ? data.payload : {},
               timestamp: now()
             };
+
+            if (relayMsg.msg_type === 'pack_offer') {
+              // Friends only ever get packs that passed the check
+              const offerErrors = checkPack(relayMsg.payload.pack);
+              if (offerErrors.length) {
+                log.log(`[PACK] Dropped invalid pack_offer from ${ctx.deviceId}: ${offerErrors[0]}`);
+                break;
+              }
+              relayMsg.payload = { pack: relayMsg.payload.pack };
+            }
 
             const { sent, queued } = relayCrewMessage(msgSender.crew_code, relayMsg, ctx.deviceId);
             log.log(`[MSG] ${msgSender.device_name} sent ${relayMsg.msg_type} to ${sent} devices (${queued} queued)`);
@@ -1568,6 +2205,55 @@ function createRelay(options = {}) {
               from: reactor.device_name,
               timestamp: now()
             }, ctx.deviceId);
+            break;
+          }
+
+          case 'agent_connect_request': {
+            // "connect my agent": a one-use code for the QR code on the screen
+            const owner = currentDevice();
+            if (!owner || !owner.crew_code) {
+              send(ws, { type: 'error', error: 'not_in_crew', message: 'Join a crew before you connect an agent' });
+              break;
+            }
+            const code = createConnectCode(ctx.deviceId, owner.crew_code);
+            send(ws, {
+              type: 'agent_connect',
+              code,
+              url: `${publicBaseUrl}/connect/${code}`,
+              expires_in: Math.round(AGENT_CODE_TTL_MS / 1000)
+            });
+            log.log(`[AGENT] Connect code created for device ${ctx.deviceId}`);
+            break;
+          }
+
+          case 'agent_disconnect': {
+            // "disconnect my agent": every connector link of this device stops working
+            if (!currentDevice()) break;
+            const removed = removeAgentTokens(ctx.deviceId);
+            send(ws, { type: 'agent_disconnected', removed });
+            log.log(`[AGENT] Removed ${removed} connector links of device ${ctx.deviceId}`);
+            break;
+          }
+
+          case 'pack_active': {
+            // The pack the device shows now (null = default look). The relay
+            // fetches its sources while the device is connected.
+            if (!currentDevice()) break;
+            const pack = data.pack === undefined ? null : data.pack;
+            const packErrors = pack === null ? [] : checkPack(pack);
+            if (packErrors.length) {
+              log.log(`[PACK] Ignored invalid pack_active from ${ctx.deviceId}: ${packErrors[0]}`);
+            }
+            if (pack === null || packErrors.length) {
+              // No pack, or one the relay cannot serve: stop its sources
+              if (devicePacks.delete(ctx.deviceId)) scheduleSave();
+              break;
+            }
+            if (JSON.stringify(devicePacks.get(ctx.deviceId)) !== JSON.stringify(pack)) {
+              devicePacks.set(ctx.deviceId, pack);
+              scheduleSave();
+            }
+            startDeviceSources(ctx.deviceId);
             break;
           }
 
@@ -1622,6 +2308,9 @@ function createRelay(options = {}) {
   const sweepTimer = setInterval(sweep, sweepMs);
   sweepTimer.unref();
 
+  const sourceTimer = sourceTickMs > 0 ? setInterval(pollSources, sourceTickMs) : null;
+  if (sourceTimer) sourceTimer.unref();
+
   loadState();
 
   // --- Lifecycle ---
@@ -1642,6 +2331,7 @@ function createRelay(options = {}) {
     closed = true;
     clearInterval(heartbeatTimer);
     clearInterval(sweepTimer);
+    if (sourceTimer) clearInterval(sourceTimer);
     flush();
 
     return new Promise((resolve) => {
@@ -1662,13 +2352,29 @@ function createRelay(options = {}) {
     close,
     flush,
     sweep,
+    pollSources,
+    validatePack: checkPack,
     dataFile,
     // Exposed for tests and debugging
-    state: { devices, crews, queues, pendingSpotifyTokens, joinFailures }
+    state: {
+      devices, crews, queues, pendingSpotifyTokens, joinFailures,
+      agentTokens, devicePacks, pendingPackOps, connectCodes, sourceCache
+    }
   };
 }
 
-module.exports = { createRelay, generateCrewCode, QUEUEABLE_MSG_TYPES };
+module.exports = {
+  createRelay,
+  generateCrewCode,
+  QUEUEABLE_MSG_TYPES,
+  validatePack,
+  packWarnings,
+  extractValue,
+  PACK_GUIDE,
+  EXAMPLE_PACK,
+  DEFAULT_SOURCE_HOSTS,
+  MCP_TOOLS
+};
 
 if (require.main === module) {
   const PORT = process.env.PORT || 3000;
