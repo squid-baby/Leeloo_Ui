@@ -8,13 +8,13 @@ require('dotenv').config();
 
 // Message types that are worth keeping for a device that is offline.
 // Ephemeral ones (nudge, reaction) are only relayed live.
-const QUEUEABLE_MSG_TYPES = new Set(['text', 'song_push', 'hang_propose', 'hang_confirm']);
+const QUEUEABLE_MSG_TYPES = new Set(['text', 'song_push', 'hang_propose', 'hang_confirm', 'pack_offer']);
 
 const SPOTIFY_PENDING_TTL_MS = 3600000; // access tokens expire after 1 hour
-const STATE_VERSION = 1;
+const STATE_VERSION = 2; // 2: agentTokens, devicePacks, pendingPackOps
 
 function generateCrewCode() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // No I/O/0/1
+  const chars = CODE_ALPHABET;
   let code = '';
   for (let i = 0; i < 4; i++) {
     code += chars[crypto.randomInt(chars.length)];
@@ -47,6 +47,678 @@ function clientIp(req) {
   return ip.startsWith('::ffff:') ? ip.slice(7) : ip;
 }
 
+// ---------------------------------------------------------------------------
+// Packs (docs/PACKS.md §1). A pack is data, not code. Everything is in this
+// one file because deploy.sh copies only server.js.
+// ---------------------------------------------------------------------------
+
+const PACK_MAX_BYTES = 8000;
+const PACK_MAX_ERRORS = 20;
+const DEFAULT_SOURCE_HOSTS = ['site.api.espn.com', 'api.open-meteo.com'];
+const PACK_COLOR_KEYS = ['bg', 'green', 'purple', 'lavender', 'tan', 'rose', 'white', 'yellow', 'orange'];
+const PACK_LABEL_KEYS = ['weather', 'time', 'messages', 'album'];
+const PACK_ID_RE = /^[a-z0-9-]{1,32}$/;
+const PACK_NAME_RE = /^[a-z][a-z0-9_]{0,15}$/;          // source id, field key
+const PACK_VALUE_NAME_RE = /^[a-z][a-z0-9_]{0,15}\.[a-z][a-z0-9_]{0,15}$/; // source_id.field
+const PACK_COLOR_RE = /^#[0-9A-Fa-f]{6}$/;
+const PACK_VALUE_MAX_CHARS = 40;
+
+// Characters as Python's len() counts them (code points), so that the relay
+// and the device agree on every length limit.
+function charCount(text) {
+  return Array.from(text).length;
+}
+
+function parseSourceHosts(value) {
+  const list = Array.isArray(value) ? value : String(value || '').split(',');
+  const hosts = list.map((h) => String(h).trim().toLowerCase()).filter(Boolean);
+  return new Set(hosts.length ? hosts : DEFAULT_SOURCE_HOSTS);
+}
+
+// Why a source URL may not be fetched, or null when it is fine.
+function sourceUrlProblem(url, hosts) {
+  if (typeof url !== 'string') return 'must be a string';
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch (_) {
+    return 'not a valid URL';
+  }
+  if (parsed.protocol !== 'https:') return 'must start with https://';
+  if (parsed.username || parsed.password) return 'must not contain a user name or password';
+  if (parsed.port) return 'must not contain a port';
+  if (!hosts.has(parsed.hostname.toLowerCase())) {
+    return `host ${parsed.hostname} is not allowed (allowed: ${Array.from(hosts).join(', ')})`;
+  }
+  return null;
+}
+
+/**
+ * Check a pack against docs/PACKS.md §1.
+ * Returns a list of short error texts ("panels[1].rows[0].left: longer than
+ * 28 characters"). An empty list means the pack is valid.
+ *
+ * options.sourceHosts: allowed source hosts (array, Set or comma list).
+ */
+function validatePack(pack, options = {}) {
+  const hosts = options.sourceHosts instanceof Set
+    ? options.sourceHosts
+    : parseSourceHosts(options.sourceHosts);
+  const errors = [];
+  const add = (where, problem) => {
+    if (errors.length < PACK_MAX_ERRORS) errors.push(`${where}: ${problem}`);
+  };
+
+  if (!isPlainObject(pack)) return ['pack: must be a JSON object'];
+
+  let bytes;
+  try {
+    bytes = Buffer.byteLength(JSON.stringify(pack), 'utf8');
+  } catch (_) {
+    return ['pack: cannot be written as JSON'];
+  }
+  if (bytes > PACK_MAX_BYTES) {
+    return [`pack: JSON text is ${bytes} bytes, the limit is ${PACK_MAX_BYTES}`];
+  }
+
+  const unknownKeys = (obj, allowed, prefix) => {
+    for (const key of Object.keys(obj)) {
+      if (!allowed.includes(key)) {
+        add(`${prefix}${key}`, `unknown key (allowed: ${allowed.join(', ')})`);
+      }
+    }
+  };
+  const checkText = (value, where, min, max) => {
+    if (typeof value !== 'string') return add(where, 'must be a string');
+    const count = charCount(value);
+    if (count < min) return add(where, 'must not be empty');
+    if (count > max) return add(where, `longer than ${max} characters`);
+    return undefined;
+  };
+  const checkNumber = (value, where, min, max, integer = false) => {
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      return add(where, `must be a number from ${min} to ${max}`);
+    }
+    if (integer && !Number.isInteger(value)) return add(where, 'must be an integer');
+    if (value < min || value > max) return add(where, `must be from ${min} to ${max}`);
+    return undefined;
+  };
+
+  unknownKeys(pack, ['pack', 'id', 'name', 'theme', 'sources', 'panels', 'rotate_seconds'], '');
+
+  if (pack.pack !== 1) add('pack', 'must be the number 1');
+
+  if (typeof pack.id !== 'string') add('id', 'required, a string');
+  else if (!PACK_ID_RE.test(pack.id)) add('id', 'must match ^[a-z0-9-]{1,32}$');
+
+  if (pack.name === undefined) add('name', 'required, 1 to 24 characters');
+  else checkText(pack.name, 'name', 1, 24);
+
+  if (pack.rotate_seconds !== undefined) checkNumber(pack.rotate_seconds, 'rotate_seconds', 5, 600);
+
+  // --- theme ---
+  if (pack.theme !== undefined) {
+    const theme = pack.theme;
+    if (!isPlainObject(theme)) {
+      add('theme', 'must be an object');
+    } else {
+      unknownKeys(theme, ['colors', 'header', 'labels'], 'theme.');
+      if (theme.colors !== undefined) {
+        if (!isPlainObject(theme.colors)) {
+          add('theme.colors', 'must be an object');
+        } else {
+          for (const [key, value] of Object.entries(theme.colors)) {
+            if (!PACK_COLOR_KEYS.includes(key)) {
+              add(`theme.colors.${key}`, `unknown key (allowed: ${PACK_COLOR_KEYS.join(', ')})`);
+            } else if (typeof value !== 'string' || !PACK_COLOR_RE.test(value)) {
+              add(`theme.colors.${key}`, 'must be a colour like #1A2B3C');
+            }
+          }
+        }
+      }
+      if (theme.header !== undefined) checkText(theme.header, 'theme.header', 1, 12);
+      if (theme.labels !== undefined) {
+        if (!isPlainObject(theme.labels)) {
+          add('theme.labels', 'must be an object');
+        } else {
+          for (const [key, value] of Object.entries(theme.labels)) {
+            if (!PACK_LABEL_KEYS.includes(key)) {
+              add(`theme.labels.${key}`, `unknown key (allowed: ${PACK_LABEL_KEYS.join(', ')})`);
+            } else {
+              checkText(value, `theme.labels.${key}`, 1, 10);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // --- sources ---
+  if (pack.sources !== undefined) {
+    if (!Array.isArray(pack.sources)) {
+      add('sources', 'must be an array');
+    } else {
+      if (pack.sources.length > 3) add('sources', 'more than 3 sources');
+      const seen = new Set();
+      pack.sources.slice(0, 3).forEach((source, i) => {
+        const at = `sources[${i}]`;
+        if (!isPlainObject(source)) return add(at, 'must be an object');
+        unknownKeys(source, ['id', 'url', 'every', 'fields'], `${at}.`);
+
+        if (typeof source.id !== 'string') add(`${at}.id`, 'required, a string');
+        else if (!PACK_NAME_RE.test(source.id)) add(`${at}.id`, 'must match ^[a-z][a-z0-9_]{0,15}$');
+        else if (seen.has(source.id)) add(`${at}.id`, `"${source.id}" is used by more than one source`);
+        else seen.add(source.id);
+
+        if (source.url === undefined) {
+          add(`${at}.url`, 'required');
+        } else {
+          const problem = sourceUrlProblem(source.url, hosts);
+          if (problem) add(`${at}.url`, problem);
+        }
+
+        if (source.every === undefined) add(`${at}.every`, 'required, seconds from 30 to 3600');
+        else checkNumber(source.every, `${at}.every`, 30, 3600);
+
+        if (!isPlainObject(source.fields)) {
+          add(`${at}.fields`, 'required, an object with 1 to 12 entries');
+        } else {
+          const entries = Object.entries(source.fields);
+          if (entries.length < 1) add(`${at}.fields`, 'needs at least 1 entry');
+          if (entries.length > 12) add(`${at}.fields`, 'more than 12 entries');
+          for (const [key, value] of entries.slice(0, 12)) {
+            const where = `${at}.fields.${key}`;
+            if (!PACK_NAME_RE.test(key)) {
+              add(where, 'key must match ^[a-z][a-z0-9_]{0,15}$');
+            } else if (typeof value !== 'string') {
+              add(where, 'must be a dot path string like "team.nextEvent.0.shortName"');
+            } else if (charCount(value) > 200) {
+              add(where, 'longer than 200 characters');
+            } else if (value.split('.').some((part) => part === '')) {
+              add(where, 'dot path has an empty part');
+            }
+          }
+        }
+        return undefined;
+      });
+    }
+  }
+
+  // --- panels ---
+  const checkWhen = (when, at) => {
+    if (!isPlainObject(when)) return add(at, 'must be an object');
+    unknownKeys(when, ['field', 'equals', 'not_equals', 'exists'], `${at}.`);
+    if (typeof when.field !== 'string' || !PACK_VALUE_NAME_RE.test(when.field)) {
+      add(`${at}.field`, 'must be a value name like "game.state" (source_id.field)');
+    }
+    const ops = ['equals', 'not_equals', 'exists'].filter((op) => when[op] !== undefined);
+    if (ops.length !== 1) return add(at, 'needs exactly one of equals, not_equals, exists');
+    if (ops[0] === 'exists') {
+      if (typeof when.exists !== 'boolean') add(`${at}.exists`, 'must be true or false');
+    } else if (typeof when[ops[0]] !== 'string') {
+      add(`${at}.${ops[0]}`, 'must be a string');
+    }
+    return undefined;
+  };
+
+  const checkRow = (row, at) => {
+    if (!isPlainObject(row)) return add(at, 'must be an object');
+    unknownKeys(row, ['left', 'right', 'bar'], `${at}.`);
+    if (row.left === undefined) add(`${at}.left`, 'required');
+    else checkText(row.left, `${at}.left`, 0, 28);
+    if (row.right !== undefined) checkText(row.right, `${at}.right`, 0, 14);
+    if (row.right !== undefined && row.bar !== undefined) {
+      add(at, 'has right and bar, use only one of them');
+    }
+    if (row.bar !== undefined) {
+      const bar = row.bar;
+      if (!isPlainObject(bar)) return add(`${at}.bar`, 'must be an object {value, max}');
+      unknownKeys(bar, ['value', 'max'], `${at}.bar.`);
+      if (typeof bar.value !== 'string') add(`${at}.bar.value`, 'required, a template string like "{game.score}"');
+      if (typeof bar.max !== 'number' || !Number.isFinite(bar.max) || bar.max <= 0) {
+        add(`${at}.bar.max`, 'required, a number greater than 0');
+      }
+    }
+    return undefined;
+  };
+
+  if (pack.panels !== undefined) {
+    if (!Array.isArray(pack.panels)) {
+      add('panels', 'must be an array');
+    } else {
+      if (pack.panels.length > 6) add('panels', 'more than 6 panels');
+      pack.panels.slice(0, 6).forEach((panel, i) => {
+        const at = `panels[${i}]`;
+        if (!isPlainObject(panel)) return add(at, 'must be an object');
+
+        if (panel.slot !== 'weather') add(`${at}.slot`, 'must be "weather"');
+        if (panel.when !== undefined) checkWhen(panel.when, `${at}.when`);
+        if (panel.priority !== undefined) checkNumber(panel.priority, `${at}.priority`, -100, 100, true);
+
+        if (panel.builtin !== undefined) {
+          unknownKeys(panel, ['slot', 'builtin', 'when', 'priority'], `${at}.`);
+          if (panel.builtin !== 'weather') add(`${at}.builtin`, 'must be "weather"');
+          return undefined;
+        }
+
+        unknownKeys(panel, ['slot', 'title', 'rows', 'when', 'priority'], `${at}.`);
+        if (panel.title !== undefined) checkText(panel.title, `${at}.title`, 1, 10);
+        if (!Array.isArray(panel.rows)) {
+          add(`${at}.rows`, 'required, 1 to 3 rows (or use "builtin": "weather")');
+        } else {
+          if (panel.rows.length < 1) add(`${at}.rows`, 'needs at least 1 row');
+          if (panel.rows.length > 3) add(`${at}.rows`, 'more than 3 rows');
+          panel.rows.slice(0, 3).forEach((row, j) => checkRow(row, `${at}.rows[${j}]`));
+        }
+        return undefined;
+      });
+    }
+  }
+
+  return errors;
+}
+
+// Hints for a VALID pack: value names used in templates or conditions that no
+// source provides (they would always show as "--"). Not errors: the format
+// allows them.
+function packWarnings(pack) {
+  const known = new Set();
+  for (const source of Array.isArray(pack.sources) ? pack.sources : []) {
+    for (const field of Object.keys(source.fields)) known.add(`${source.id}.${field}`);
+  }
+  const warnings = [];
+  const checkTemplate = (text, where) => {
+    if (typeof text !== 'string') return;
+    for (const match of text.matchAll(/\{([^{}]*)\}/g)) {
+      if (!known.has(match[1])) warnings.push(`${where}: {${match[1]}} is not a field of any source, it will show as --`);
+    }
+  };
+  (Array.isArray(pack.panels) ? pack.panels : []).forEach((panel, i) => {
+    if (panel.when && !known.has(panel.when.field)) {
+      warnings.push(`panels[${i}].when.field: ${panel.when.field} is not a field of any source`);
+    }
+    (Array.isArray(panel.rows) ? panel.rows : []).forEach((row, j) => {
+      checkTemplate(row.left, `panels[${i}].rows[${j}].left`);
+      checkTemplate(row.right, `panels[${i}].rows[${j}].right`);
+      if (row.bar) checkTemplate(row.bar.value, `panels[${i}].rows[${j}].bar.value`);
+    });
+  });
+  return warnings.slice(0, PACK_MAX_ERRORS);
+}
+
+// Follow a dot path into a JSON reply. Returns a string of 40 characters at
+// most, or undefined when the path gives no value.
+function extractValue(data, dotPath) {
+  let current = data;
+  for (const part of String(dotPath).split('.')) {
+    if (Array.isArray(current)) {
+      if (!/^\d+$/.test(part)) return undefined;
+      current = current[Number(part)];
+    } else if (isPlainObject(current)) {
+      if (!Object.prototype.hasOwnProperty.call(current, part)) return undefined;
+      current = current[part];
+    } else {
+      return undefined;
+    }
+  }
+  if (isPlainObject(current)) {
+    if (!Object.prototype.hasOwnProperty.call(current, 'displayValue')) return undefined;
+    current = current.displayValue;
+  }
+  let text;
+  if (typeof current === 'string') text = current;
+  else if (typeof current === 'number' && Number.isFinite(current)) text = String(current);
+  else if (typeof current === 'boolean') text = String(current);
+  else return undefined;
+  return Array.from(text).slice(0, PACK_VALUE_MAX_CHARS).join('');
+}
+
+// docs/PACKS.md §1, word for word (test/packs.test.js checks that the two are
+// the same). It is embedded because only server.js is copied to the server.
+const PACK_GUIDE = [
+  "## 1. Pack format (version 1)",
+  "",
+  "The JSON text of a pack is 8,000 bytes at most. Unknown keys are an error.",
+  "",
+  "| Key | Type | Rules |",
+  "|-----|------|-------|",
+  "| `pack` | number | Must be `1` |",
+  "| `id` | string | `^[a-z0-9-]{1,32}$` |",
+  "| `name` | string | 1 to 24 characters |",
+  "| `theme` | object | Optional. See below |",
+  "| `sources` | array | Optional. 3 at most |",
+  "| `panels` | array | Optional. 6 at most |",
+  "| `rotate_seconds` | number | Optional. 5 to 600. Default 20 |",
+  "",
+  "### theme",
+  "",
+  "- `colors`: object. Keys from `bg`, `green`, `purple`, `lavender`, `tan`,",
+  "  `rose`, `white`, `yellow`, `orange`. Each value `#RRGGBB`.",
+  "  (`tan` = weather box, `purple` = time box, `lavender` = outer frame and",
+  "  messages box, `green` = album box.)",
+  "- `header`: string, 1 to 12 characters. Replaces `LEELOO v1.0`.",
+  "- `labels`: object. Keys from `weather`, `time`, `messages`, `album`. Each",
+  "  value 1 to 10 characters.",
+  "",
+  "### sources",
+  "",
+  "Each source: `{ \"id\", \"url\", \"every\", \"fields\" }`.",
+  "",
+  "- `id`: `^[a-z][a-z0-9_]{0,15}$`, unique in the pack.",
+  "- `url`: `https://` only. The host must be in the relay's allowed list",
+  "  (default: `site.api.espn.com`, `api.open-meteo.com`).",
+  "- `every`: seconds between fetches, 30 to 3600.",
+  "- `fields`: object, 1 to 12 entries. Key `^[a-z][a-z0-9_]{0,15}$`. Value: a",
+  "  dot path into the JSON reply. A number is an array index",
+  "  (`team.nextEvent.0.shortName`). 200 characters at most.",
+  "",
+  "The **relay** fetches each URL (one time for all devices that use it) and",
+  "sends the values to the devices. A value is made a string of 40 characters at",
+  "most. If the path ends at an object that has `displayValue`, that is used.",
+  "A missing path gives no value. The full name of a value is `source_id.field`,",
+  "for example `game.state`.",
+  "",
+  "### panels",
+  "",
+  "All panels in version 1 fill the **weather box** (three rows). Two forms:",
+  "",
+  "1. Built-in: `{ \"slot\": \"weather\", \"builtin\": \"weather\" }` — the normal",
+  "   weather panel takes part in the rotation.",
+  "2. Custom: `{ \"slot\": \"weather\", \"title\", \"rows\", \"when\", \"priority\" }`",
+  "   - `title`: optional, 1 to 10 characters. Label of the box for this panel.",
+  "   - `rows`: 1 to 3 rows. Each row: `{ \"left\", \"right\", \"bar\" }`.",
+  "     - `left`: required text template, 28 characters at most.",
+  "     - `right`: optional text template, 14 characters at most.",
+  "     - `bar`: optional `{ \"value\": template, \"max\": number > 0 }`. Draws the",
+  "       12-box slider at the right. A row has `right` or `bar`, not the two.",
+  "   - A template puts values in with `{source_id.field}`. A value that is not",
+  "     there shows as `--`.",
+  "   - `when`: optional condition `{ \"field\": \"game.state\", <op> }` with one",
+  "     of `\"equals\": string`, `\"not_equals\": string`, `\"exists\": true|false`.",
+  "     Both forms can have `when` and `priority`.",
+  "   - `priority`: optional integer, -100 to 100. Default 0.",
+  "",
+  "**Which panel shows:** take the panels whose `when` is true (no `when` =",
+  "true). Keep those with the highest `priority`. If more than one stays, show",
+  "them in turn, each for `rotate_seconds`:",
+  "`index = floor(unix_time / rotate_seconds) % count`. If none stays, or the",
+  "pack has no panels, show the built-in weather."
+].join('\n');
+
+// packs/unc-hoops.json (also checked by the tests)
+const EXAMPLE_PACK = {
+  "pack": 1,
+  "id": "unc-hoops",
+  "name": "UNC Hoops",
+  "theme": {
+    "colors": {
+      "bg": "#13294B",
+      "tan": "#7BAFD4",
+      "lavender": "#FFFFFF",
+      "purple": "#B9D9EB",
+      "green": "#7BAFD4"
+    },
+    "header": "GO HEELS",
+    "labels": {
+      "messages": "crew"
+    }
+  },
+  "sources": [
+    {
+      "id": "game",
+      "url": "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/teams/153",
+      "every": 60,
+      "fields": {
+        "state": "team.nextEvent.0.competitions.0.status.type.state",
+        "when": "team.nextEvent.0.competitions.0.status.type.shortDetail",
+        "match": "team.nextEvent.0.shortName",
+        "clock": "team.nextEvent.0.competitions.0.status.displayClock",
+        "period": "team.nextEvent.0.competitions.0.status.period",
+        "home": "team.nextEvent.0.competitions.0.competitors.0.team.abbreviation",
+        "home_score": "team.nextEvent.0.competitions.0.competitors.0.score",
+        "away": "team.nextEvent.0.competitions.0.competitors.1.team.abbreviation",
+        "away_score": "team.nextEvent.0.competitions.0.competitors.1.score",
+        "record": "team.record.items.0.summary",
+        "standing": "team.standingSummary"
+      }
+    }
+  ],
+  "panels": [
+    {
+      "slot": "weather",
+      "title": "live",
+      "priority": 10,
+      "when": {
+        "field": "game.state",
+        "equals": "in"
+      },
+      "rows": [
+        {
+          "left": "{game.home}",
+          "right": "{game.home_score}"
+        },
+        {
+          "left": "{game.away}",
+          "right": "{game.away_score}"
+        },
+        {
+          "left": "period {game.period}",
+          "right": "{game.clock}"
+        }
+      ]
+    },
+    {
+      "slot": "weather",
+      "title": "final",
+      "priority": 5,
+      "when": {
+        "field": "game.state",
+        "equals": "post"
+      },
+      "rows": [
+        {
+          "left": "{game.home}",
+          "right": "{game.home_score}"
+        },
+        {
+          "left": "{game.away}",
+          "right": "{game.away_score}"
+        },
+        {
+          "left": "final",
+          "right": "{game.record}"
+        }
+      ]
+    },
+    {
+      "slot": "weather",
+      "builtin": "weather"
+    },
+    {
+      "slot": "weather",
+      "title": "next game",
+      "when": {
+        "field": "game.state",
+        "equals": "pre"
+      },
+      "rows": [
+        {
+          "left": "{game.match}"
+        },
+        {
+          "left": "{game.when}"
+        },
+        {
+          "left": "{game.record}",
+          "right": "{game.standing}"
+        }
+      ]
+    }
+  ],
+  "rotate_seconds": 20
+};
+
+// ---------------------------------------------------------------------------
+// Agent connect (docs/PACKS.md §3)
+// ---------------------------------------------------------------------------
+
+const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // No I/O/0/1
+const AGENT_CODE_TTL_MS = 15 * 60000;
+const AGENT_TOKENS_PER_DEVICE = 5;
+const AGENT_SEND_LIMIT = 20;            // send_message + share_pack per token ...
+const AGENT_SEND_WINDOW_MS = 10 * 60000; // ... in this window
+const MCP_BODY_LIMIT = 64 * 1024;
+const MCP_MAX_BATCH = 20;
+const MCP_PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
+const MCP_DEFAULT_PROTOCOL_VERSION = '2025-06-18';
+const SOURCE_TIMEOUT_MS = 10000;
+const SOURCE_MAX_BYTES = 2 * 1024 * 1024;
+const SOURCE_KEEP_UNUSED_MS = 3600000;
+
+let RELAY_VERSION = '1.0.0';
+try {
+  RELAY_VERSION = require('./package.json').version || RELAY_VERSION;
+} catch (_) { /* keep the default */ }
+
+function generateConnectCode() {
+  let code = '';
+  for (let i = 0; i < 8; i++) code += CODE_ALPHABET[crypto.randomInt(CODE_ALPHABET.length)];
+  return code;
+}
+
+function sha256Hex(text) {
+  return crypto.createHash('sha256').update(text).digest('hex');
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[ch]));
+}
+
+// Small self-contained page in the style of the Spotify success page.
+function htmlPage(title, bodyHtml) {
+  return `<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="robots" content="noindex">
+    <title>LEELOO - ${escapeHtml(title)}</title>
+    <style>
+      body { font-family: Arial, sans-serif; text-align: center; padding: 40px 16px; margin: 0; background: #1A1D2E; color: #A7AFD4; }
+      main { max-width: 560px; margin: 0 auto; }
+      h1 { color: #7beec0; }
+      h2 { color: #7beec0; font-size: 1.05em; margin-top: 28px; }
+      p, li { line-height: 1.5; }
+      ol { text-align: left; }
+      button { font-size: 1.05em; padding: 12px 22px; border: 0; border-radius: 8px; background: #7beec0; color: #1A1D2E; font-weight: bold; cursor: pointer; }
+      textarea { width: 100%; box-sizing: border-box; font-family: monospace; font-size: 0.95em; padding: 12px; border: 1px solid #A7AFD4; border-radius: 8px; background: #11131f; color: #ffffff; resize: none; }
+      .warn { color: #D6697F; }
+    </style>
+  </head>
+  <body>
+    <main>
+${bodyHtml}
+    </main>
+  </body>
+</html>`;
+}
+
+class RpcError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+  }
+}
+
+function rpcError(id, code, message) {
+  return { jsonrpc: '2.0', id: id === undefined ? null : id, error: { code, message } };
+}
+
+function toolText(text, isError = false) {
+  const result = { content: [{ type: 'text', text }] };
+  if (isError) result.isError = true;
+  return result;
+}
+
+const PACK_ARGUMENT_SCHEMA = {
+  type: 'object',
+  description: 'The complete pack as a JSON object (format: call get_pack_guide). 8,000 bytes at most.',
+  additionalProperties: true
+};
+const NO_ARGUMENTS_SCHEMA = { type: 'object', properties: {}, additionalProperties: false };
+const PACK_INPUT_SCHEMA = {
+  type: 'object',
+  properties: { pack: PACK_ARGUMENT_SCHEMA },
+  required: ['pack'],
+  additionalProperties: false
+};
+
+const MCP_TOOLS = [
+  {
+    name: 'get_status',
+    title: 'Leeloo status',
+    description: 'Shows the owner name of this Leeloo, if it is online, the crew members, the crew devices that are online now, and the pack that is active on the Leeloo.',
+    inputSchema: NO_ARGUMENTS_SCHEMA,
+    annotations: { readOnlyHint: true }
+  },
+  {
+    name: 'get_pack_guide',
+    title: 'Pack format guide',
+    description: 'Returns the pack format (version 1) with all rules and limits, the allowed source hosts and an example pack. Call this before you write a pack.',
+    inputSchema: NO_ARGUMENTS_SCHEMA,
+    annotations: { readOnlyHint: true }
+  },
+  {
+    name: 'validate_pack',
+    title: 'Check a pack',
+    description: 'Checks a pack and changes nothing. Returns "valid" or the list of errors, each with the path of the bad value. Correct the pack and check it again.',
+    inputSchema: PACK_INPUT_SCHEMA,
+    annotations: { readOnlyHint: true }
+  },
+  {
+    name: 'install_pack',
+    title: 'Install a pack',
+    description: 'Checks a pack, then installs it on the owner\'s Leeloo. It replaces the pack that is active now. If the Leeloo is offline, the pack is installed when it connects again. An invalid pack is not installed: the result lists the errors.',
+    inputSchema: PACK_INPUT_SCHEMA
+  },
+  {
+    name: 'share_pack',
+    title: 'Offer a pack to the crew',
+    description: 'Checks a pack, then offers it to the other Leeloos of the crew in the owner\'s name. Each friend decides to use it or not. It does not install the pack on the owner\'s Leeloo (use install_pack for that). Do this only when the owner asks for it.',
+    inputSchema: PACK_INPUT_SCHEMA
+  },
+  {
+    name: 'reset_pack',
+    title: 'Default look',
+    description: 'Removes the active pack from the owner\'s Leeloo and brings back the default look. If the Leeloo is offline, this is done when it connects again.',
+    inputSchema: NO_ARGUMENTS_SCHEMA
+  },
+  {
+    name: 'send_message',
+    title: 'Message the crew',
+    description: 'Sends a short text message to the crew in the owner\'s name. It shows on the screens of the friends\' Leeloos. Do this only when the owner asks for it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', minLength: 1, maxLength: 500, description: 'The message, 1 to 500 characters. Plain text.' }
+      },
+      required: ['text'],
+      additionalProperties: false
+    }
+  }
+];
+
+const MCP_INSTRUCTIONS =
+  'A Leeloo is a small gadget with a 480x320 screen that shows weather, time, crew messages and ' +
+  'the music of its owner, and shares messages and songs with a crew of friends. This connector ' +
+  'controls ONE Leeloo. You can change how it looks with a "pack": one JSON file with colours, ' +
+  'labels and up to 6 panels for the weather box, which can show live values from allowed web ' +
+  'sources. A pack is data, not code. Call get_pack_guide before you write a pack, check it with ' +
+  'validate_pack, then use install_pack. share_pack and send_message go to the owner\'s friends: ' +
+  'use them only when the owner asks.';
+
 /**
  * Build a relay instance. Nothing listens until `listen()` is called.
  *
@@ -62,6 +734,13 @@ function clientIp(req) {
  *   maxPayload        max incoming WebSocket message size in bytes (default 64 KB)
  *   now               clock function returning ms (default Date.now)
  *   fetch             fetch implementation used for the Spotify token exchange
+ *                     and for pack sources
+ *   publicBaseUrl     base of the links shown to users (env PUBLIC_BASE_URL,
+ *                     default https://leeloobot.xyz)
+ *   sourceHosts       hosts that pack sources may use: array or comma list
+ *                     (env LEELOO_SOURCE_HOSTS, default site.api.espn.com,api.open-meteo.com)
+ *   sourceTickMs      how often the source scheduler looks for due URLs
+ *                     (default 5000; 0 = no timer, call pollSources() yourself)
  *   log               logger with log/error (default console)
  *   telegramApiSecret, spotifyClientId, spotifyClientSecret, spotifyRedirectUri
  *                     default to the matching environment variables
@@ -86,6 +765,11 @@ function createRelay(options = {}) {
   const SPOTIFY_CLIENT_SECRET = options.spotifyClientSecret ?? process.env.SPOTIFY_CLIENT_SECRET;
   const SPOTIFY_REDIRECT_URI = options.spotifyRedirectUri ?? process.env.SPOTIFY_REDIRECT_URI;
   const TELEGRAM_API_SECRET = options.telegramApiSecret ?? process.env.TELEGRAM_API_SECRET ?? '';
+  const publicBaseUrl = String(options.publicBaseUrl ?? process.env.PUBLIC_BASE_URL ?? 'https://leeloobot.xyz')
+    .replace(/\/+$/, '');
+  const sourceHosts = parseSourceHosts(options.sourceHosts ?? process.env.LEELOO_SOURCE_HOSTS);
+  const sourceTickMs = options.sourceTickMs ?? 5000;
+  const checkPack = (pack) => validatePack(pack, { sourceHosts });
 
   const app = express();
   const server = http.createServer(app);
@@ -98,9 +782,17 @@ function createRelay(options = {}) {
   const crews = new Map();   // crew_code -> { created_at, telegram_users: Map<id, name>, members: Map<device_id, name> }
   const queues = new Map();  // device_id -> [ { crew_code, message } ]
   const pendingSpotifyTokens = new Map(); // device_id -> { tokens, timestamp }
+  const agentTokens = new Map();    // sha256(token) -> { device_id, crew_code, created_at }
+  const devicePacks = new Map();    // device_id -> active pack (valid, with sources or not)
+  const pendingPackOps = new Map(); // device_id -> { message: pack_install | pack_reset, timestamp }
 
   // Failed crew attempts: key -> [timestamps]
   const joinFailures = new Map();
+
+  // Memory only
+  const connectCodes = new Map(); // code -> { device_id, crew_code, expires_at }
+  const agentSends = new Map();   // token hash -> [timestamps] of send_message / share_pack
+  const sourceCache = new Map();  // url -> { data, hasData, lastAttempt, failing, inflight }
 
   let closed = false;
 
@@ -124,7 +816,10 @@ function createRelay(options = {}) {
       saved_at: now(),
       crews: crewsOut,
       queues: Object.fromEntries(queues),
-      pendingSpotifyTokens: Object.fromEntries(pendingSpotifyTokens)
+      pendingSpotifyTokens: Object.fromEntries(pendingSpotifyTokens),
+      agentTokens: Object.fromEntries(agentTokens), // hashes only, never the tokens
+      devicePacks: Object.fromEntries(devicePacks),
+      pendingPackOps: Object.fromEntries(pendingPackOps)
     };
   }
 
@@ -184,7 +879,38 @@ function createRelay(options = {}) {
       }
     }
 
-    log.log(`[STATE] Loaded ${crews.size} crews, ${queues.size} offline queues from ${dataFile}`);
+    // Added in state version 2. Older files do not have these keys.
+    if (isPlainObject(state.agentTokens)) {
+      for (const [hash, saved] of Object.entries(state.agentTokens)) {
+        if (!/^[0-9a-f]{64}$/.test(hash) || !isPlainObject(saved)) continue;
+        if (typeof saved.device_id !== 'string' || typeof saved.crew_code !== 'string') continue;
+        agentTokens.set(hash, {
+          device_id: saved.device_id,
+          crew_code: saved.crew_code,
+          created_at: Number(saved.created_at) || now()
+        });
+      }
+    }
+
+    if (isPlainObject(state.devicePacks)) {
+      for (const [id, pack] of Object.entries(state.devicePacks)) {
+        // The rules or the allowed hosts can change between two runs. The
+        // device sends pack_active again after its next join.
+        if (checkPack(pack).length === 0) devicePacks.set(id, pack);
+      }
+    }
+
+    if (isPlainObject(state.pendingPackOps)) {
+      for (const [id, op] of Object.entries(state.pendingPackOps)) {
+        if (!isPlainObject(op) || !isPlainObject(op.message)) continue;
+        const message = op.message;
+        const ok = message.type === 'pack_reset' ||
+          (message.type === 'pack_install' && checkPack(message.pack).length === 0);
+        if (ok) pendingPackOps.set(id, { message, timestamp: Number(op.timestamp) || now() });
+      }
+    }
+
+    log.log(`[STATE] Loaded ${crews.size} crews, ${queues.size} offline queues, ${agentTokens.size} agent links from ${dataFile}`);
   }
 
   // Synchronous atomic write: temp file in the same directory, then rename.

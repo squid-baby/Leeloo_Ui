@@ -58,6 +58,9 @@ class FakeClient:
     async def send_hang_confirm(self): return await self._send('hang_confirm')
     async def push_song(self, uri, *a, **k): return await self._send('song', uri)
     async def disconnect(self): self.connected = False
+    async def send_pack_active(self, pack): return await self._send('pack_active', (pack or {}).get('id'))
+    async def request_agent_connect(self): return await self._send('agent_connect_request')
+    async def send_agent_disconnect(self): return await self._send('agent_disconnect')
 
 
 @pytest.fixture
@@ -74,7 +77,7 @@ def brain(tmp_path, monkeypatch):
     monkeypatch.setattr(brain_mod, "get_weather", lambda *a, **k: None)
     # Fresh data files for every test
     for name in ("messages.json", "crew_config.json", "device_config.json", "leeloo_data.json",
-                 ".spotify_offered", ".welcome_sent"):
+                 ".spotify_offered", ".welcome_sent", "pack.json"):
         try:
             os.remove(os.path.join(os.environ["LEELOO_HOME"], name))
         except FileNotFoundError:
@@ -1080,3 +1083,134 @@ def test_readout_cuts_very_long_messages(brain):
     brain.message_mgr.add_message("Amy", "word " * 1000)
     run_voice(brain, Intent("MESSAGE_READOUT", {}, ""))
     assert sum(len(l) for l in brain.frames[-1][1]) < 600
+
+
+# =============================================================================
+# Packs + agent connect (docs/PACKS.md)
+# =============================================================================
+import json as _json
+
+UNC = _json.load(open(os.path.join(os.path.dirname(os.path.dirname(__file__)), "packs", "unc-hoops.json")))
+
+
+def test_agent_installs_pack_and_screen_changes(brain):
+    before = brain.display.render(None, {'time_str': '9:00 AM', 'date_str': 'Nov 12', 'seconds': 0}, [], None).getpixel((300, 2))
+
+    async def go():
+        brain._on_pack_install(UNC)
+        await settle(brain)
+    asyncio.run(go())
+    assert brain.packs.pack['id'] == 'unc-hoops'
+    assert ('pack_active', 'unc-hoops') in brain.ws_client.sent
+    assert "new look!" in frame_text(brain) and "UNC Hoops" in frame_text(brain)
+    assert brain._render_normal(True) is True
+    after = brain.display.image.getpixel((300, 2))
+    assert after != before                               # Carolina navy, not the default background
+    # A new brain (restart) keeps the pack
+    assert LeelooBrain().packs.pack['id'] == 'unc-hoops'
+    brain._reset_pack()
+    brain._render_normal(True)
+    assert brain.display.image.getpixel((300, 2)) == before
+
+
+def test_invalid_pack_from_agent_is_refused(brain):
+    async def go():
+        brain._on_pack_install({"pack": 1, "id": "x", "name": "bad", "run": "rm -rf /"})
+        await settle(brain)
+    asyncio.run(go())
+    assert brain.packs.pack is None and "look not installed" in frame_text(brain)
+
+
+def test_offered_pack_needs_use_it(brain):
+    async def go():
+        brain._on_pack_offer("Amy", UNC)
+        await settle(brain)
+    asyncio.run(go())
+    assert brain.packs.pack is None                       # never installed automatically
+    assert "amy shared" in frame_text(brain) and 'tap + say "use it"' in frame_text(brain)
+    assert "UNC Hoops from Amy" in brain._get_intent_context()
+    run_voice(brain, Intent("PACK_ACCEPT", {}, ""))
+    assert brain.packs.pack['id'] == 'unc-hoops' and brain._offered_pack is None
+    run_voice(brain, Intent("PACK_RESET", {}, ""))
+    assert brain.packs.pack is None and ('pack_active', None) in brain.ws_client.sent
+
+
+def test_pack_accept_without_offer_and_invalid_offer(brain):
+    run_voice(brain, Intent("PACK_ACCEPT", {}, ""))
+    assert "no look to use" in frame_text(brain)
+    brain._on_pack_offer("Amy", {"pack": 1, "id": "BAD ID", "name": "x"})
+    assert brain._offered_pack is None
+
+
+def test_pack_data_drives_the_live_scoreboard(brain, monkeypatch):
+    monkeypatch.setattr(brain, "_update_time", lambda: brain.__setattr__(
+        "time_data", {'time_str': '9:00 AM', 'date_str': 'Nov 12', 'seconds': 5}))
+    brain.packs.install(UNC)
+    brain._render_normal(True)
+    brain._on_pack_data("unc-hoops", {"game.state": "in", "game.home": "UNC", "game.home_score": "54",
+                                      "game.away": "DUKE", "game.away_score": "51",
+                                      "game.period": "2", "game.clock": "4:12"})
+    panel = brain.packs.current_panel()
+    assert panel['title'] == 'live' and panel['rows'][0] == {'left': 'UNC', 'right': '54', 'bar': None}
+    assert brain._render_normal() is True                 # new data -> repaint
+    assert brain._render_normal() is False                # nothing new -> no repaint
+    brain._on_pack_data("other-pack", {"game.state": "post"})
+    assert brain.packs.current_panel()['title'] == 'live'  # data for another pack is ignored
+
+
+def test_pack_from_agent_during_voice_is_not_drawn_while_recording(brain):
+    brain.voice = FakeVoice(transcript="", delay=0.3)
+
+    async def go():
+        tap = asyncio.ensure_future(brain._on_tap('single_tap'))
+        await asyncio.sleep(0.15)
+        brain._on_pack_install(UNC)
+        assert not brain.frames
+        await tap
+        for _ in range(3):
+            await asyncio.sleep(0.2); await settle(brain)
+    asyncio.run(go())
+    assert "new look!" in frame_text(brain)
+
+
+def test_agent_connect_shows_qr_with_the_code(brain, monkeypatch):
+    qr = {}
+    monkeypatch.setattr(brain, "_generate_qr_image", lambda url, *a: qr.setdefault('url', url) and None)
+    real = brain.ws_client.request_agent_connect
+
+    async def request():
+        ok = await real()
+        asyncio.get_running_loop().call_later(
+            0.05, brain._on_agent_connect, "ABCD2345", "https://leeloobot.xyz/connect/ABCD2345", 900)
+        return ok
+    brain.ws_client.request_agent_connect = request
+    run_voice(brain, Intent("AGENT_CONNECT", {}, ""))
+    assert qr['url'] == "https://leeloobot.xyz/connect/ABCD2345"
+    text = frame_text(brain)
+    assert "connect your agent" in text and "code: ABCD2345" in text and "good for 15 min" in text
+    assert brain._welcome_qr_active is False
+
+
+def test_agent_connect_offline_and_no_answer(brain, monkeypatch):
+    brain.ws_client.connected = False
+    run_voice(brain, Intent("AGENT_CONNECT", {}, ""))
+    assert "can't connect" in frame_text(brain)
+    brain.frames.clear(); brain.ws_client.connected = True
+    real_wait_for = asyncio.wait_for
+    monkeypatch.setattr(brain_mod.asyncio, "wait_for", lambda fut, timeout: real_wait_for(fut, min(timeout, 0.1)))
+    run_voice(brain, Intent("AGENT_CONNECT", {}, ""))
+    assert "no answer" in frame_text(brain)
+
+
+def test_agent_disconnect(brain):
+    run_voice(brain, Intent("AGENT_DISCONNECT", {}, ""))
+    assert ('agent_disconnect',) in brain.ws_client.sent and "agent disconnected" in frame_text(brain)
+
+
+def test_queued_pack_offer_is_kept_for_later(brain):
+    async def go():
+        brain._on_ws_queued("Amy", "pack_offer", {"pack": UNC}, time.time() - 60)
+        await asyncio.sleep(0.05)
+    asyncio.run(go())
+    assert brain._offered_pack and brain._offered_pack[0] == "Amy" and brain.packs.pack is None
+    assert brain.message_mgr.get_unread_counts() == {"Amy": 1}

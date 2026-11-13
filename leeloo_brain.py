@@ -74,6 +74,7 @@ from leeloo_tap import TapManager
 from leeloo_voice import VoiceManager
 from leeloo_intent import IntentRouter, build_context, ask_claude, extract_json
 from leeloo_messages import MessageManager
+from leeloo_packs import PackManager, validate_pack
 from leeloo_client import LeelooClient
 
 # Config
@@ -371,6 +372,11 @@ class LeelooBrain:
             print("[BRAIN] Intent: disabled (no ANTHROPIC_API_KEY)")
 
         self.message_mgr = MessageManager()
+
+        # Packs: a look + one custom panel, as data (docs/PACKS.md)
+        self.packs = PackManager(os.path.join(LEELOO_HOME, "pack.json"))
+        self._offered_pack = None         # (sender, pack) that waits for "use it"
+        self._agent_connect_waiter = None # Future for the relay's connect code
         print(f"[BRAIN] Messages: {self.message_mgr.get_total_unread()} unread")
 
         self.ws_client = LeelooClient(relay_url=RELAY_URL, config_path=CREW_CONFIG_PATH)
@@ -519,6 +525,9 @@ class LeelooBrain:
             now=now.replace(tzinfo=None),
             pending_hang=self._hang_context(),
             next_hang=(self._hang_label(self._next_hang()) if self._next_hang() else None),
+            pack=(self.packs.pack or {}).get('name'),
+            offered_pack=(f"{self._offered_pack[1].get('name')} from {self._offered_pack[0]}"
+                          if self._offered_pack else None),
         )
 
     def _hang_context(self):
@@ -782,6 +791,125 @@ class LeelooBrain:
         c.on_spotify_auth = self._on_spotify_auth
         c.on_roster = self._on_roster
         c.on_queued_message = self._on_ws_queued
+        c.on_pack_offer = self._on_pack_offer
+        c.on_pack_install = self._on_pack_install
+        c.on_pack_reset = self._on_pack_reset
+        c.on_pack_data = self._on_pack_data
+        c.on_agent_connect = self._on_agent_connect
+        c.on_agent_disconnected = self._on_agent_disconnected
+
+    # =========================================================================
+    # PACKS + AGENT CONNECT (docs/PACKS.md)
+    # =========================================================================
+
+    def _install_pack(self, pack, from_who, from_voice=False):
+        """Install a pack on this device. Returns True if it is active now."""
+        errors = self.packs.install(pack)
+        if errors:
+            print(f"[BRAIN] Pack refused: {errors[:3]}")
+            self.show_frame(FrameType.MESSAGES, [
+                ("look not installed", "large", COLORS['rose']),
+                ("", None, None),
+                *format_display_text("the pack has an error. ask the agent to check it.", COLORS['white']),
+            ], duration=10.0, from_voice=from_voice)
+            return False
+        self._offered_pack = None
+        self._spawn(self.ws_client.send_pack_active(self.packs.pack))
+        self._wake_display()
+        self.show_frame(FrameType.MESSAGES, [
+            ("new look!", "large", COLORS['lavender']),
+            ("", None, None),
+            *format_display_text(str(pack.get('name', '')), COLORS['white']),
+            *format_display_text(f"from {from_who}", COLORS['tan']),
+            ("", None, None),
+            ('say "default look"', "small", HINT_COLOR),
+            ("to remove it", "small", HINT_COLOR),
+        ], duration=10.0, from_voice=from_voice)
+        return True
+
+    def _reset_pack(self):
+        self.packs.reset()
+        self._spawn(self.ws_client.send_pack_active(None))
+        self._wake_display()
+
+    def _on_pack_install(self, pack):
+        """The owner's own agent installs a pack. No question is asked:
+        the owner gave the agent the key to this device."""
+        self._led_notify(self.led.message_received)
+        self._install_pack(pack, "your agent")
+
+    def _on_pack_reset(self):
+        self._reset_pack()
+        self.show_frame(FrameType.MESSAGES, [("default look", "large", COLORS['lavender'])], duration=5.0)
+
+    def _on_pack_offer(self, sender, pack, notify=True):
+        """A friend offers a pack. It is NEVER installed automatically."""
+        if validate_pack(pack):
+            print(f"[BRAIN] Offered pack from {sender} is not valid - ignored")
+            return False
+        self._remember_contact(sender)
+        self._offered_pack = (sender, pack)
+        if notify:
+            self._led_notify(self.led.message_received)
+            self.show_frame(FrameType.MESSAGES, [
+                (f"{sender.lower()} shared", "large", COLORS['lavender']),
+                ("a new look", "large", COLORS['lavender']),
+                ("", None, None),
+                *format_display_text(str(pack.get('name', '')), COLORS['white']),
+                ("", None, None),
+                ('tap + say "use it"', "small", COLORS['tan']),
+            ])
+        return True
+
+    def _on_pack_data(self, pack_id, values):
+        if self.packs.set_values(pack_id, values):
+            self._wake_display()
+
+    def _on_agent_connect(self, code, url, expires_in):
+        waiter = self._agent_connect_waiter
+        if waiter is not None and not waiter.done():
+            waiter.set_result((code, url, expires_in))
+
+    def _on_agent_disconnected(self, removed):
+        print(f"[BRAIN] Agent links removed: {removed}")
+
+    async def _intent_agent_connect(self, show):
+        """Voice command "connect my agent": show a QR code for the connect page."""
+        if not self._connected():
+            self._show_offline("can't connect")
+            return
+        self._agent_connect_waiter = asyncio.get_running_loop().create_future()
+        try:
+            if not await self.ws_client.request_agent_connect():
+                self._show_offline("can't connect")
+                return
+            code, url, expires_in = await asyncio.wait_for(self._agent_connect_waiter, timeout=8.0)
+        except asyncio.TimeoutError:
+            show(FrameType.MESSAGES, [
+                ("no answer", "large", COLORS['rose']),
+                ("", None, None),
+                *format_display_text("the leeloo server did not answer. try again in a minute.",
+                                     COLORS['white']),
+            ], 10.0)
+            return
+        finally:
+            self._agent_connect_waiter = None
+        minutes = max(1, int(expires_in) // 60)
+        self._start_frame_task(lambda: self._qr_frame(
+            (url, "scan to connect", "your agent", COLORS['lavender']),
+            [
+                ("connect your agent", "large", COLORS['lavender']),
+                ("", None, None),
+                ("scan the QR code", "normal", COLORS['white']),
+                ("with your phone.", "normal", COLORS['white']),
+                ("the page gives you", "normal", COLORS['white']),
+                ("a link for Claude", "normal", COLORS['white']),
+                ("or ChatGPT.", "normal", COLORS['white']),
+                ("", None, None),
+                (f"code: {code}", "normal", COLORS['green']),
+                (f"good for {minutes} min", "small", HINT_COLOR),
+                ("tap device to close", "small", HINT_COLOR),
+            ], duration=120.0))
 
     def _remember_contact(self, name):
         """Add a crew member to the contact list (persisted in crew_config.json)."""
@@ -1015,6 +1143,12 @@ class LeelooBrain:
         elif msg_type == 'hang_confirm':
             self._save_pending_hang()
             self.message_mgr.add_message(sender, "confirmed the hang", timestamp)
+        elif msg_type == 'pack_offer':
+            pack = payload.get('pack')
+            if not isinstance(pack, dict) or not self._on_pack_offer(sender, pack, notify=False):
+                return
+            self.message_mgr.add_message(
+                sender, f'shared a look: {pack.get("name", "")}. say "use it" to try it', timestamp)
         else:
             return
 
@@ -1185,10 +1319,13 @@ class LeelooBrain:
             unread = self.message_mgr.get_unread_counts()
             hang = format_countdown_display()
             art = self.album_art_path
+            self.display.apply_theme(self.packs.theme_colors())   # cheap when unchanged
+            panel = self.packs.current_panel()
+            pack_sig = self.packs.signature()
 
             if status in ("listening...", "thinking..."):
                 # During a voice session repaint once per state, not per clock tick
-                sig = ('voice', status)
+                sig = ('voice', status, pack_sig)
             else:
                 sig = (
                     status,
@@ -1201,6 +1338,7 @@ class LeelooBrain:
                     art,
                     tuple(self.contacts), tuple(sorted(unread.items())),
                     json.dumps(hang, sort_keys=True, default=str),
+                    pack_sig,
                 )
             if not force and sig == self._last_render_sig:
                 return False
@@ -1209,6 +1347,7 @@ class LeelooBrain:
                 weather, self.time_data, list(self.contacts), music,
                 album_art_path=art, unread_counts=unread,
                 status_text=status, hang=hang,
+                header=self.packs.header(), labels=self.packs.labels(), custom_panel=panel,
             )
             write_to_framebuffer(img)
             self._last_render_sig = sig
@@ -1542,6 +1681,34 @@ class LeelooBrain:
         elif action == "SPOTIFY_SETUP":
             self._show_spotify_qr()
 
+        elif action == "AGENT_CONNECT":
+            await self._intent_agent_connect(show)
+
+        elif action == "AGENT_DISCONNECT":
+            if self._connected() and await self.ws_client.send_agent_disconnect():
+                show(FrameType.MESSAGES, [
+                    ("agent disconnected", "large", COLORS['lavender']),
+                    ("", None, None),
+                    *format_display_text("old connector links do not work now.", COLORS['white']),
+                ], 8.0)
+            else:
+                self._show_offline("not disconnected")
+
+        elif action == "PACK_ACCEPT":
+            if self._offered_pack:
+                sender, pack = self._offered_pack
+                self._install_pack(pack, sender, from_voice=True)
+            else:
+                show(FrameType.MESSAGES, [
+                    ("no look to use", "large", COLORS['lavender']),
+                    ("", None, None),
+                    *format_display_text("a friend must share a look first.", COLORS['white']),
+                ], 8.0)
+
+        elif action == "PACK_RESET":
+            self._reset_pack()
+            show(FrameType.MESSAGES, [("default look", "large", COLORS['lavender'])], 5.0)
+
         elif action == "TIME_QUERY":
             time_text = await self._generate_cosmic_time()
             now = self._now()
@@ -1763,6 +1930,8 @@ class LeelooBrain:
                         print("[BRAIN] WebSocket connected and crew joined!")
                         session_start = time.time()
                         self._ws_down_since = None
+                        # The relay fetches the pack's data sources for us
+                        await self.ws_client.send_pack_active(self.packs.pack)
                         self._wake_display()
 
                         listen_task = asyncio.create_task(self.ws_client.listen())

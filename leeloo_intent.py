@@ -34,7 +34,8 @@ API_TIMEOUT_S = 12.0
 ACTIONS = (
     "WEATHER_EXPAND", "MESSAGE_SEND", "MESSAGE_READOUT", "ALBUM_INFO",
     "SONG_PUSH", "HANG_PROPOSE", "HANG_CONFIRM", "NUDGE", "TELEGRAM_SETUP",
-    "SPOTIFY_SETUP", "TIME_QUERY", "UNKNOWN",
+    "SPOTIFY_SETUP", "AGENT_CONNECT", "AGENT_DISCONNECT", "PACK_ACCEPT", "PACK_RESET",
+    "TIME_QUERY", "UNKNOWN",
 )
 
 # STATIC. No .format(), no dates, no device state. Any change to this text
@@ -43,7 +44,7 @@ SYSTEM_PROMPT = """You are LEELOO's brain — a retro music-sharing gadget share
 
 Respond with one JSON object only (no markdown, no code fences, no other text):
 {
-  "action": "WEATHER_EXPAND|MESSAGE_SEND|MESSAGE_READOUT|ALBUM_INFO|SONG_PUSH|HANG_PROPOSE|HANG_CONFIRM|NUDGE|TELEGRAM_SETUP|SPOTIFY_SETUP|TIME_QUERY|UNKNOWN",
+  "action": "WEATHER_EXPAND|MESSAGE_SEND|MESSAGE_READOUT|ALBUM_INFO|SONG_PUSH|HANG_PROPOSE|HANG_CONFIRM|NUDGE|TELEGRAM_SETUP|SPOTIFY_SETUP|AGENT_CONNECT|AGENT_DISCONNECT|PACK_ACCEPT|PACK_RESET|TIME_QUERY|UNKNOWN",
   "params": { },
   "display_text": "text to show on the retro LCD screen (keep under 200 chars)"
 }
@@ -59,6 +60,10 @@ Action details:
 - NUDGE: User wants to nudge/wink/poke friends. Set params.nudge=true.
 - TELEGRAM_SETUP: User asks about Telegram setup, how to message from phone, how to connect Telegram, or says "setup help". Set params.telegram=true.
 - SPOTIFY_SETUP: User wants to connect, link, or sync their Spotify account ("connect spotify", "spotify setup", "show my music"). Set params.spotify=true.
+- AGENT_CONNECT: User wants to connect an AI agent or assistant (Claude, ChatGPT) to this Leeloo ("connect my agent", "connect claude", "agent setup"). No params.
+- AGENT_DISCONNECT: User wants to remove the agent's access ("disconnect my agent", "remove my agent"). No params.
+- PACK_ACCEPT: A friend offered a new look ("pack") and the user accepts it ("use it", "install it", "yes use that look"). Use it ONLY when the device state shows an offered pack. No params.
+- PACK_RESET: User wants the normal look back ("default look", "reset the look", "remove the theme"). No params.
 - TIME_QUERY: User asks about the time, date, or "what time is it". Set params.time=true. display_text is NOT used for this action (will be generated separately).
 - UNKNOWN: Everything else. display_text = a brief friendly answer. Rules:
   - If the user asks when the next hang is, answer from "Next confirmed hang" / "Pending hang proposal" in the device state.
@@ -231,7 +236,8 @@ def _contact_name(contact) -> str:
 
 def build_context(weather_data=None, music_data=None, contacts=None, messages=None,
                   now: Optional[datetime] = None, pending_hang: Optional[str] = None,
-                  next_hang: Optional[str] = None):
+                  next_hang: Optional[str] = None, pack: Optional[str] = None,
+                  offered_pack: Optional[str] = None):
     """
     Build the device-state text for the intent router.
 
@@ -297,6 +303,8 @@ def build_context(weather_data=None, music_data=None, contacts=None, messages=No
     # Hang proposal waiting for an answer
     parts.append(f"Pending hang proposal: {pending_hang or 'none'}")
     parts.append(f"Next confirmed hang: {next_hang or 'none'}")
+    parts.append(f"Active look (pack): {pack or 'default'}")
+    parts.append(f"Offered pack waiting for an answer: {offered_pack or 'none'}")
 
     # Recent messages (input is newest first; show oldest -> newest)
     if messages:

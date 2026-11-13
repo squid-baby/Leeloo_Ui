@@ -647,3 +647,34 @@ def test_spotify_tokens_written(config_path, tmp_path, monkeypatch):
     with open(home / "spotify_tokens.json") as f:
         assert json.load(f) == tokens
     assert os.listdir(home) == ["spotify_tokens.json"]
+
+
+def test_pack_and_agent_messages_reach_their_callbacks():
+    """New message types from docs/PACKS.md."""
+    import leeloo_client
+    c = leeloo_client.LeelooClient(relay_url="ws://unused", config_path=os.path.join(os.environ["LEELOO_HOME"], "crew_packs.json"))
+    seen = []
+    c.on_pack_offer = lambda who, pack: seen.append(("offer", who, pack["id"]))
+    c.on_pack_install = lambda pack: seen.append(("install", pack["id"]))
+    c.on_pack_reset = lambda: seen.append(("reset",))
+    c.on_pack_data = lambda pid, values: seen.append(("data", pid, values))
+    c.on_agent_connect = lambda code, url, exp: seen.append(("connect", code, url, exp))
+    c.on_agent_disconnected = lambda n: seen.append(("gone", n))
+
+    async def go():
+        for msg in [
+            {"type": "message", "msg_type": "pack_offer", "from_name": "Amy", "payload": {"pack": {"id": "p1"}}},
+            {"type": "message", "msg_type": "pack_offer", "from_name": "Amy", "payload": {"pack": "not a dict"}},
+            {"type": "pack_install", "pack": {"id": "p2"}},
+            {"type": "pack_install"},
+            {"type": "pack_reset"},
+            {"type": "pack_data", "pack_id": "p2", "values": {"a.b": "1"}},
+            {"type": "pack_data", "pack_id": "p2", "values": "bad"},
+            {"type": "agent_connect", "code": "ABCD2345", "url": "https://x/connect/ABCD2345", "expires_in": 900},
+            {"type": "agent_connect", "code": 5},
+            {"type": "agent_disconnected", "removed": 2},
+        ]:
+            await c._handle_message(msg)
+    asyncio.run(go())
+    assert seen == [("offer", "Amy", "p1"), ("install", "p2"), ("reset",), ("data", "p2", {"a.b": "1"}),
+                    ("connect", "ABCD2345", "https://x/connect/ABCD2345", 900), ("gone", 2)]

@@ -25,6 +25,7 @@ DATA_FILES = [
     "current_music.json",
     ".welcome_sent",
     ".spotify_offered",
+    "pack.json",               # installed look
     ".welcome_qr.png",
 ]
 

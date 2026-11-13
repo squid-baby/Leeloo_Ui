@@ -84,6 +84,13 @@ class LeelooClient:
         self.on_spotify_auth: Optional[Callable] = None
         # Full crew roster (list of names) on crew_joined
         self.on_roster: Optional[Callable[[list], None]] = None
+        # Packs and agent connect (docs/PACKS.md)
+        self.on_pack_offer: Optional[Callable[[str, dict], None]] = None      # (from_name, pack)
+        self.on_pack_install: Optional[Callable[[dict], None]] = None         # (pack) from the owner's agent
+        self.on_pack_reset: Optional[Callable[[], None]] = None
+        self.on_pack_data: Optional[Callable[[str, dict], None]] = None       # (pack_id, values)
+        self.on_agent_connect: Optional[Callable[[str, str, int], None]] = None   # (code, url, expires_in)
+        self.on_agent_disconnected: Optional[Callable[[int], None]] = None    # (tokens removed)
         # Message stored while we were offline:
         # (from_name, msg_type, payload, timestamp_seconds)
         self.on_queued_message: Optional[Callable[[str, str, dict, float], None]] = None
@@ -409,6 +416,25 @@ class LeelooClient:
         """Send a nudge/wink to crew"""
         return await self._send_crew('nudge', {})
 
+    async def send_pack_active(self, pack) -> bool:
+        """Tell the relay which pack is active (None = default look).
+        The relay then fetches the pack's data sources for this device."""
+        if not self.config.crew_id:
+            return False
+        return await self._send({'type': 'pack_active', 'pack': pack})
+
+    async def request_agent_connect(self) -> bool:
+        """Ask the relay for a one-use code to connect an AI agent."""
+        if not self.config.crew_id:
+            return False
+        return await self._send({'type': 'agent_connect_request'})
+
+    async def send_agent_disconnect(self) -> bool:
+        """Delete every agent connector link of this device."""
+        if not self.config.crew_id:
+            return False
+        return await self._send({'type': 'agent_disconnect'})
+
     async def send_hang_propose(self, datetime_str: str, description: str = "") -> bool:
         """Propose a hangout time to crew"""
         return await self._send_crew('hang_propose', {
@@ -518,6 +544,41 @@ class LeelooClient:
             elif inner_type == 'hang_confirm':
                 print(f"[HANG] {from_name} confirmed!")
                 self._call(self.on_hang_confirm, from_name)
+
+            elif inner_type == 'pack_offer':
+                pack = payload.get('pack')
+                if isinstance(pack, dict):
+                    print(f"[PACK] {from_name} offers a pack: {pack.get('name')}")
+                    self._call(self.on_pack_offer, from_name, pack)
+
+        elif msg_type == 'pack_install':
+            pack = data.get('pack')
+            if isinstance(pack, dict):
+                self._call(self.on_pack_install, pack)
+
+        elif msg_type == 'pack_reset':
+            self._call(self.on_pack_reset)
+
+        elif msg_type == 'pack_data':
+            values = data.get('values')
+            if isinstance(values, dict):
+                self._call(self.on_pack_data, str(data.get('pack_id', '')), values)
+
+        elif msg_type == 'agent_connect':
+            code, url = data.get('code'), data.get('url')
+            if isinstance(code, str) and isinstance(url, str):
+                try:
+                    expires = int(data.get('expires_in', 900))
+                except (TypeError, ValueError):
+                    expires = 900
+                self._call(self.on_agent_connect, code, url, expires)
+
+        elif msg_type == 'agent_disconnected':
+            try:
+                removed = int(data.get('removed', 0))
+            except (TypeError, ValueError):
+                removed = 0
+            self._call(self.on_agent_disconnected, removed)
 
         elif msg_type == 'member_joined':
             name = data.get('display_name', 'Someone')

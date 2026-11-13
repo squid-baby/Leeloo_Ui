@@ -55,6 +55,40 @@ COLORS = {
     'yellow': '#D4A84B',         # UV moderate (muted yellow)
 }
 
+# The built-in palette, never changed. COLORS is the palette in use: a pack
+# theme is applied by updating COLORS IN PLACE (other modules hold the same
+# dict object through `from gadget_display import COLORS`).
+DEFAULT_COLORS = dict(COLORS)
+
+# Guards COLORS: a theme never changes in the middle of a render().
+_theme_lock = threading.RLock()
+
+
+def _valid_hex_color(value):
+    if not isinstance(value, str) or len(value) != 7 or value[0] != '#':
+        return False
+    try:
+        int(value[1:], 16)
+    except ValueError:
+        return False
+    return True
+
+
+def _hex_to_rgb(hex_color):
+    h = hex_color.lstrip('#')
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _plain_text(value):
+    """Pack text for one row: a string without control characters."""
+    if value is None:
+        return ''
+    text = str(value)
+    if not text.isprintable():
+        text = ''.join(ch if ch.isprintable() else ' ' for ch in text)
+    return text
+
+
 class LeelooDisplay:
     def __init__(self, width=480, height=320, preview_mode=True):
         """
@@ -113,6 +147,7 @@ class LeelooDisplay:
         self._art_cache = OrderedDict()
         self._art_lock = threading.RLock()
         self._dim_cache = {}
+        self._theme_bg = COLORS['bg']
         self._slider_char_w = None
         self._art_warned = None
 
@@ -137,10 +172,12 @@ class LeelooDisplay:
         Returns:
             Dimmed hex color string
         """
-        cached = self._dim_cache.get(hex_color)
+        # The result depends on the background of the active theme
+        bg = COLORS['bg']
+        key = (hex_color, bg)
+        cached = self._dim_cache.get(key)
         if cached is not None:
             return cached
-        key = hex_color
 
         # Parse hex color
         hex_color = hex_color.lstrip('#')
@@ -149,14 +186,50 @@ class LeelooDisplay:
         b = int(hex_color[4:6], 16)
 
         # Dim by mixing with background (30% original, 70% background)
-        bg_r, bg_g, bg_b = 0x1A, 0x1D, 0x2E  # leeloo-navy
+        bg_r, bg_g, bg_b = _hex_to_rgb(bg)  # leeloo-navy unless a pack theme is active
         dim_r = int(r * 0.3 + bg_r * 0.7)
         dim_g = int(g * 0.3 + bg_g * 0.7)
         dim_b = int(b * 0.3 + bg_b * 0.7)
 
         result = f'#{dim_r:02x}{dim_g:02x}{dim_b:02x}'
+        if len(self._dim_cache) > 256:
+            self._dim_cache.clear()
         self._dim_cache[key] = result
         return result
+
+    def apply_theme(self, colors=None):
+        """
+        Use pack colours on top of the DEFAULT palette.
+
+        Args:
+            colors: dict colour name -> '#RRGGBB' (names as in COLORS).
+                    None or {} restores the default palette. Unknown names
+                    and bad values are ignored.
+        Returns:
+            True if the palette changed.
+
+        COLORS is updated in place (same dict object). Calling this again
+        with the same colours only compares two small dicts. Call it from
+        the thread that renders (it waits for a render() in progress).
+        """
+        palette = dict(DEFAULT_COLORS)
+        if isinstance(colors, dict):
+            for name, value in colors.items():
+                if name in DEFAULT_COLORS and _valid_hex_color(value):
+                    palette[name] = value
+        with _theme_lock:
+            changed = palette != COLORS
+            if changed:
+                COLORS.update(palette)
+            # Caches that hold palette colours (they are also keyed by the
+            # background, so a change made through another display is safe)
+            if changed or self._theme_bg != palette['bg']:
+                self._theme_bg = palette['bg']
+                self._dim_cache.clear()
+                with self._art_lock:
+                    for key in [k for k in self._art_cache if k[0] == 'gradient']:
+                        del self._art_cache[key]
+        return changed
 
     def draw_slider(self, x, y, value, max_val, color, num_dots=20, draw=None):
         """
@@ -317,7 +390,7 @@ class LeelooDisplay:
             box_x += char_width
 
     def draw_left_column(self, weather_data, time_data, contacts, album_data, right_edge=158, unread_counts=None,
-                         status_text=None, hang=None, draw=None):
+                         status_text=None, hang=None, draw=None, header=None, labels=None, custom_panel=None):
         """
         Draw the left column with all info panels - MATCHES REACT UI EXACTLY
 
@@ -332,9 +405,26 @@ class LeelooDisplay:
             hang: dict as returned by gadget_data.format_countdown_display()
                   (None = read it here)
             draw: ImageDraw to draw on (None = self.draw)
+            header: replaces "LEELOO v1.0" when set (truncated to fit)
+            labels: dict with any of weather/time/messages/album -> box label
+            custom_panel: dict from PackManager.current_panel(); replaces the
+                          content of the weather box (weather_data is not drawn)
         """
         draw = draw if draw is not None else self.draw
         box_right = right_edge - 5  # Inner box right edge with padding
+        if not isinstance(labels, dict):
+            labels = {}
+        if not isinstance(custom_panel, dict):
+            custom_panel = None
+
+        def box_label(name, default):
+            # Pack label, cut so that it stays on the top edge of its box
+            text = _plain_text(labels.get(name)).strip()
+            if name == 'weather' and custom_panel is not None:
+                text = _plain_text(custom_panel.get('title')).strip() or text
+            if not text:
+                return default
+            return truncate_text(text, self.font_tiny, max(10, box_right - 13 - 8))
 
         # Main container border with header
         draw.rectangle([2, 4, right_edge, 318], outline=COLORS['lavender'], width=1)
@@ -343,7 +433,13 @@ class LeelooDisplay:
         header_y = 4
         # Draw background behind header text to "break" the frame
         draw.rectangle([6, header_y - 5, 155, header_y + 7], fill=COLORS['bg'])
-        draw.text((8, header_y - 4), "LEELOO v1.0", font=self.font_header, fill=COLORS['lavender'])
+        header_text = _plain_text(header).strip()
+        if header_text:
+            # "tap to talk" / the status starts at x=90
+            header_text = truncate_text(header_text, self.font_header, 78)
+        else:
+            header_text = "LEELOO v1.0"
+        draw.text((8, header_y - 4), header_text, font=self.font_header, fill=COLORS['lavender'])
         if status_text:
             # Status replaces "tap to talk"; keep it inside the outer frame
             status_max = max(10, right_edge - 8 - 90)
@@ -365,14 +461,16 @@ class LeelooDisplay:
         box_height = 59
         draw.rectangle([7, y, box_right, y + box_height], outline=COLORS['tan'], width=2)
         # Draw background behind label to "break" the frame, centered
-        label = "weather"
+        label = box_label('weather', "weather")
         label_width = self.font_tiny.getlength(label) if hasattr(self.font_tiny, 'getlength') else len(label) * 7
         label_x = 13  # 3px right from frame edge
         draw.rectangle([label_x - 2, y - 6, label_x + label_width + 2, y + 6], fill=COLORS['bg'])
         draw.text((label_x, y - 5), label, font=self.font_tiny, fill=COLORS['tan'])
 
         weather_error = bool(weather_data) and bool(weather_data.get('error'))
-        if weather_data is None or weather_error:
+        if custom_panel is not None:
+            self._draw_custom_panel(draw, custom_panel, y, box_right)
+        elif weather_data is None or weather_error:
             # Empty state - no location configured / weather fetch failed
             empty_text = "weather offline" if weather_error else "set location"
             try:
@@ -404,7 +502,7 @@ class LeelooDisplay:
         box_height = 71  # Was 40, added 31px for hang rows (+3px taller)
         draw.rectangle([7, y, box_right, y + box_height], outline=COLORS['purple'], width=2)
         # Draw background behind label to "break" the frame, centered
-        label = "time"
+        label = box_label('time', "time")
         label_width = self.font_tiny.getlength(label) if hasattr(self.font_tiny, 'getlength') else len(label) * 7
         label_x = 13  # 3px right from frame edge
         draw.rectangle([label_x - 2, y - 6, label_x + label_width + 2, y + 6], fill=COLORS['bg'])
@@ -447,7 +545,7 @@ class LeelooDisplay:
         box_height = 28
         draw.rectangle([7, y, box_right, y + box_height], outline=COLORS['lavender'], width=2)
         # Draw background behind label to "break" the frame, centered
-        label = "messages"
+        label = box_label('messages', "messages")
         label_width = self.font_tiny.getlength(label) if hasattr(self.font_tiny, 'getlength') else len(label) * 7
         label_x = 13  # 3px right from frame edge
         draw.rectangle([label_x - 2, y - 1, label_x + label_width + 2, y + 6], fill=COLORS['bg'])
@@ -500,7 +598,7 @@ class LeelooDisplay:
         box_height = 110  # Extended 2px for more content room
         draw.rectangle([7, y, box_right, y + box_height], outline=COLORS['green'], width=2)
         # Draw background behind label to "break" the frame, centered
-        label = "album"
+        label = box_label('album', "album")
         label_width = self.font_tiny.getlength(label) if hasattr(self.font_tiny, 'getlength') else len(label) * 7
         label_x = 13  # 3px right from frame edge
         draw.rectangle([label_x - 2, y - 6, label_x + label_width + 2, y + 6], fill=COLORS['bg'])
@@ -574,6 +672,62 @@ class LeelooDisplay:
             ask_truncated = truncate_text(ask_text, self.font_tiny, text_box_width)
             ask_x = 7 + 4  # 4px buffer from album frame left edge
             draw.text((ask_x, content_y), ask_truncated, font=self.font_tiny, fill=COLORS['lavender'])
+
+    def _draw_custom_panel(self, draw, panel, y, box_right):
+        """
+        Pack panel inside the weather box: up to 3 rows at the y positions of
+        the temperature / UV / rain rows. Each row has `left` text and either
+        `right` text (right-aligned) or a 12-box slider filled to `bar` (0..1).
+        All text is cut to fit: nothing is drawn outside the box.
+        """
+        color = COLORS['tan']
+        font = self.font_tiny
+        left_x = 12
+        right_x = box_right - 5          # same right padding as the sliders
+        inner = right_x - left_x
+        gap = 6
+        rows = panel.get('rows')
+        if not isinstance(rows, (list, tuple)) or inner <= 0:
+            return
+
+        def width(text):
+            try:
+                return font.getlength(text)
+            except Exception:
+                return len(text) * 7
+
+        for i, row in enumerate(rows[:3]):
+            if not isinstance(row, dict):
+                continue
+            row_y = y + 8 + i * 16
+            left = _plain_text(row.get('left'))
+            left_max = inner
+
+            bar = row.get('bar')
+            right = row.get('right')
+            if bar is not None:
+                try:
+                    fraction = float(bar)
+                except (TypeError, ValueError):
+                    fraction = 0.0
+                if not 0.0 <= fraction <= 1.0:      # also catches NaN
+                    fraction = 1.0 if fraction > 1.0 else 0.0
+                self.draw_weather_slider(box_right, row_y, int(fraction * 12 + 1e-6), color, draw=draw)
+                left_max = inner - 12 * self._slider_char_width() - gap
+            elif right is not None and _plain_text(right) != '':
+                right = _plain_text(right)
+                # The right text gets what the left text leaves, at least half
+                right_max = max(inner - width(left) - gap, inner // 2)
+                right = truncate_text(right, font, right_max)
+                right_w = width(right)
+                if right_w <= inner:
+                    draw.text((right_x - int(right_w + 0.999), row_y), right, font=font, fill=color)
+                    left_max = inner - right_w - gap
+
+            if left and left_max > 0:
+                left = truncate_text(left, font, left_max)
+                if width(left) <= left_max:
+                    draw.text((left_x, row_y), left, font=font, fill=color)
 
     # ------------------------------------------------------------------
     # Album art (right side) - prepared once per file, then just pasted
@@ -699,7 +853,7 @@ class LeelooDisplay:
                 return entry
 
         # Final fallback: gradient (rendered once)
-        key = ('gradient',)
+        key = ('gradient', COLORS['bg'])
         entry = self._art_cache_get(key, None)
         if entry is None:
             img = Image.new('RGB', (album_width + 1, album_height + 1), COLORS['bg'])
@@ -771,7 +925,7 @@ class LeelooDisplay:
         return image
 
     def render(self, weather_data, time_data, contacts, album_data, album_art_path=None, unread_counts=None,
-               status_text=None, hang=None):
+               status_text=None, hang=None, header=None, labels=None, custom_panel=None):
         """
         Render the complete display - MATCHES REACT UI EXACTLY
 
@@ -785,21 +939,27 @@ class LeelooDisplay:
             unread_counts: dict mapping sender name to unread count (e.g., {'Amy': 2})
             status_text: shown in the header instead of "tap to talk" when set
             hang: dict from gadget_data.format_countdown_display() (None = read it here)
+            header: replaces the text "LEELOO v1.0" (pack header)
+            labels: dict with any of weather/time/messages/album -> box label text
+            custom_panel: dict from PackManager.current_panel(). Replaces the
+                          content of the weather box; weather_data is not drawn
 
         Safe to call from a worker thread: the frame is built off to the side
         and only assigned to self.image / self.draw when complete.
         """
-        image, draw = self._new_frame()
+        with _theme_lock:       # one palette for the whole frame
+            image, draw = self._new_frame()
 
-        # Draw album art first (right side) - returns x position where it starts
-        album_x = self.draw_album_art(album_art_path=album_art_path, draw=draw, image=image)
+            # Draw album art first (right side) - returns x position where it starts
+            album_x = self.draw_album_art(album_art_path=album_art_path, draw=draw, image=image)
 
-        # Draw left column panels, extending to meet album art (with small gap)
-        info_panel_right = album_x - 5
-        self.draw_left_column(weather_data, time_data, contacts, album_data, right_edge=info_panel_right,
-                              unread_counts=unread_counts, status_text=status_text, hang=hang, draw=draw)
+            # Draw left column panels, extending to meet album art (with small gap)
+            info_panel_right = album_x - 5
+            self.draw_left_column(weather_data, time_data, contacts, album_data, right_edge=info_panel_right,
+                                  unread_counts=unread_counts, status_text=status_text, hang=hang, draw=draw,
+                                  header=header, labels=labels, custom_panel=custom_panel)
 
-        return self._publish_frame(image, draw)
+            return self._publish_frame(image, draw)
 
     def draw_reaction_overlay(self, ascii_art: str, message: str):
         """
@@ -816,7 +976,7 @@ class LeelooDisplay:
         # Draw darkened background (80% opacity)
         overlay_draw.rectangle(
             [0, 0, self.width, self.height],
-            fill=(26, 29, 46, 200)  # bg color with alpha
+            fill=_hex_to_rgb(COLORS['bg']) + (200,)  # bg color with alpha
         )
 
         # Draw ASCII art centered

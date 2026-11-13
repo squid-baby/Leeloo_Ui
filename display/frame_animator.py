@@ -75,6 +75,17 @@ def get_frame_geometries(box_right: int = 153):
     }
 
 
+# Palette key of each frame's border colour. The colour is looked up when an
+# animation starts, so it follows the active pack theme (COLORS is updated
+# in place by LeelooDisplay.apply_theme).
+FRAME_COLOR_KEYS = {
+    FrameType.WEATHER: 'tan',
+    FrameType.TIME: 'purple',
+    FrameType.MESSAGES: 'lavender',
+    FrameType.ALBUM: 'green',
+}
+
+
 def get_expanded_geometry(box_right: int = 153, color: str = '#A7AFD4', label: str = ""):
     """Get expanded frame geometry"""
     left_padding = 7  # 2px padding from outer frame edge (5) = 7
@@ -272,6 +283,17 @@ class FrameAnimator:
 
         return processed_frames
 
+    def _collapsed_geometry(self, frame_type: FrameType) -> FrameGeometry:
+        """Collapsed geometry of a frame with its colour in the CURRENT
+        palette (self.frame_geometries holds the colours of the moment the
+        animator was made)."""
+        geom = self.frame_geometries[frame_type]
+        color = COLORS.get(FRAME_COLOR_KEYS.get(frame_type), geom.color)
+        if color == geom.color:
+            return geom
+        return FrameGeometry(x=geom.x, y=geom.y, width=geom.width, height=geom.height,
+                             color=color, label=geom.label)
+
     def expand(
         self,
         frame_type: FrameType,
@@ -279,7 +301,7 @@ class FrameAnimator:
         on_complete: Optional[Callable] = None
     ):
         """Animate a frame expanding from collapsed to full size"""
-        collapsed = self.frame_geometries[frame_type]
+        collapsed = self._collapsed_geometry(frame_type)
         expanded = FrameGeometry(
             x=self.expanded_geometry.x,
             y=self.expanded_geometry.y,
@@ -297,7 +319,7 @@ class FrameAnimator:
         on_complete: Optional[Callable] = None
     ):
         """Animate a frame collapsing from full size back to collapsed"""
-        collapsed = self.frame_geometries[frame_type]
+        collapsed = self._collapsed_geometry(frame_type)
         expanded = FrameGeometry(
             x=self.expanded_geometry.x,
             y=self.expanded_geometry.y,
@@ -368,7 +390,7 @@ class FrameAnimator:
         on_complete: Optional[Callable] = None
     ):
         """Async version of expand — yields to event loop between frames"""
-        collapsed = self.frame_geometries[frame_type]
+        collapsed = self._collapsed_geometry(frame_type)
         expanded = FrameGeometry(
             x=self.expanded_geometry.x,
             y=self.expanded_geometry.y,
@@ -386,7 +408,7 @@ class FrameAnimator:
         on_complete: Optional[Callable] = None
     ):
         """Async version of collapse — yields to event loop between frames"""
-        collapsed = self.frame_geometries[frame_type]
+        collapsed = self._collapsed_geometry(frame_type)
         expanded = FrameGeometry(
             x=self.expanded_geometry.x,
             y=self.expanded_geometry.y,
