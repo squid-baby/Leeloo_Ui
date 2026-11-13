@@ -251,6 +251,42 @@ test('validator rejects bad packs with the path of the bad value', () => {
     assert.ok(hit, `${label}: expected ${expected}, got ${JSON.stringify(errors)}`);
   }
 
+  // Lone surrogates cannot be stored as UTF-8 on the device
+  assert.deepEqual(validatePack(smallPack({ name: 'a\uD83Db' })), ['name: has an invalid character']);
+  assert.deepEqual(validatePack(smallPack({ panels: [{ slot: 'weather', rows: [{ left: 'ok' }, { left: 'x\uDE00' }] }] })),
+    ['panels[0].rows[1].left: has an invalid character']);
+  assert.deepEqual(validatePack(JSON.parse('{"pack":1,"id":"a","name":"A","theme":{"labels":{"ti\\udc00me":"x"}}}')),
+    ['theme.labels: has an invalid character']);
+  assert.deepEqual(validatePack(smallPack({ name: 'ok \uD83D\uDE00' })), [], 'a full pair is a normal character');
+
+  // Readable screen rule
+  const black = Object.fromEntries(['bg', 'green', 'purple', 'lavender', 'tan', 'white'].map((k) => [k, '#000000']));
+  assert.deepEqual(validatePack(smallPack({ theme: { colors: black } })),
+    ['green', 'purple', 'lavender', 'tan', 'white'].map(
+      (k) => `theme.colors.${k}: too close to the background colour (contrast 1.00, need 2.0)`));
+  const lightBg = validatePack(smallPack({ theme: { colors: { bg: '#FFFFFF' } } }));
+  assert.equal(lightBg.length, 2, 'a light bg alone hides the default green and white');
+  assert.equal(lightBg[1], 'theme.colors.white: too close to the background colour (contrast 1.00, need 2.0)');
+  assert.match(lightBg[0], /^theme\.colors\.green: too close to the background colour \(contrast 1\.\d\d, need 2\.0\)$/);
+  assert.deepEqual(validatePack(smallPack({
+    theme: { colors: { bg: '#FFFFFF', green: '#006633', purple: '#4B3F9E', lavender: '#7A1FA2', tan: '#6B4A12', white: '#111111' } }
+  })), []);
+  assert.deepEqual(validatePack(smallPack({ theme: { colors: { tan: '#22263A' } } })).map((e) => e.split(':')[0]),
+    ['theme.colors.tan']);
+  assert.deepEqual(validatePack(smallPack({ theme: { colors: { rose: '#1A1D2E', yellow: '#1A1D2E' } } })), [],
+    'only the five text colours are checked');
+
+  // The relay stops at 7,800 bytes (the device at 8,000)
+  const sized = (bytes) => {
+    const pack = smallPack({ panels: Array.from({ length: 6 }, () => ({ slot: 'weather', rows: [{ left: 'a', bar: { value: '', max: 1 } }] })) });
+    const spare = bytes - Buffer.byteLength(JSON.stringify(pack));
+    pack.panels.forEach((panel, i) => { panel.rows[0].bar.value = 'v'.repeat(Math.floor(spare / 6) + (i < spare % 6 ? 1 : 0)); });
+    assert.equal(Buffer.byteLength(JSON.stringify(pack)), bytes);
+    return pack;
+  };
+  assert.deepEqual(validatePack(sized(7800)), []);
+  assert.deepEqual(validatePack(sized(7801)), ['pack: JSON text is 7801 bytes, the limit is 7800']);
+
   // The allowed hosts are an option
   const other = smallPack({ sources: [{ id: 'a', url: 'https://data.example.org/x', every: 60, fields: { a: 'b' } }] });
   assert.equal(validatePack(other).length, 1);

@@ -231,9 +231,11 @@ test('state survives close + recreate from the same data file', async () => {
 
   await bob.close();
   await alice.next('member_offline');
+  // Set before the message: the save that the message starts must include it
+  // (a direct write to the map does not mark the state as changed)
+  relay1.state.pendingSpotifyTokens.set('z9', { tokens: { access_token: 'tok' }, timestamp: clock() });
   alice.sendMessage('text', { text: 'while you were away' });
   await alice.sync();
-  relay1.state.pendingSpotifyTokens.set('z9', { tokens: { access_token: 'tok' }, timestamp: clock() });
 
   await alice.close();
   await relay1.close();
@@ -389,7 +391,7 @@ test('WebSocket join rate limit triggers and resets', async () => {
 });
 
 test('successful joins are not limited and the limit is per client IP', async () => {
-  const relay = await relayUp();
+  const relay = await relayUp({ maxCrewMembers: 50 });
   const { code } = await crewOfTwo(relay);
 
   for (let i = 0; i < 15; i++) {

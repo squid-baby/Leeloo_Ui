@@ -103,6 +103,11 @@ Full specification: `docs/PACKS.md`. Example: `packs/unc-hoops.json`.
   device. The relay stores only its hash. Never print or log a token.
 - `tests/test_e2e_agent_connect.py` runs the real Node relay with the real Python
   client and an MCP agent call.
+- **Device key:** the relay gives each device a secret `device_key` at its first
+  registration (stored in `crew_config.json`). A `device_id` alone is not an identity:
+  the crew can see it. Never log the key. **Deploy the device code BEFORE the relay**:
+  an old client does not save the key and is refused when it reconnects.
+- Relay limits: 12 members for each crew, 6 data-source URLs for each crew, 50 in total.
 
 ## Key Conventions
 

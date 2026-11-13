@@ -56,6 +56,28 @@ SPOTIFY_REDIRECT_URI=https://leeloobot.xyz/spotify/callback
   `X-Forwarded-For`, so nginx must set that header.
 - **Tests**: `npm install && npm test` (uses `node:test`, Node 18 or newer).
 
+## Device keys and limits
+
+- **Device key**: a `device_id` is public (the crew sees it), so it proves
+  nothing. The first `register` / `create_crew` / `join_crew` of an id gets
+  `device_key` (64 hex characters) in the reply (`registered`,
+  `crew_created`, `crew_joined`). The device must save it and send it as
+  `device_key` in every later one of these three messages. Without the right
+  key the reply is `{type:'error', error:'device_key_required'}`, nothing is
+  bound, the connected device stays connected, and the attempt counts for the
+  per-IP limit. The relay saves only the SHA-256 hash (`deviceKeys` in the
+  state file). Devices from before the keys get one at their next bind.
+  **Update the device code before the relay**: an old client does not save
+  the key and cannot connect a second time.
+- **One crew per device**: a device that binds to another crew leaves the old
+  roster, and its agent links and open connect codes are deleted.
+- **Limits** (options of `createRelay`): `maxCrewMembers` 12 devices per crew
+  (`crew_full` error), `maxCrewSourceUrls` 6 and `maxSourceUrls` 50 source
+  URLs polled at one time (sources over a limit are not polled, the pack
+  stays active), `maxDevicePacks` 2000, `maxDeviceKeys` 20000. A new device
+  id without a crew uses the per-IP budget of failed attempts. `pack_active`
+  is accepted only from a device in a crew, 20 changes in 10 minutes.
+
 ## Agent connect and packs
 
 Full contract: `../docs/PACKS.md`. All of it is in `server.js` (the deploy
@@ -69,16 +91,19 @@ copies only that file).
 - **MCP**: `POST /mcp/<token>` is a stateless MCP server (JSON-RPC 2.0, JSON
   replies, 64 KB body limit, no SSE: `GET` gives 405). Tools: `get_status`,
   `get_pack_guide`, `validate_pack`, `install_pack`, `share_pack`,
-  `reset_pack`, `send_message`. An agent can send 20 crew messages/offers in
-  10 minutes per link.
-- **Packs**: `validatePack()` checks every rule of PACKS.md §1. Invalid packs
+  `reset_pack`, `send_message`. Per link in 10 minutes: 20 crew
+  messages/offers, 10 installs/resets. A link works only while its device is
+  in the crew it was made for.
+- **Packs**: `validatePack()` checks every rule of PACKS.md §1 (the relay
+  accepts 7,800 bytes, the device 8,000). Invalid packs
   are never relayed, stored or installed. `pack_offer` messages are queued for
   offline devices like text messages. A `pack_install` / `pack_reset` for an
   offline device is kept (the newest one) until it connects.
 - **Sources**: for the active packs (`pack_active`) of connected devices, the
   relay fetches each source URL one time per interval (the smallest `every`
-  among its users) and sends `pack_data` to those devices. Limits: https only,
-  host allowlist, no redirects, 10 s timeout, 2 MB.
+  among its users) and sends `pack_data` to those devices. Only the values
+  that the packs ask for are kept, not the replies. Limits: https only, host
+  allowlist, no redirects, 10 s timeout, 2 MB.
 - **Environment**:
   - `PUBLIC_BASE_URL` (default `https://leeloobot.xyz`): base of the connect
     and connector links.
