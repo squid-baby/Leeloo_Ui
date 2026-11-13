@@ -118,10 +118,8 @@ test('offline queue is delivered on rejoin, in order, with queued: true', async 
   clock.advance(60000);
 
   const bob2 = await connect(relay);
-  bob2.send({ type: 'join_crew', crew_code: code, device_id: 'b1', display_name: 'Bob' });
-
-  // crew_joined comes first, then the queue
-  const first = await bob2.next();
+  // crew_joined comes first, then the queue (joinCrew sends Bob's device key)
+  const first = await bob2.joinCrew(code, 'b1', 'Bob');
   assert.equal(first.type, 'crew_joined');
   const queued = await bob2.drain('message');
   assert.deepEqual(queued.map((m) => m.msg_type), ['text', 'song_push', 'hang_propose', 'hang_confirm']);
@@ -546,7 +544,9 @@ test('Spotify callback rejects error responses and forwards good tokens', async 
   const relay = await relayUp({ fetch: fakeFetch });
   const alice = await connect(relay);
   alice.send({ type: 'register', device_id: 'a1', device_name: 'LEELOO' });
-  assert.deepEqual(await alice.next(), { type: 'registered', device_id: 'a1' });
+  const registered = await alice.next();
+  assert.match(registered.device_key, /^[0-9a-f]{64}$/); // first bind of this id
+  assert.deepEqual(registered, { type: 'registered', device_id: 'a1', device_key: registered.device_key });
 
   // Spotify error
   reply = { ok: false, status: 400, body: { error: 'invalid_grant' } };

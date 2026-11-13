@@ -242,7 +242,7 @@ test('validator rejects bad packs with the path of the bad value', () => {
     ['slow rotation', smallPack({ rotate_seconds: 601 }), 'rotate_seconds: must be from 5 to 600'],
     ['oversize', smallPack({
       panels: Array.from({ length: 6 }, () => ({ slot: 'weather', rows: [{ left: 'a', bar: { value: 'x'.repeat(1500), max: 1 } }] }))
-    }), /^pack: JSON text is \d+ bytes, the limit is 8000$/]
+    }), /^pack: JSON text is \d+ bytes, the limit is 7800$/]
   ];
 
   for (const [label, pack, expected] of table) {
@@ -930,18 +930,22 @@ test('a state file from before packs loads; bad pack entries are dropped', async
   assert.equal(old.state.crews.size, 1);
   assert.equal(old.state.agentTokens.size, 0);
   assert.equal(old.state.devicePacks.size, 0);
+  assert.equal(old.state.deviceKeys.size, 0);
   await old.close();
 
   fs.writeFileSync(dataFile, JSON.stringify({
     version: 1,
-    crews: {},
+    crews: { 'LEELOO-NEW1': { created_at: 1, telegram_users: [], members: { a1: 'Alice', b1: 'Bob' } } },
     agentTokens: { nothex: { device_id: 'a1', crew_code: 'X' }, ['a'.repeat(64)]: { device_id: 'a1', crew_code: 'X', created_at: 5 }, ['b'.repeat(64)]: 'junk' },
-    devicePacks: { a1: smallPack(), b1: smallPack({ evil: 1 }), c1: 'junk' },
+    // b1: invalid pack. c1: junk. z9: valid pack, but the device is in no crew
+    devicePacks: { a1: smallPack(), b1: smallPack({ evil: 1 }), c1: 'junk', z9: smallPack() },
+    deviceKeys: { a1: 'c'.repeat(64), b1: 'short', c1: 7 },
     pendingPackOps: { a1: { message: { type: 'pack_reset' }, timestamp: 1 }, b1: { message: { type: 'run', cmd: 'x' } }, c1: null }
   }));
   const relay = createRelay({ dataFile, log: quietLog, sourceTickMs: 0 });
   assert.deepEqual(Array.from(relay.state.agentTokens.keys()), ['a'.repeat(64)]);
   assert.deepEqual(Array.from(relay.state.devicePacks.keys()), ['a1']);
   assert.deepEqual(Array.from(relay.state.pendingPackOps.keys()), ['a1']);
+  assert.deepEqual(Array.from(relay.state.deviceKeys.entries()), [['a1', 'c'.repeat(64)]]);
   await relay.close();
 });

@@ -34,6 +34,11 @@ async function startRelay(options = {}) {
   return relay;
 }
 
+// Device keys that relays gave to the test devices, by device id. The Client
+// helpers send them like a real device does (it keeps its key in a file).
+// A test that wants to bind WITHOUT the key uses client.send() directly.
+const deviceKeys = new Map();
+
 // WebSocket client that buffers incoming JSON messages.
 class Client {
   constructor(url, wsOptions = {}) {
@@ -44,6 +49,7 @@ class Client {
     this.ws.on('error', () => {});
     this.ws.on('message', (raw) => {
       const msg = JSON.parse(raw);
+      if (typeof msg.device_key === 'string' && msg.device_id) deviceKeys.set(msg.device_id, msg.device_key);
       const index = this.waiters.findIndex((w) => w.match(msg));
       if (index >= 0) {
         const [waiter] = this.waiters.splice(index, 1);
@@ -100,12 +106,23 @@ class Client {
   async createCrew(deviceId, name, crewCode) {
     const msg = { type: 'create_crew', device_id: deviceId, display_name: name };
     if (crewCode) msg.crew_code = crewCode;
+    if (deviceKeys.has(deviceId)) msg.device_key = deviceKeys.get(deviceId);
     this.send(msg);
     return this.next();
   }
 
   async joinCrew(crewCode, deviceId, name) {
-    this.send({ type: 'join_crew', crew_code: crewCode, device_id: deviceId, display_name: name });
+    const msg = { type: 'join_crew', crew_code: crewCode, device_id: deviceId, display_name: name };
+    if (deviceKeys.has(deviceId)) msg.device_key = deviceKeys.get(deviceId);
+    this.send(msg);
+    return this.next();
+  }
+
+  async register(deviceId, name, crewCode) {
+    const msg = { type: 'register', device_id: deviceId, device_name: name };
+    if (crewCode) msg.crew_code = crewCode;
+    if (deviceKeys.has(deviceId)) msg.device_key = deviceKeys.get(deviceId);
+    this.send(msg);
     return this.next();
   }
 
@@ -128,4 +145,4 @@ async function post(relay, route, body, headers = {}) {
   return { status: res.status, body: await res.json() };
 }
 
-module.exports = { Client, startRelay, tempDataFile, fakeClock, post, quietLog };
+module.exports = { Client, startRelay, tempDataFile, fakeClock, post, quietLog, deviceKeys };
